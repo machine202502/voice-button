@@ -1,0 +1,6 @@
+﻿# whisper.cpp's Vulkan shader generator writes CMake scratch files whose paths
+# overflow the Windows limit inside a deep target\ directory (MSBuild FTK1011).
+# Keeping the build directory short avoids it; the packaging script uses the
+# same location.
+[build]
+target-dir = "C:/vbt"

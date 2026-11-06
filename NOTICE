@@ -1,0 +1,21 @@
+﻿Voice Button includes third-party components.
+
+Voice Button source code: https://github.com/machine202502/voice-button
+Voice Button source license: MIT, see LICENSE.
+Copyright (c) 2026 machine202502.
+
+The executables contain Rust crates and native libraries:
+  - ONNX Runtime (MIT) — runs the sherpa-onnx model sessions;
+  - sherpa-onnx (Apache-2.0) — the speech engine: NeMo/GigaAM and the
+    multilingual ONNX models, including their feature extraction;
+  - whisper.cpp (MIT) — the Whisper speech engine.
+Their names, versions, authors, repositories, and available license texts are
+collected in THIRD-PARTY.txt next to the executables in release packages, and
+the license texts themselves are in the licenses/ directory of this repository.
+
+Bundled sound cues start.wav and end.wav are dedicated to the public domain
+under CC0 1.0. Their sources and processing are documented in assets/CREDITS.md.
+
+Speech models are not bundled with Voice Button. The application only offers
+links from which the user can download them. No model license or model source
+notice is required for those recommendations in this package.

@@ -1,0 +1,42 @@
+﻿name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Vulkan SDK
+        uses: jakoch/install-vulkan-sdk-action@v1
+        with:
+          vulkan_version: latest
+          stripdown: true
+          cache: true
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+      - name: Test
+        run: cargo test --release
+      - name: Build both executables
+        run: cargo build --release --bins
+      - name: Upload executables
+        uses: actions/upload-artifact@v4
+        with:
+          name: voice-button-windows-x64
+          path: |
+            C:/vbt/release/voice-button.exe
+            C:/vbt/release/voice-button-ui.exe
+            C:/vbt/release/sherpa-onnx-c-api.dll
+            C:/vbt/release/sherpa-onnx-cxx-api.dll
+            C:/vbt/release/onnxruntime.dll
+          if-no-files-found: error

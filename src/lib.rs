@@ -1,0 +1,14 @@
+pub mod autostart;
+pub mod config;
+pub mod history;
+pub mod hotkey;
+pub mod icons;
+pub mod ipc;
+pub mod log;
+pub mod model_manager;
+pub mod recorder;
+pub mod sound;
+pub mod state;
+pub mod transcribe;
+pub mod tray;
+pub mod ui;

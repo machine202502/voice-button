@@ -1,0 +1,86 @@
+name: Site
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - site/**
+      - .github/workflows/site.yml
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: site
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve latest release assets
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if ! gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName > /tmp/tag.txt 2>/dev/null; then
+            echo "No release yet — deploying with placeholders."
+            echo "version=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          tag=$(cat /tmp/tag.txt)
+          version=${tag#v}
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          mkdir -p /tmp/voice-button-release
+          cd /tmp/voice-button-release
+          asset() {
+            gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets \
+              --jq "[.assets[] | select(.name | endswith(\"$1\"))][0].$2 // \"\""
+          }
+          fill_asset() {
+            local suffix="$1" key="$2"
+            local name url digest hash size
+            name=$(asset "$suffix" name)
+            if [ -z "$name" ]; then echo "Missing $suffix in $tag" >&2; exit 1; fi
+            url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}/${name}"
+            digest=$(asset "$suffix" digest)
+            hash=${digest#sha256:}
+            curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -o "$key" "$url"
+            size=$(awk -v b="$(stat -c %s "$key")" 'BEGIN{printf "%.1f", b/1048576}')
+            if [ "$hash" = "$digest" ]; then hash=$(sha256sum "$key" | cut -d' ' -f1); fi
+            echo "${key}_hash=$hash" >> "$GITHUB_OUTPUT"
+            echo "${key}_size=$size" >> "$GITHUB_OUTPUT"
+          }
+          fill_asset 'windows-x64.zip' zip
+          fill_asset '-setup.exe' setup
+      - name: Fill release data into the site
+        if: steps.release.outputs.version != ''
+        run: |
+          set -euo pipefail
+          sed -i \
+            -e 's/@@VERSION@@/${{ steps.release.outputs.version }}/g' \
+            -e 's/@@HASH_SETUP@@/${{ steps.release.outputs.setup_hash }}/g' \
+            -e 's/@@HASH_ZIP@@/${{ steps.release.outputs.zip_hash }}/g' \
+            -e 's/@@SIZE_SETUP@@/${{ steps.release.outputs.setup_size }}/g' \
+            -e 's/@@SIZE_ZIP@@/${{ steps.release.outputs.zip_size }}/g' \
+            site/index.html site/en/index.html
+      - uses: actions/upload-pages-artifact@v3
+        with: { path: site }
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

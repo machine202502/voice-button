@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://machine202502.github.io/voice-button/sitemap.xml
