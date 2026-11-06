@@ -11,7 +11,10 @@ Site: https://machine202502.github.io/voice-button/
 
 - Click the tray microphone to start recording; click again to stop.
 - Middle-click the tray microphone to record and paste the result at the caret
-  of the focused window (same as the paste hotkey).
+  of the focused window (same as the paste hotkey). **Settings → Mouse** can
+  swap the left and middle button actions.
+- If transcriptions are empty, pick the real microphone under
+  **Settings → Microphone**: a virtual cable such as VB-Audio records silence.
 - Open **Capture** to start/stop from the window and watch the live transcript.
 - The tray menu also contains **Settings**, **Capture**, **Last Copy**, and **Quit**.
 - Recording is unavailable until a usable model is downloaded. During an active

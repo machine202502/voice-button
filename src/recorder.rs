@@ -26,6 +26,7 @@ pub struct Recorder {
     buffer: Arc<Mutex<Vec<f32>>>,
     sample_rate: u32,
     channels: u16,
+    device_name: String,
 }
 
 impl Recorder {
@@ -35,6 +36,7 @@ impl Recorder {
             buffer: Arc::new(Mutex::new(Vec::new())),
             sample_rate: 48000,
             channels: 1,
+            device_name: String::new(),
         }
     }
 
@@ -42,14 +44,31 @@ impl Recorder {
         self.stream.is_some()
     }
 
-    pub fn start(&mut self) -> Result<()> {
+    pub fn start(&mut self, preferred: Option<&str>) -> Result<()> {
         if self.stream.is_some() {
             return Ok(());
         }
         let host = cpal::default_host();
-        let device = host
-            .default_input_device()
-            .context("no default microphone found")?;
+        let requested = preferred.map(str::trim).filter(|name| !name.is_empty());
+        let mut device = requested.and_then(|name| {
+            host.input_devices().ok().and_then(|devices| {
+                devices
+                    .into_iter()
+                    .find(|device| device.name().ok().as_deref() == Some(name))
+            })
+        });
+        if device.is_none() {
+            if let Some(name) = requested {
+                crate::log::log(&format!(
+                    "microphone {name:?} not found; using the system default device"
+                ));
+            }
+            device = host.default_input_device();
+        }
+        let device = device.context("no default microphone found")?;
+        self.device_name = device
+            .name()
+            .unwrap_or_else(|_| "unknown microphone".to_string());
         let supported = device
             .default_input_config()
             .context("failed to get microphone config")?;
@@ -111,6 +130,11 @@ impl Recorder {
         self.sample_rate
     }
 
+    /// Name of the device used by the current (or last) recording.
+    pub fn device_name(&self) -> &str {
+        &self.device_name
+    }
+
     pub fn channels(&self) -> u16 {
         self.channels
     }
@@ -126,6 +150,24 @@ impl Recorder {
             sample_rate: self.sample_rate,
         })
     }
+}
+
+/// Human-readable names of the available input devices (duplicates removed).
+/// Used by Settings so the user can pick a real microphone instead of a
+/// virtual cable, which records silence.
+pub fn input_device_names() -> Vec<String> {
+    let host = cpal::default_host();
+    let mut names = Vec::new();
+    if let Ok(devices) = host.input_devices() {
+        for device in devices {
+            if let Ok(name) = device.name() {
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+        }
+    }
+    names
 }
 
 #[cfg(test)]

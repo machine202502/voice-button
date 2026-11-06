@@ -57,6 +57,10 @@ pub struct Data {
     pub capturing_append_hotkey: bool,
     /// Same as above, for the record-and-paste shortcut.
     pub capturing_paste_hotkey: bool,
+    /// Input device names shown in the Settings microphone picker, cached for
+    /// a couple of seconds while the window is open.
+    pub input_devices: Vec<String>,
+    pub input_devices_at: Option<std::time::Instant>,
     pub history: History,
     pub quit: bool,
 }
@@ -85,6 +89,8 @@ impl Shared {
                 capturing_hotkey: false,
                 capturing_append_hotkey: false,
                 capturing_paste_hotkey: false,
+                input_devices: Vec::new(),
+                input_devices_at: None,
                 history,
                 quit: false,
             }),

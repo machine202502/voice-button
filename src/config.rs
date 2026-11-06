@@ -21,6 +21,14 @@ pub struct Config {
     #[serde(default)]
     pub onnx_folder: Option<String>,
     pub language: String,
+    /// Preferred microphone name; empty uses the Windows default device.
+    /// Virtual cables (VB-Audio, streaming devices) record silence unless
+    /// something is routed into them, so the microphone is selectable.
+    #[serde(default)]
+    pub input_device: String,
+    /// Swap the tray icon's left and middle mouse actions.
+    #[serde(default)]
+    pub swap_mouse_buttons: bool,
     #[serde(default = "default_true")]
     pub autostart: bool,
     #[serde(default = "default_true")]
@@ -69,6 +77,8 @@ impl Default for Config {
             onnx_model: "gigaam-v3-sherpa-int8".to_string(),
             onnx_folder: None,
             language: "auto".to_string(),
+            input_device: String::new(),
+            swap_mouse_buttons: false,
             autostart: true,
             silent_start: true,
             play_start_sound: true,

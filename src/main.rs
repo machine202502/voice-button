@@ -408,6 +408,10 @@ fn transcribe_stream_piece(
     kind: &str,
 ) -> anyhow::Result<String> {
     let seconds = samples.len() as f64 / sample_rate as f64;
+    let peak = samples
+        .iter()
+        .fold(0.0f32, |max, sample| max.max(sample.abs()));
+    let rms = (samples.iter().map(|s| s * s).sum::<f32>() / samples.len().max(1) as f32).sqrt();
     let began = std::time::Instant::now();
     let result = transcriber.transcribe(Recording {
         samples: samples.to_vec(),
@@ -415,7 +419,7 @@ fn transcribe_stream_piece(
     });
     match &result {
         Ok(text) => log::log(&format!(
-            "{kind} transcription: {seconds:.2}s audio, {} chars, {} ms",
+            "{kind} transcription: {seconds:.2}s audio, peak={peak:.4}, rms={rms:.4}, {} chars, {} ms",
             text.chars().count(),
             began.elapsed().as_millis()
         )),
@@ -423,6 +427,11 @@ fn transcribe_stream_piece(
             "{kind} transcription failed after {} ms: {e:#}",
             began.elapsed().as_millis()
         )),
+    }
+    if kind == "final" && peak < 0.0005 {
+        log::log(
+            "recording looks silent (peak below 0.0005): check the microphone selected in Settings",
+        );
     }
     result
 }
@@ -620,11 +629,18 @@ fn toggle_record(
             }
         }
     } else {
-        match recorder.start() {
+        let preferred = shared.lock().config.input_device.clone();
+        match recorder.start(Some(preferred.as_str())) {
             Ok(()) => {
                 ctx.sample_rate
                     .store(recorder.sample_rate(), Ordering::SeqCst);
                 ctx.append_now.store(append, Ordering::SeqCst);
+                log::log(&format!(
+                    "recording device: {} ({} Hz, {} ch)",
+                    recorder.device_name(),
+                    recorder.sample_rate(),
+                    recorder.channels()
+                ));
                 // The paste target is captured now, while the user's window is
                 // still the reference; transcription may take a while and focus
                 // can move meanwhile. A tray click moves the foreground to the
@@ -786,6 +802,7 @@ fn run_daemon() {
         voice_button::hotkey::parse(&cfg.hotkey),
         voice_button::hotkey::parse(&cfg.append_hotkey),
         voice_button::hotkey::parse(&cfg.paste_hotkey),
+        cfg.swap_mouse_buttons,
     );
     let (events_tx, events_rx) = mpsc::channel::<AppEvent>();
     let mut recorder = Recorder::new();
@@ -1051,6 +1068,7 @@ fn run_daemon() {
             let _ = tray_cmds.send(tray::TrayCommand::SetPasteHotkey(
                 voice_button::hotkey::parse(&cfg.paste_hotkey),
             ));
+            let _ = tray_cmds.send(tray::TrayCommand::SetMouseSwap(cfg.swap_mouse_buttons));
         }
         // The Settings window asks for the shortcut(s) to be released while it
         // captures a new combination, otherwise its keystrokes would toggle

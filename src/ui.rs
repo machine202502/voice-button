@@ -684,6 +684,71 @@ fn settings_body(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs) {
         apply_settings(data, dirs);
     }
     ui.separator();
+    ui.heading("Microphone");
+    // Device enumeration creates COM objects, so refresh it at most every two
+    // seconds instead of on every frame.
+    let refresh_devices = data
+        .input_devices_at
+        .map(|at| at.elapsed() >= Duration::from_secs(2))
+        .unwrap_or(true);
+    if refresh_devices {
+        data.input_devices = crate::recorder::input_device_names();
+        data.input_devices_at = Some(std::time::Instant::now());
+    }
+    let devices = data.input_devices.clone();
+    let selected = if data.config.input_device.is_empty() {
+        "System default".to_string()
+    } else {
+        data.config.input_device.clone()
+    };
+    let mut microphone_changed = false;
+    egui::ComboBox::from_id_source("input_device")
+        .selected_text(selected)
+        .show_ui(ui, |ui| {
+            microphone_changed |= ui
+                .selectable_value(
+                    &mut data.config.input_device,
+                    String::new(),
+                    "System default",
+                )
+                .changed();
+            for name in &devices {
+                microphone_changed |= ui
+                    .selectable_value(&mut data.config.input_device, name.clone(), name.as_str())
+                    .changed();
+            }
+        });
+    if microphone_changed {
+        apply_settings(data, dirs);
+    }
+    if data.config.input_device.is_empty() {
+        ui.label(
+            RichText::new(
+                "Using the Windows default device. Virtual cables (VB-Audio, streaming devices) record silence — pick your real microphone above if transcriptions are empty.",
+            )
+            .weak(),
+        );
+    }
+    ui.separator();
+    ui.heading("Mouse");
+    if ui
+        .checkbox(
+            &mut data.config.swap_mouse_buttons,
+            "Swap left and middle mouse button actions on the tray icon",
+        )
+        .changed()
+    {
+        apply_settings(data, dirs);
+    }
+    ui.label(
+        RichText::new(if data.config.swap_mouse_buttons {
+            "Left click records and pastes at the cursor; middle click records a new message."
+        } else {
+            "Left click records a new message; middle click records and pastes at the cursor."
+        })
+        .weak(),
+    );
+    ui.separator();
     hotkey_section(ui, data, dirs, HotkeyField::Record);
     hotkey_section(ui, data, dirs, HotkeyField::Append);
     hotkey_section(ui, data, dirs, HotkeyField::Paste);

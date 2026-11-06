@@ -34,6 +34,8 @@ pub enum TrayCommand {
     SetAppendHotkey(Option<Hotkey>),
     /// Apply a new paste shortcut; `None` disables it.
     SetPasteHotkey(Option<Hotkey>),
+    /// Swap the left and middle tray mouse actions.
+    SetMouseSwap(bool),
     Shutdown,
 }
 
@@ -42,11 +44,19 @@ pub fn start(
     hotkey: Option<Hotkey>,
     append_hotkey: Option<Hotkey>,
     paste_hotkey: Option<Hotkey>,
+    swap_mouse_buttons: bool,
 ) -> Sender<TrayCommand> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         crate::log::log("tray thread starting");
-        run(to_app, rx, hotkey, append_hotkey, paste_hotkey);
+        run(
+            to_app,
+            rx,
+            hotkey,
+            append_hotkey,
+            paste_hotkey,
+            swap_mouse_buttons,
+        );
     });
     tx
 }
@@ -162,6 +172,7 @@ fn run(
     hotkey: Option<Hotkey>,
     append_hotkey: Option<Hotkey>,
     paste_hotkey: Option<Hotkey>,
+    mut swap_mouse_buttons: bool,
 ) {
     let menu = Menu::new();
     let copy_last = MenuItem::new("Copy last transcription", true, None);
@@ -187,7 +198,11 @@ fn run(
     let tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_menu_on_left_click(false)
-        .with_tooltip("Voice Button - left click: record, middle click: record and paste")
+        .with_tooltip(if swap_mouse_buttons {
+            "Voice Button - left click: record and paste, middle click: record"
+        } else {
+            "Voice Button - left click: record, middle click: record and paste"
+        })
         .with_icon(icons::icon_idle())
         .build()
         .expect("failed to create tray icon");
@@ -253,6 +268,15 @@ fn run(
                     next,
                     "paste",
                 ),
+                TrayCommand::SetMouseSwap(swap) => {
+                    swap_mouse_buttons = swap;
+                    let _ = tray.set_tooltip(Some(if swap {
+                        "Voice Button - left click: record and paste, middle click: record"
+                    } else {
+                        "Voice Button - left click: record, middle click: record and paste"
+                    }));
+                    crate::log::log(&format!("tray mouse buttons swapped: {swap}"));
+                }
                 TrayCommand::Shutdown => {
                     apply_hotkey(hotkey_window, HOTKEY_ID, &mut registered, None, "record");
                     apply_hotkey(
@@ -280,14 +304,24 @@ fn run(
             }
             let action = match button {
                 MouseButton::Left => {
-                    crate::log::log("tray left click");
-                    Some(TrayAction::RecordToggle)
+                    if swap_mouse_buttons {
+                        crate::log::log("tray left click (swapped: record and paste)");
+                        Some(TrayAction::RecordPaste)
+                    } else {
+                        crate::log::log("tray left click");
+                        Some(TrayAction::RecordToggle)
+                    }
                 }
                 MouseButton::Middle => {
                     // Middle click mirrors the paste hotkey: record a new
                     // message and insert it at the caret of the focused window.
-                    crate::log::log("tray middle click");
-                    Some(TrayAction::RecordPaste)
+                    if swap_mouse_buttons {
+                        crate::log::log("tray middle click (swapped: record)");
+                        Some(TrayAction::RecordToggle)
+                    } else {
+                        crate::log::log("tray middle click");
+                        Some(TrayAction::RecordPaste)
+                    }
                 }
                 MouseButton::Right => None,
             };
