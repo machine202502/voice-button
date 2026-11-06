@@ -53,11 +53,103 @@ fn foreground_window() -> isize {
     unsafe { GetForegroundWindow() as isize }
 }
 
+/// Window class name, empty when the window is gone.
+fn window_class(hwnd: isize) -> String {
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetClassNameW;
+    if hwnd == 0 {
+        return String::new();
+    }
+    let mut buffer = [0u16; 256];
+    // SAFETY: buffer is valid for the given length; hwnd is only read.
+    let len = unsafe {
+        GetClassNameW(
+            hwnd as windows_sys::Win32::Foundation::HWND,
+            buffer.as_mut_ptr(),
+            buffer.len() as i32,
+        )
+    };
+    if len <= 0 {
+        String::new()
+    } else {
+        String::from_utf16_lossy(&buffer[..len as usize])
+    }
+}
+
+/// Windows that must never receive the dictated text: the taskbar, the tray
+/// overflow, the desktop and shell flyouts. Clicking the tray icon moves the
+/// foreground to one of these, so they cannot become the paste target.
+fn shell_window_class(class: &str) -> bool {
+    matches!(
+        class,
+        "Shell_TrayWnd"
+            | "Shell_SecondaryTrayWnd"
+            | "TrayNotifyWnd"
+            | "NotifyIconOverflowWindow"
+            | "TopLevelWindowForOverflowXamlIsland"
+            | "Windows.UI.Core.CoreWindow"
+            | "XamlExplorerHostIslandWindow"
+            | "Progman"
+            | "WorkerW"
+            | "MultitaskingViewFrame"
+            | "ForegroundStaging"
+            | "tray_icon_app"
+    )
+}
+
+/// Whether a window can receive the pasted text: alive, visible, owned by
+/// another process and not part of the shell.
+fn is_paste_window(hwnd: isize) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetWindowThreadProcessId, IsWindow, IsWindowVisible,
+    };
+    if hwnd == 0 {
+        return false;
+    }
+    // SAFETY: plain Win32 window queries on a handle supplied by the OS.
+    unsafe {
+        let hwnd = hwnd as windows_sys::Win32::Foundation::HWND;
+        if IsWindow(hwnd) == 0 || IsWindowVisible(hwnd) == 0 {
+            return false;
+        }
+        let mut pid: u32 = 0;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        if pid == std::process::id() {
+            return false;
+        }
+    }
+    !shell_window_class(&window_class(hwnd))
+}
+
+/// The last window that was a real paste target. Clicking the tray icon makes
+/// the taskbar the foreground window, so the target has to be remembered from
+/// before the click.
+static LAST_PASTE_TARGET: AtomicIsize = AtomicIsize::new(0);
+
+/// Remember the current foreground window when it is a usable paste target.
+fn track_paste_target() {
+    let hwnd = foreground_window();
+    if is_paste_window(hwnd) {
+        LAST_PASTE_TARGET.store(hwnd, Ordering::SeqCst);
+    }
+}
+
+/// Window to paste into: the current foreground when it is a real app window,
+/// otherwise the last app window that had focus (the tray click case).
+fn paste_target_window() -> isize {
+    let current = foreground_window();
+    if is_paste_window(current) {
+        current
+    } else {
+        LAST_PASTE_TARGET.load(Ordering::SeqCst)
+    }
+}
+
 /// Bring the remembered window back to the foreground. Windows may refuse the
 /// focus change from a background process, so the result is verified instead of
 /// trusted; a failed restore means "do not paste into a random window".
 fn focus_window(hwnd: isize) -> bool {
     use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         GetForegroundWindow, GetWindowThreadProcessId, IsIconic, PeekMessageW, SetForegroundWindow,
         ShowWindow, MSG, PM_NOREMOVE, SW_RESTORE,
@@ -89,6 +181,11 @@ fn focus_window(hwnd: isize) -> bool {
         let target = GetWindowThreadProcessId(hwnd, std::ptr::null_mut());
         let attached = target != 0 && AttachThreadInput(current, target, 1) != 0;
         let raised = SetForegroundWindow(hwnd);
+        if attached {
+            // Sharing the input queue also allows moving the keyboard focus,
+            // which some applications need before they accept Ctrl+V.
+            SetFocus(hwnd);
+        }
         if attached {
             AttachThreadInput(current, target, 0);
         }
@@ -169,20 +266,39 @@ fn paste_at_cursor(target: isize, previous: Option<ClipboardSnapshot>, pasted: S
     std::thread::spawn(move || {
         // Let the key that stopped the recording settle before we steal focus.
         std::thread::sleep(Duration::from_millis(120));
+        log::log(&format!(
+            "pasting into hwnd=0x{target:X} class={}",
+            window_class(target)
+        ));
         if !focus_window(target) {
             // The window cannot be raised (closed, elevated, or focus locked).
             // Keep the text in the clipboard so the user can paste manually.
-            log::log("paste skipped: could not focus the target window");
+            log::log(&format!(
+                "paste skipped: could not focus hwnd=0x{target:X} (foreground is 0x{:X} class={})",
+                foreground_window(),
+                window_class(foreground_window())
+            ));
             return;
         }
-        std::thread::sleep(Duration::from_millis(120));
+        std::thread::sleep(Duration::from_millis(150));
+        if foreground_window() != target {
+            // Focus moved away again: do not type into an unrelated window.
+            log::log(&format!(
+                "paste skipped: focus left hwnd=0x{target:X} (now 0x{:X} class={})",
+                foreground_window(),
+                window_class(foreground_window())
+            ));
+            return;
+        }
         if !send_ctrl_v() {
             log::log("paste failed: SendInput was rejected");
+        } else {
+            log::log("paste sent (Ctrl+V)");
         }
         // Give the application time to read the clipboard, then put the user's
         // previous clipboard back. If something else already replaced the
         // clipboard, leave it alone: restoring would discard that content.
-        std::thread::sleep(Duration::from_millis(300));
+        std::thread::sleep(Duration::from_millis(400));
         let clipboard_still_ours = arboard::Clipboard::new()
             .and_then(|mut clipboard| clipboard.get_text())
             .map(|current| current == pasted)
@@ -190,6 +306,7 @@ fn paste_at_cursor(target: isize, previous: Option<ClipboardSnapshot>, pasted: S
         if clipboard_still_ours {
             if let Some(snapshot) = previous {
                 restore_clipboard(snapshot);
+                log::log("previous clipboard restored");
             }
         } else {
             log::log("clipboard changed after paste; previous clipboard not restored");
@@ -509,12 +626,17 @@ fn toggle_record(
                     .store(recorder.sample_rate(), Ordering::SeqCst);
                 ctx.append_now.store(append, Ordering::SeqCst);
                 // The paste target is captured now, while the user's window is
-                // still in front; transcription may take a while and focus can
-                // move meanwhile.
-                ctx.paste_target.store(
-                    if paste { foreground_window() } else { 0 },
-                    Ordering::SeqCst,
-                );
+                // still the reference; transcription may take a while and focus
+                // can move meanwhile. A tray click moves the foreground to the
+                // taskbar, so fall back to the last real app window.
+                let target = if paste { paste_target_window() } else { 0 };
+                if paste {
+                    log::log(&format!(
+                        "paste target: hwnd=0x{target:X} class={}",
+                        window_class(target)
+                    ));
+                }
+                ctx.paste_target.store(target, Ordering::SeqCst);
                 ctx.recording.store(true, Ordering::SeqCst);
                 ipc::clear_live(&dirs.root);
                 set_status(shared, tray_cmds, dirs, Status::Recording);
@@ -689,6 +811,9 @@ fn run_daemon() {
     let mut last_rotate = std::time::Instant::now();
     set_status(&shared, &tray_cmds, &dirs, Status::Idle);
     loop {
+        // Keep the last real foreground window around: a tray click puts the
+        // taskbar in front, and the paste must still find the user's app.
+        track_paste_target();
         let action = match action_rx.recv_timeout(Duration::from_millis(50)) {
             Ok(action) => Some(action),
             Err(mpsc::RecvTimeoutError::Timeout) => None,
