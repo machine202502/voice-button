@@ -187,7 +187,7 @@ fn run(
     let tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_menu_on_left_click(false)
-        .with_tooltip("Voice Button - left click to record")
+        .with_tooltip("Voice Button - left click: record, middle click: record and paste")
         .with_icon(icons::icon_idle())
         .build()
         .expect("failed to create tray icon");
@@ -275,9 +275,24 @@ fn run(
             }
         }
         for (button, button_state) in poll_clicks() {
-            if button == MouseButton::Left && button_state == MouseButtonState::Down {
-                crate::log::log("tray left click");
-                let _ = to_app.send(TrayAction::RecordToggle);
+            if button_state != MouseButtonState::Down {
+                continue;
+            }
+            let action = match button {
+                MouseButton::Left => {
+                    crate::log::log("tray left click");
+                    Some(TrayAction::RecordToggle)
+                }
+                MouseButton::Middle => {
+                    // Middle click mirrors the paste hotkey: record a new
+                    // message and insert it at the caret of the focused window.
+                    crate::log::log("tray middle click");
+                    Some(TrayAction::RecordPaste)
+                }
+                MouseButton::Right => None,
+            };
+            if let Some(action) = action {
+                let _ = to_app.send(action);
             }
         }
         for id in poll_menu_ids() {
