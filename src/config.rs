@@ -31,13 +31,25 @@ pub struct Config {
     pub play_start_sound: bool,
     #[serde(default = "default_true")]
     pub play_end_sound: bool,
-    /// Global start/stop shortcut, e.g. "Ctrl+Alt+R". Empty disables it.
+    /// Global start/stop shortcut, e.g. "Ctrl+Alt+R". Empty (the default)
+    /// means the shortcut is not bound.
     #[serde(default = "default_hotkey")]
     pub hotkey: String,
+    /// Global append shortcut: transcribes a piece and appends it to the last
+    /// history entry, then copies the full merged message. Empty disables it.
+    #[serde(default)]
+    pub append_hotkey: String,
+    /// Global shortcut that records a new message, saves it to history and
+    /// pastes the text at the caret of the window that was active when the
+    /// shortcut was pressed. The previous clipboard content is restored after
+    /// the paste. Empty disables it.
+    #[serde(default)]
+    pub paste_hotkey: String,
 }
 
+/// Shortcuts start unbound: the user picks them in Settings.
 fn default_hotkey() -> String {
-    crate::hotkey::DEFAULT.to_string()
+    String::new()
 }
 
 fn default_sound_volume() -> f32 {
@@ -62,7 +74,9 @@ impl Default for Config {
             play_start_sound: true,
             play_end_sound: true,
             sound_volume: 0.5,
-            hotkey: crate::hotkey::DEFAULT.to_string(),
+            hotkey: String::new(),
+            append_hotkey: String::new(),
+            paste_hotkey: String::new(),
         }
     }
 }
@@ -111,7 +125,10 @@ pub fn load_config(root: &std::path::Path) -> Config {
     // Retired catalog ids (istupakov exports and older folders) map to the
     // sherpa-onnx conversions this build actually ships.
     config.onnx_model = match config.onnx_model.as_str() {
-        "gigaam-v3-ctc-int8" | "gigaam-v3-ctc" | "v3_ctc" | "multi-gigaam-ctc"
+        "gigaam-v3-ctc-int8"
+        | "gigaam-v3-ctc"
+        | "v3_ctc"
+        | "multi-gigaam-ctc"
         | "multi-gigaam-large-ctc" => "gigaam-v3-sherpa-int8",
         "gigaam-v3-e2e-rnnt-int8" | "v3_e2e_rnnt" => "gigaam-v3-rnnt-punct",
         "v3_e2e_ctc" => "gigaam-v3-ctc-punct",

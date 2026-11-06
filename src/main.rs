@@ -1,14 +1,21 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
+use std::time::Duration;
 use voice_button::recorder::{Recorder, Recording};
 use voice_button::state::{self, Shared, Status};
 use voice_button::{autostart, config, ipc, log, model_manager, tray, ui};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{mpsc, Arc, Mutex, OnceLock};
-use std::time::Duration;
 
 enum AppEvent {
-    Transcribed(String, String),
+    /// A recording finished; `append` selects the append-to-last-message mode,
+    /// `paste_target` carries the window to paste into (record-and-paste mode).
+    Transcribed {
+        text: String,
+        model: String,
+        append: bool,
+        paste_target: Option<isize>,
+    },
     Failed(String),
 }
 
@@ -25,6 +32,191 @@ struct LiveCtx {
     final_tx: mpsc::SyncSender<Recording>,
     buffer: Arc<Mutex<Vec<f32>>>,
     sample_rate: AtomicU32,
+    /// Whether the current recording was started in the append-to-last mode;
+    /// read back when the final transcript arrives.
+    append_now: Arc<AtomicBool>,
+    /// Target window for record-and-paste mode (0 = plain recording). Captured
+    /// when recording starts, so the text goes back to the window the user was
+    /// working in even if focus changes during transcription.
+    paste_target: Arc<AtomicIsize>,
+}
+
+/// Time string used for the history entries and appended chunks.
+fn now_stamp() -> String {
+    chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+/// Window that is in the foreground right now, as a raw handle (0 when none).
+fn foreground_window() -> isize {
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+    // SAFETY: GetForegroundWindow has no preconditions and only reads state.
+    unsafe { GetForegroundWindow() as isize }
+}
+
+/// Bring the remembered window back to the foreground. Windows may refuse the
+/// focus change from a background process, so the result is verified instead of
+/// trusted; a failed restore means "do not paste into a random window".
+fn focus_window(hwnd: isize) -> bool {
+    use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetForegroundWindow, GetWindowThreadProcessId, IsIconic, PeekMessageW, SetForegroundWindow,
+        ShowWindow, MSG, PM_NOREMOVE, SW_RESTORE,
+    };
+    if hwnd == 0 {
+        return false;
+    }
+    // SAFETY: plain Win32 window/thread queries; hwnd came from the OS and is
+    // checked for validity by the calls themselves.
+    unsafe {
+        let hwnd = hwnd as windows_sys::Win32::Foundation::HWND;
+        if windows_sys::Win32::UI::WindowsAndMessaging::IsWindow(hwnd) == 0 {
+            return false;
+        }
+        if GetForegroundWindow() == hwnd {
+            return true;
+        }
+        // AttachThreadInput needs this thread to own a message queue; the
+        // paste thread is fresh, so create the queue explicitly.
+        let mut msg: MSG = core::mem::zeroed();
+        PeekMessageW(&mut msg, core::ptr::null_mut(), 0, 0, PM_NOREMOVE);
+        if IsIconic(hwnd) != 0 {
+            ShowWindow(hwnd, SW_RESTORE);
+        }
+        // A background process usually cannot raise a window on its own.
+        // Attaching to the target's input queue lifts that restriction for the
+        // duration of the call.
+        let current = GetCurrentThreadId();
+        let target = GetWindowThreadProcessId(hwnd, std::ptr::null_mut());
+        let attached = target != 0 && AttachThreadInput(current, target, 1) != 0;
+        let raised = SetForegroundWindow(hwnd);
+        if attached {
+            AttachThreadInput(current, target, 0);
+        }
+        raised != 0 && GetForegroundWindow() == hwnd
+    }
+}
+
+/// Send Ctrl+V to the foreground window.
+fn send_ctrl_v() -> bool {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VK_CONTROL, VK_V,
+    };
+    fn key(vk: u16, up: bool) -> INPUT {
+        INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: vk,
+                    wScan: 0,
+                    dwFlags: if up { KEYEVENTF_KEYUP } else { 0 },
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        }
+    }
+    let inputs = [
+        key(VK_CONTROL, false),
+        key(VK_V, false),
+        key(VK_V, true),
+        key(VK_CONTROL, true),
+    ];
+    // SAFETY: the array is valid for the duration of the call; SendInput reads
+    // exactly `len` INPUT-sized records.
+    let sent = unsafe {
+        SendInput(
+            inputs.len() as u32,
+            inputs.as_ptr(),
+            core::mem::size_of::<INPUT>() as i32,
+        )
+    };
+    sent == inputs.len() as u32
+}
+
+/// Clipboard content saved before a record-and-paste run. Text and images can
+/// be restored; other formats (HTML, files) cannot and are left replaced.
+enum ClipboardSnapshot {
+    Text(String),
+    Image(arboard::ImageData<'static>),
+}
+
+fn snapshot_clipboard() -> Option<ClipboardSnapshot> {
+    let mut clipboard = arboard::Clipboard::new().ok()?;
+    if let Ok(text) = clipboard.get_text() {
+        return Some(ClipboardSnapshot::Text(text));
+    }
+    clipboard.get_image().ok().map(ClipboardSnapshot::Image)
+}
+
+fn restore_clipboard(snapshot: ClipboardSnapshot) {
+    let Ok(mut clipboard) = arboard::Clipboard::new() else {
+        return;
+    };
+    match snapshot {
+        ClipboardSnapshot::Text(text) => {
+            let _ = clipboard.set_text(text);
+        }
+        ClipboardSnapshot::Image(image) => {
+            let _ = clipboard.set_image(image);
+        }
+    }
+}
+
+/// Paste the transcribed text into a window without keeping the clipboard
+/// hijacked: the previous clipboard content is restored once the target
+/// application had time to read the text.
+fn paste_at_cursor(target: isize, previous: Option<ClipboardSnapshot>, pasted: String) {
+    std::thread::spawn(move || {
+        // Let the key that stopped the recording settle before we steal focus.
+        std::thread::sleep(Duration::from_millis(120));
+        if !focus_window(target) {
+            // The window cannot be raised (closed, elevated, or focus locked).
+            // Keep the text in the clipboard so the user can paste manually.
+            log::log("paste skipped: could not focus the target window");
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(120));
+        if !send_ctrl_v() {
+            log::log("paste failed: SendInput was rejected");
+        }
+        // Give the application time to read the clipboard, then put the user's
+        // previous clipboard back. If something else already replaced the
+        // clipboard, leave it alone: restoring would discard that content.
+        std::thread::sleep(Duration::from_millis(300));
+        let clipboard_still_ours = arboard::Clipboard::new()
+            .and_then(|mut clipboard| clipboard.get_text())
+            .map(|current| current == pasted)
+            .unwrap_or(false);
+        if clipboard_still_ours {
+            if let Some(snapshot) = previous {
+                restore_clipboard(snapshot);
+            }
+        } else {
+            log::log("clipboard changed after paste; previous clipboard not restored");
+        }
+    });
+}
+
+/// Merge a newly transcribed piece into the last history entry. The full
+/// merged text becomes the entry text, so every "copy whole message" path
+/// (clipboard after stop, tray menu, UI Copy button) keeps working unchanged.
+fn merged_entry(prev: state::HistoryEntry, piece: &str) -> state::HistoryEntry {
+    let piece = piece.trim();
+    let mut text = prev.text.trim_end().to_string();
+    // Every dictation in append mode starts on its own line, so the merged
+    // message reads as a sequence of paragraphs both in the clipboard and in
+    // the history view.
+    if !text.is_empty() && !piece.is_empty() {
+        text.push('\n');
+    }
+    text.push_str(piece);
+    let mut entry = prev;
+    entry.text = text;
+    entry.parts.push(state::HistoryChunk {
+        at: now_stamp(),
+        text: piece.to_string(),
+    });
+    entry
 }
 
 static LIVE: OnceLock<LiveCtx> = OnceLock::new();
@@ -62,6 +254,8 @@ fn spawn_final_transcription(
     dirs: config::AppDirs,
     events_tx: mpsc::Sender<AppEvent>,
     recording: Recording,
+    append: bool,
+    paste_target: Option<isize>,
 ) {
     std::thread::spawn(move || {
         let config = shared.lock().config.clone();
@@ -70,8 +264,16 @@ fn spawn_final_transcription(
             .and_then(|t| t.transcribe(recording))
         {
             Ok(text) => {
-                log::log(&format!("transcription done ({} chars)", text.chars().count()));
-                AppEvent::Transcribed(text, model)
+                log::log(&format!(
+                    "transcription done ({} chars)",
+                    text.chars().count()
+                ));
+                AppEvent::Transcribed {
+                    text,
+                    model,
+                    append,
+                    paste_target,
+                }
             }
             Err(e) => {
                 log::log(&format!("transcription failed: {e:#}"));
@@ -151,7 +353,13 @@ fn spawn_live_worker(
             }
         };
         let started = chrono::Local::now().timestamp_millis();
-        ipc::write_live(&dirs.root, &ipc::LiveView { text: String::new(), started });
+        ipc::write_live(
+            &dirs.root,
+            &ipc::LiveView {
+                text: String::new(),
+                started,
+            },
+        );
         let sample_rate = ctx.sample_rate.load(Ordering::SeqCst);
         // A live preview re-decodes the whole buffer, which only pays off for
         // the light GigaAM models. Whisper needs seconds per pass, so it stays
@@ -172,7 +380,12 @@ fn spawn_live_worker(
                 if samples.len() >= last_len + sample_rate as usize / 4 {
                     last_attempt = std::time::Instant::now();
                     last_len = samples.len();
-                    match transcribe_stream_piece(transcriber.as_ref(), &samples, sample_rate, "live") {
+                    match transcribe_stream_piece(
+                        transcriber.as_ref(),
+                        &samples,
+                        sample_rate,
+                        "live",
+                    ) {
                         Ok(text) => {
                             if text != live_text {
                                 live_text.clone_from(&text);
@@ -188,6 +401,14 @@ fn spawn_live_worker(
         match final_rx.recv_timeout(Duration::from_secs(5)) {
             Ok(recording) => {
                 let seconds = recording.samples.len() as f64 / recording.sample_rate.max(1) as f64;
+                // The append/paste modes were fixed when the recording started;
+                // read the flags before decoding.
+                let append = ctx.append_now.load(std::sync::atomic::Ordering::SeqCst);
+                let paste_target = match ctx.paste_target.load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    0 => None,
+                    hwnd => Some(hwnd),
+                };
                 // Always re-decode the complete recording: the live preview is
                 // only a hint, never the result.
                 let event = match transcribe_stream_piece(
@@ -201,13 +422,23 @@ fn spawn_live_worker(
                             "transcription done ({} chars, {seconds:.2}s audio)",
                             text.chars().count()
                         ));
-                        AppEvent::Transcribed(text, model.clone())
+                        AppEvent::Transcribed {
+                            text,
+                            model: model.clone(),
+                            append,
+                            paste_target,
+                        }
                     }
                     Err(e) if !live_text.is_empty() => {
                         log::log(&format!(
                             "final transcription failed ({e:#}); keeping the last live transcript"
                         ));
-                        AppEvent::Transcribed(live_text, model.clone())
+                        AppEvent::Transcribed {
+                            text: live_text,
+                            model: model.clone(),
+                            append,
+                            paste_target,
+                        }
                     }
                     Err(e) => AppEvent::Failed(format!("{e:#}")),
                 };
@@ -229,6 +460,8 @@ fn toggle_record(
     dirs: &config::AppDirs,
     tray_cmds: &mpsc::Sender<tray::TrayCommand>,
     events_tx: mpsc::Sender<AppEvent>,
+    append: bool,
+    paste: bool,
 ) {
     let ctx = LIVE.get().expect("live context initialized");
     if !recording_toggle_allowed(shared.lock().status, recorder.is_active()) {
@@ -245,6 +478,11 @@ fn toggle_record(
                 return;
             }
         };
+        let append_now = ctx.append_now.load(Ordering::SeqCst);
+        let paste_target = match ctx.paste_target.load(Ordering::SeqCst) {
+            0 => None,
+            hwnd => Some(hwnd),
+        };
         ctx.recording.store(false, Ordering::SeqCst);
         // The end cue belongs to the finished transcription, not to the
         // keypress: it plays once the text is in the clipboard.
@@ -254,13 +492,29 @@ fn toggle_record(
             Err(mpsc::TrySendError::Disconnected(recording))
             | Err(mpsc::TrySendError::Full(recording)) => {
                 // Live worker is gone (or overloaded): transcribe standalone.
-                spawn_final_transcription(shared.clone(), dirs.clone(), events_tx, recording);
+                spawn_final_transcription(
+                    shared.clone(),
+                    dirs.clone(),
+                    events_tx,
+                    recording,
+                    append_now,
+                    paste_target,
+                );
             }
         }
     } else {
         match recorder.start() {
             Ok(()) => {
-                ctx.sample_rate.store(recorder.sample_rate(), Ordering::SeqCst);
+                ctx.sample_rate
+                    .store(recorder.sample_rate(), Ordering::SeqCst);
+                ctx.append_now.store(append, Ordering::SeqCst);
+                // The paste target is captured now, while the user's window is
+                // still in front; transcription may take a while and focus can
+                // move meanwhile.
+                ctx.paste_target.store(
+                    if paste { foreground_window() } else { 0 },
+                    Ordering::SeqCst,
+                );
                 ctx.recording.store(true, Ordering::SeqCst);
                 ipc::clear_live(&dirs.root);
                 set_status(shared, tray_cmds, dirs, Status::Recording);
@@ -320,12 +574,7 @@ fn show_ui(child: &mut Option<std::process::Child>, tab: &str) {
         return;
     }
     match std::process::Command::new(&spawn_exe)
-        .args([
-            "--ui",
-            tab,
-            "--parent",
-            &std::process::id().to_string(),
-        ])
+        .args(["--ui", tab, "--parent", &std::process::id().to_string()])
         .spawn()
     {
         Ok(c) => *child = Some(c),
@@ -347,7 +596,6 @@ fn ensure_single_instance() -> bool {
     // SAFETY: no state needed beyond the error value.
     unsafe { GetLastError() != ERROR_ALREADY_EXISTS }
 }
-
 
 /// Watch the physical keyboard while the Settings window captures a shortcut.
 /// Returns the canonical text of the first complete combination, or "cancel" for
@@ -398,6 +646,8 @@ fn run_daemon() {
     // A capture request left behind by a crashed settings window would keep the
     // hotkey released forever, so start from a clean slate.
     ipc::set_hotkey_capture(&dirs.root, false);
+    ipc::set_append_hotkey_capture(&dirs.root, false);
+    ipc::set_paste_hotkey_capture(&dirs.root, false);
     if !ensure_single_instance() {
         log::log("another daemon instance is already running, exiting");
         std::process::exit(0);
@@ -409,7 +659,12 @@ fn run_daemon() {
     let history = state::load_history(&dirs.root);
     let shared = Arc::new(Shared::new(cfg.clone(), history));
     let (action_tx, action_rx) = mpsc::channel::<tray::TrayAction>();
-    let tray_cmds = tray::start(action_tx, voice_button::hotkey::parse(&cfg.hotkey));
+    let tray_cmds = tray::start(
+        action_tx,
+        voice_button::hotkey::parse(&cfg.hotkey),
+        voice_button::hotkey::parse(&cfg.append_hotkey),
+        voice_button::hotkey::parse(&cfg.paste_hotkey),
+    );
     let (events_tx, events_rx) = mpsc::channel::<AppEvent>();
     let mut recorder = Recorder::new();
     let (final_tx, final_rx) = mpsc::sync_channel::<Recording>(1);
@@ -418,6 +673,8 @@ fn run_daemon() {
         final_tx,
         buffer: recorder.buffer_handle(),
         sample_rate: AtomicU32::new(48_000),
+        append_now: Arc::new(AtomicBool::new(false)),
+        paste_target: Arc::new(AtomicIsize::new(0)),
     });
     spawn_live_worker(shared.clone(), dirs.clone(), events_tx.clone(), final_rx);
     let mut last_click: Option<std::time::Instant> = None;
@@ -439,8 +696,14 @@ fn run_daemon() {
         };
         if let Some(action) = action {
             log::log(&format!("main got action {action:?}"));
-            match action {
-                tray::TrayAction::RecordToggle => {
+            match &action {
+                tray::TrayAction::RecordToggle
+                | tray::TrayAction::RecordAppend
+                | tray::TrayAction::RecordPaste => {
+                    // Append records a piece for the last message; paste records
+                    // a new message and inserts it at the remembered caret.
+                    let append = matches!(action, tray::TrayAction::RecordAppend);
+                    let paste = matches!(action, tray::TrayAction::RecordPaste);
                     if !recording_allowed(&shared, &dirs) {
                         // No usable model or a download is running: point the
                         // user at Settings instead of failing to record.
@@ -458,28 +721,64 @@ fn run_daemon() {
                                 &dirs,
                                 &tray_cmds,
                                 events_tx.clone(),
+                                append,
+                                paste,
                             );
                         }
                     }
                 }
                 tray::TrayAction::OpenSettings => show_ui(&mut ui_child, "settings"),
                 tray::TrayAction::OpenCapture => show_ui(&mut ui_child, "capture"),
-                tray::TrayAction::CopyLast => {
-                    match shared.lock().history.entry(0) {
-                        Ok(entry) => copy_to_clipboard(&entry.text),
-                        Err(e) => log::log(&format!("failed to read last history entry: {e:#}")),
-                    }
-                }
+                tray::TrayAction::CopyLast => match shared.lock().history.entry(0) {
+                    Ok(entry) => copy_to_clipboard(&entry.text),
+                    Err(e) => log::log(&format!("failed to read last history entry: {e:#}")),
+                },
                 tray::TrayAction::OpenModelsFolder => {
-                    let _ = std::process::Command::new("explorer").arg(&dirs.models).spawn();
+                    let _ = std::process::Command::new("explorer")
+                        .arg(&dirs.models)
+                        .spawn();
                 }
                 tray::TrayAction::Quit => break,
             }
         }
         while let Ok(event) = events_rx.try_recv() {
             match event {
-                AppEvent::Transcribed(text, model) => {
-                    copy_to_clipboard(&text);
+                AppEvent::Transcribed {
+                    text,
+                    model,
+                    append,
+                    paste_target,
+                } => {
+                    // Append mode: the piece continues the last history entry;
+                    // the clipboard gets the full merged message either way.
+                    let previous = if append && !text.trim().is_empty() {
+                        match shared.lock().history.entry(0) {
+                            Ok(prev) => Some(prev),
+                            Err(e) => {
+                                // Nothing to append to (e.g. first ever
+                                // recording): keep the piece as a fresh entry.
+                                log::log(&format!("no history entry to append to: {e:#}"));
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    let to_copy = previous
+                        .as_ref()
+                        .map(|prev| merged_entry(prev.clone(), &text).text)
+                        .unwrap_or_else(|| text.clone());
+                    let text_is_empty = text.trim().is_empty();
+                    // Record-and-paste borrows the clipboard only for Ctrl+V:
+                    // save what the user had there before replacing it.
+                    let clipboard_before = if paste_target.is_some() && !text_is_empty {
+                        snapshot_clipboard()
+                    } else {
+                        None
+                    };
+                    if !(paste_target.is_some() && text_is_empty) {
+                        copy_to_clipboard(&to_copy);
+                    }
                     // The transcription is complete and the text is already in
                     // the clipboard, so the end cue now means "text is ready".
                     let (play, volume) = {
@@ -489,16 +788,54 @@ fn run_daemon() {
                     if play {
                         voice_button::sound::play_end(volume);
                     }
-                    if !text.trim().is_empty() {
-                        let at = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-                        let entry = state::HistoryEntry { at, text, model };
-                        match voice_button::history::append(&dirs.root, &entry) {
-                            Ok(row) => shared.lock().history.push_row(row),
-                            Err(e) => {
-                                log::log(&format!("failed to append history: {e:#}"));
-                                shared.set_error(format!("failed to save history: {e:#}"));
+                    if !text_is_empty {
+                        match previous {
+                            Some(prev) => {
+                                let merged = merged_entry(prev, &text);
+                                // update_last replaces the newest row in
+                                // place, both on disk and in the index.
+                                let result = shared.lock().history.update_last(&dirs.root, &merged);
+                                if let Err(e) = result {
+                                    // Never lose the new piece: if the last
+                                    // line cannot be rewritten, save the
+                                    // merged message as a fresh entry.
+                                    log::log(&format!(
+                                        "failed to rewrite the last history entry ({e:#}); appending a new one"
+                                    ));
+                                    match voice_button::history::append(&dirs.root, &merged) {
+                                        Ok(row) => shared.lock().history.push_row(row),
+                                        Err(e) => {
+                                            log::log(&format!("failed to append history: {e:#}"));
+                                            shared.set_error(format!(
+                                                "failed to save history: {e:#}"
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                            None => {
+                                let entry = state::HistoryEntry {
+                                    at: now_stamp(),
+                                    text,
+                                    model,
+                                    parts: Vec::new(),
+                                };
+                                match voice_button::history::append(&dirs.root, &entry) {
+                                    Ok(row) => shared.lock().history.push_row(row),
+                                    Err(e) => {
+                                        log::log(&format!("failed to append history: {e:#}"));
+                                        shared.set_error(format!("failed to save history: {e:#}"));
+                                    }
+                                }
                             }
                         }
+                    }
+                    // Put the text at the caret of the window the user was in
+                    // when recording started. Runs on its own thread so the
+                    // daemon keeps handling hotkeys while focus and the
+                    // clipboard are juggled.
+                    if let Some(hwnd) = paste_target.filter(|_| !text_is_empty) {
+                        paste_at_cursor(hwnd, clipboard_before, to_copy.clone());
                     }
                     set_status(&shared, &tray_cmds, &dirs, Status::Idle);
                 }
@@ -524,7 +861,16 @@ fn run_daemon() {
         // UI → daemon: start/stop recording.
         if ipc::take_record_request(&dirs.root) {
             if recording_allowed(&shared, &dirs) || recorder.is_active() {
-                toggle_record(&mut recorder, &shared, &dirs, &tray_cmds, events_tx.clone());
+                // The UI start button always records a fresh message.
+                toggle_record(
+                    &mut recorder,
+                    &shared,
+                    &dirs,
+                    &tray_cmds,
+                    events_tx.clone(),
+                    false,
+                    false,
+                );
             } else {
                 show_ui(&mut ui_child, "settings");
             }
@@ -574,11 +920,19 @@ fn run_daemon() {
             let _ = tray_cmds.send(tray::TrayCommand::SetHotkey(voice_button::hotkey::parse(
                 &cfg.hotkey,
             )));
+            let _ = tray_cmds.send(tray::TrayCommand::SetAppendHotkey(
+                voice_button::hotkey::parse(&cfg.append_hotkey),
+            ));
+            let _ = tray_cmds.send(tray::TrayCommand::SetPasteHotkey(
+                voice_button::hotkey::parse(&cfg.paste_hotkey),
+            ));
         }
-        // The Settings window asks for the shortcut to be released while it
+        // The Settings window asks for the shortcut(s) to be released while it
         // captures a new combination, otherwise its keystrokes would toggle
         // recording instead of reaching the input.
-        let capturing = ipc::hotkey_capture_active(&dirs.root);
+        let capturing = ipc::hotkey_capture_active(&dirs.root)
+            || ipc::append_hotkey_capture_active(&dirs.root)
+            || ipc::paste_hotkey_capture_active(&dirs.root);
         if capturing {
             // The settings window may not have keyboard focus and a released
             // global hotkey no longer swallows the keys, so the daemon watches
@@ -590,11 +944,18 @@ fn run_daemon() {
         }
         if capturing != last_hotkey_capture {
             last_hotkey_capture = capturing;
-            let _ = tray_cmds.send(tray::TrayCommand::SetHotkey(if capturing {
-                None
+            let (record_hotkey, append_hotkey, paste_hotkey) = if capturing {
+                (None, None, None)
             } else {
-                voice_button::hotkey::parse(&cfg.hotkey)
-            }));
+                (
+                    voice_button::hotkey::parse(&cfg.hotkey),
+                    voice_button::hotkey::parse(&cfg.append_hotkey),
+                    voice_button::hotkey::parse(&cfg.paste_hotkey),
+                )
+            };
+            let _ = tray_cmds.send(tray::TrayCommand::SetHotkey(record_hotkey));
+            let _ = tray_cmds.send(tray::TrayCommand::SetAppendHotkey(append_hotkey));
+            let _ = tray_cmds.send(tray::TrayCommand::SetPasteHotkey(paste_hotkey));
         }
         // Keep logs bounded: rotate log.txt before it grows past the limit.
         if last_rotate.elapsed() > Duration::from_secs(2) {
@@ -614,7 +975,11 @@ fn run_daemon() {
                     &shared,
                     &tray_cmds,
                     &dirs,
-                    if allowed { Status::Idle } else { Status::NoModel },
+                    if allowed {
+                        Status::Idle
+                    } else {
+                        Status::NoModel
+                    },
                 );
             }
         }
@@ -650,8 +1015,17 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::recording_toggle_allowed;
-    use voice_button::state::Status;
+    use super::{merged_entry, recording_toggle_allowed};
+    use voice_button::state::{HistoryChunk, HistoryEntry, Status};
+
+    fn entry(text: &str) -> HistoryEntry {
+        HistoryEntry {
+            at: "2026-11-07 10:00:00".to_string(),
+            text: text.to_string(),
+            model: "model".to_string(),
+            parts: Vec::new(),
+        }
+    }
 
     #[test]
     fn transcribing_cannot_start_a_new_recording() {
@@ -659,5 +1033,35 @@ mod tests {
         assert!(recording_toggle_allowed(Status::Transcribing, true));
         assert!(recording_toggle_allowed(Status::Idle, false));
         assert!(recording_toggle_allowed(Status::Recording, true));
+    }
+
+    #[test]
+    fn append_keeps_the_whole_message_and_records_the_piece() {
+        let merged = merged_entry(entry("Первая мысль."), "  Вторая мысль.  ");
+        assert_eq!(merged.text, "Первая мысль.\nВторая мысль.");
+        assert_eq!(merged.parts.len(), 1);
+        assert_eq!(merged.parts[0].text, "Вторая мысль.");
+        // The original timestamp and model stay: the message was created once.
+        assert_eq!(merged.at, "2026-11-07 10:00:00");
+        assert_eq!(merged.model, "model");
+    }
+
+    #[test]
+    fn append_twice_accumulates_pieces_on_new_lines() {
+        let once = merged_entry(entry("Раз."), "Два.");
+        let twice = merged_entry(once, "Три.");
+        assert_eq!(twice.text, "Раз.\nДва.\nТри.");
+        let texts: Vec<_> = twice
+            .parts
+            .iter()
+            .map(|p: &HistoryChunk| p.text.clone())
+            .collect();
+        assert_eq!(texts, vec!["Два.", "Три."]);
+    }
+
+    #[test]
+    fn append_to_an_empty_message_does_not_leave_a_leading_newline() {
+        let merged = merged_entry(entry("   "), "Кусочек.");
+        assert_eq!(merged.text, "Кусочек.");
     }
 }

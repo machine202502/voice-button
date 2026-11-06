@@ -3,12 +3,24 @@ use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// One appended piece inside a message that was built with the append
+/// shortcut. The full merged text stays in `HistoryEntry::text`; `parts` only
+/// records when each additional piece was added.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryChunk {
+    pub at: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryEntry {
     pub at: String,
     pub text: String,
     #[serde(default)]
     pub model: String,
+    /// Appended pieces in chronological order; empty for plain recordings.
+    #[serde(default)]
+    pub parts: Vec<HistoryChunk>,
 }
 
 #[derive(Debug, Clone)]
@@ -18,29 +30,41 @@ pub struct HistoryRow {
     model: String,
     offset: u64,
     len: usize,
-    inline_text: Option<String>,
+    pieces: usize,
+    inline_entry: Option<HistoryEntry>,
 }
 
 impl HistoryRow {
+    /// One-line preview: line breaks are flattened so the fixed row height in
+    /// the virtualized list stays correct.
+    fn preview_of(text: &str) -> String {
+        text.chars()
+            .take(60)
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect()
+    }
+
     fn new(entry: &HistoryEntry, offset: u64, len: usize) -> Self {
         Self {
             at: entry.at.clone(),
-            preview: entry.text.chars().take(60).collect(),
+            preview: Self::preview_of(&entry.text),
             model: entry.model.clone(),
             offset,
             len,
-            inline_text: None,
+            pieces: entry.parts.len(),
+            inline_entry: None,
         }
     }
 
     fn inline(entry: HistoryEntry) -> Self {
         Self {
-            at: entry.at,
-            preview: entry.text.chars().take(60).collect(),
-            model: entry.model,
+            preview: Self::preview_of(&entry.text),
+            at: entry.at.clone(),
+            model: entry.model.clone(),
             offset: 0,
             len: 0,
-            inline_text: Some(entry.text),
+            pieces: entry.parts.len(),
+            inline_entry: Some(entry),
         }
     }
 
@@ -58,6 +82,11 @@ impl HistoryRow {
         } else {
             &self.model
         }
+    }
+
+    /// Number of pieces appended to this message after it was created.
+    pub fn pieces(&self) -> usize {
+        self.pieces
     }
 }
 
@@ -147,13 +176,12 @@ impl History {
     }
 
     pub fn entry(&self, index: usize) -> Result<HistoryEntry> {
-        let row = self.rows.get(index).context("history row is out of range")?;
-        if let Some(text) = &row.inline_text {
-            return Ok(HistoryEntry {
-                at: row.at.clone(),
-                text: text.clone(),
-                model: row.model.clone(),
-            });
+        let row = self
+            .rows
+            .get(index)
+            .context("history row is out of range")?;
+        if let Some(entry) = &row.inline_entry {
+            return Ok(entry.clone());
         }
         let root = self.root.as_ref().context("history has no backing file")?;
         let path = history_path(root);
@@ -172,14 +200,40 @@ impl History {
         self.rows.insert(0, row);
     }
 
+    /// Rewrite the newest entry in place. The replaced line is the last line
+    /// of the file, so truncating at its start offset and rewriting keeps every
+    /// earlier entry's byte offset intact. Used to append a piece to a message.
+    pub fn update_last(&mut self, root: &Path, entry: &HistoryEntry) -> Result<HistoryRow> {
+        let row = self.rows.first().context("history is empty")?;
+        if row.inline_entry.is_some() {
+            // In-memory rows (UI snapshot mode) have no position on disk.
+            anyhow::bail!("history row has no backing file");
+        }
+        let offset = row.offset;
+        let path = history_path(root);
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("failed to open {}", path.display()))?;
+        let mut line = serde_json::to_vec(entry)?;
+        let len = line.len();
+        line.push(b'\n');
+        file.seek(SeekFrom::Start(offset))?;
+        file.set_len(offset)?;
+        file.write_all(&line)?;
+        file.flush()?;
+        let new_row = HistoryRow::new(entry, offset, len);
+        self.rows[0] = new_row.clone();
+        Ok(new_row)
+    }
+
     pub fn clear_local(&mut self) {
         self.rows.clear();
     }
 
     #[cfg(test)]
     fn disk_reads(&self) -> usize {
-        self.disk_reads
-            .load(std::sync::atomic::Ordering::SeqCst)
+        self.disk_reads.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -260,6 +314,7 @@ mod tests {
             at: format!("2026-11-06 00:00:{index:04}"),
             text: format!("Сообщение номер {index}, которое должно сохраниться полностью"),
             model: format!("model-{index}"),
+            parts: Vec::new(),
         }
     }
 
@@ -273,6 +328,58 @@ mod tests {
         assert_eq!(loaded.len(), 1000);
         assert_eq!(loaded.entry(0).unwrap().text, entry(999).text);
         assert_eq!(loaded.entry(999).unwrap().text, entry(0).text);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn update_last_merges_into_the_newest_line_only() {
+        let root = test_root("history-append");
+        append(&root, &entry(1)).unwrap();
+        append(&root, &entry(2)).unwrap();
+        let mut history = History::load(&root);
+        let mut merged = history.entry(0).unwrap();
+        merged.text = format!("{} Продолжение мысли", merged.text);
+        merged.parts.push(super::HistoryChunk {
+            at: "2026-11-06 00:01:00".to_string(),
+            text: "Продолжение мысли".to_string(),
+        });
+        history.update_last(&root, &merged).unwrap();
+        // Both entries survive, the newest one carries the merged text.
+        let loaded = History::load(&root);
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded.entry(1).unwrap().text, entry(1).text);
+        let newest = loaded.entry(0).unwrap();
+        assert_eq!(newest.text, format!("{} Продолжение мысли", entry(2).text));
+        assert_eq!(newest.parts.len(), 1);
+        assert_eq!(newest.parts[0].text, "Продолжение мысли");
+        // A second append keeps working (offsets stay valid).
+        let mut loaded = History::load(&root);
+        let mut again = loaded.entry(0).unwrap();
+        again.text.push_str(" И ещё кусочек");
+        again.parts.push(super::HistoryChunk {
+            at: "2026-11-06 00:02:00".to_string(),
+            text: "И ещё кусочек".to_string(),
+        });
+        loaded.update_last(&root, &again).unwrap();
+        let loaded = History::load(&root);
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded.entry(0).unwrap().parts.len(), 2);
+        assert_eq!(loaded.entry(1).unwrap().text, entry(1).text);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn entries_with_parts_round_trip() {
+        let root = test_root("history-parts");
+        let mut big = entry(1);
+        big.text = "Первый кусочек. Второй кусочек.".to_string();
+        big.parts.push(super::HistoryChunk {
+            at: "2026-11-06 00:03:00".to_string(),
+            text: "Второй кусочек.".to_string(),
+        });
+        append(&root, &big).unwrap();
+        let loaded = History::load(&root);
+        assert_eq!(loaded.entry(0).unwrap(), big);
         let _ = std::fs::remove_dir_all(root);
     }
 

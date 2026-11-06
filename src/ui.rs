@@ -40,23 +40,37 @@ pub fn run_from_args() {
         history = state::History::from_entries(vec![
             state::HistoryEntry {
                 at: "2026-11-05 09:14:32".to_string(),
-                text: "Hi! Remind me to call the bank after lunch - I need to check the loan terms and which documents to bring to the meeting with the account manager on Friday, and also ask about early repayment and fees, if any.".to_string(),
+                text: "Hi! Remind me to call the bank after lunch - I need to check the loan terms and which documents to bring to the meeting with the account manager on Friday, and also ask about early repayment and fees, if any.\nAlso ask whether the meeting can be moved to the morning.\nAnd print two copies of the contract.".to_string(),
                 model: "v3_e2e_rnnt".to_string(),
+                // Shows how pieces appended with the append hotkey look.
+                parts: vec![
+                    state::HistoryChunk {
+                        at: "2026-11-05 09:16:02".to_string(),
+                        text: "Also ask whether the meeting can be moved to the morning.".to_string(),
+                    },
+                    state::HistoryChunk {
+                        at: "2026-11-05 09:17:41".to_string(),
+                        text: "And print two copies of the contract.".to_string(),
+                    },
+                ],
             },
             state::HistoryEntry {
                 at: "2026-11-05 11:02:17".to_string(),
                 text: "Add milk, bread, eggs and coffee to the shopping list, and do not forget the cat food.".to_string(),
                 model: "v3_e2e_ctc".to_string(),
+                parts: Vec::new(),
             },
             state::HistoryEntry {
                 at: "2026-11-04 18:45:03".to_string(),
                 text: "Tomorrow at ten there is a team meeting; prepare the slides for the second section.".to_string(),
                 model: "large-v3-turbo-q5_0".to_string(),
+                parts: Vec::new(),
             },
             state::HistoryEntry {
                 at: "2026-11-04 15:20:44".to_string(),
                 text: "Translate the sentence into English: I would be glad to see you at the exhibition on Thursday.".to_string(),
                 model: "multi-gigaam-ctc".to_string(),
+                parts: Vec::new(),
             },
         ]);
         // Simulate a UI process opened while the daemon is already recording.
@@ -81,7 +95,11 @@ fn run_ui(config: config::Config, history: state::History, dirs: AppDirs, tab: S
         spawn_parent_watcher(pid);
     }
     spawn_file_poller(shared.clone(), dirs.clone());
-    let initial_tab = if tab == "settings" { Tab::Settings } else { Tab::Capture };
+    let initial_tab = if tab == "settings" {
+        Tab::Settings
+    } else {
+        Tab::Capture
+    };
     let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(WINDOW_TITLE)
@@ -89,9 +107,7 @@ fn run_ui(config: config::Config, history: state::History, dirs: AppDirs, tab: S
             .with_icon(crate::icons::window_icon()),
         ..Default::default()
     };
-    options.viewport = options
-        .viewport
-        .with_active(true);
+    options.viewport = options.viewport.with_active(true);
     let app = MainWindow {
         shared: shared.clone(),
         dirs: dirs.clone(),
@@ -114,6 +130,8 @@ fn run_ui(config: config::Config, history: state::History, dirs: AppDirs, tab: S
     }
     // Never leave the daemon hotkey released after the window is gone.
     crate::ipc::set_hotkey_capture(&dirs.root, false);
+    crate::ipc::set_append_hotkey_capture(&dirs.root, false);
+    crate::ipc::set_paste_hotkey_capture(&dirs.root, false);
 }
 
 fn current_parent_pid() -> Option<u32> {
@@ -292,7 +310,14 @@ impl eframe::App for MainWindow {
             ui.separator();
             match self.tab {
                 Tab::Capture => capture_body(ui, &mut data, &self.dirs, &mut self.expanded_history),
-                Tab::Settings => settings_body(ui, &mut data, &self.dirs),
+                Tab::Settings => {
+                    // The settings page is taller than the window on small
+                    // screens, so keep everything reachable by scrolling.
+                    ScrollArea::vertical()
+                        .id_source("settings_scroll")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| settings_body(ui, &mut data, &self.dirs));
+                }
             }
         });
         // A finished download may make a pending model selection applicable.
@@ -478,14 +503,20 @@ fn show_download_banner(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs) {
         0.0
     };
     ui.horizontal(|ui| {
-        ui.add(egui::ProgressBar::new(fraction).show_percentage().desired_width(220.0));
+        ui.add(
+            egui::ProgressBar::new(fraction)
+                .show_percentage()
+                .desired_width(220.0),
+        );
         ui.label(format!(
             "{} — file {}/{}: {}{}",
             dl.model,
             dl.file + 1,
             dl.files,
             bytes_to_mb(dl.downloaded),
-            dl.total.map(|t| format!(" / {}", bytes_to_mb(t))).unwrap_or_default(),
+            dl.total
+                .map(|t| format!(" / {}", bytes_to_mb(t)))
+                .unwrap_or_default(),
         ));
         if ui.button("Cancel").clicked() {
             // Cancellation crosses process borders via a flag file.
@@ -569,7 +600,11 @@ fn settings_body(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs) {
                 )
                 .changed();
             format_changed |= ui
-                .radio_value(&mut data.config.backend, Backend::Onnx, "ONNX (ONNX Runtime)")
+                .radio_value(
+                    &mut data.config.backend,
+                    Backend::Onnx,
+                    "ONNX (ONNX Runtime)",
+                )
                 .changed();
         });
     });
@@ -595,14 +630,20 @@ fn settings_body(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs) {
     }
     ui.separator();
     if ui.button("Open models folder").clicked() {
-        let _ = std::process::Command::new("explorer").arg(&dirs.models).spawn();
+        let _ = std::process::Command::new("explorer")
+            .arg(&dirs.models)
+            .spawn();
     }
     ui.separator();
     ui.heading("Sounds");
     let mut sounds_changed = false;
     let mut volume_pct = (data.config.sound_volume * 100.0).round().clamp(0.0, 100.0);
     if ui
-        .add(egui::Slider::new(&mut volume_pct, 0.0..=100.0).text("%").fixed_decimals(0))
+        .add(
+            egui::Slider::new(&mut volume_pct, 0.0..=100.0)
+                .text("%")
+                .fixed_decimals(0),
+        )
         .changed()
     {
         data.config.sound_volume = (volume_pct / 100.0).clamp(0.0, 1.0);
@@ -643,95 +684,9 @@ fn settings_body(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs) {
         apply_settings(data, dirs);
     }
     ui.separator();
-    ui.heading("Global hotkey");
-    ui.horizontal(|ui| {
-        if data.config.hotkey.is_empty() {
-            ui.monospace("disabled");
-        } else {
-            ui.monospace(data.config.hotkey.clone());
-        }
-        if data.capturing_hotkey {
-            ui.label(RichText::new("press Ctrl/Alt/Shift + key (or an F-key), Esc cancels").color(egui::Color32::from_rgb(230, 170, 60)));
-        } else if ui.button("Record shortcut").clicked() {
-            data.capturing_hotkey = true;
-            // Release the global hotkey while capturing, otherwise the very
-            // combination being typed would toggle recording instead of
-            // reaching this window.
-            crate::ipc::set_hotkey_capture(&dirs.root, true);
-            let _ = std::fs::remove_file(crate::ipc::hotkey_result_path(&dirs.root));
-            crate::log::log("hotkey capture started");
-        }
-        if ui.button("Clear").clicked() {
-            data.config.hotkey.clear();
-            apply_settings(data, dirs);
-            // Clearing means "pick a new one": start listening right away.
-            data.capturing_hotkey = true;
-            crate::ipc::set_hotkey_capture(&dirs.root, true);
-            let _ = std::fs::remove_file(crate::ipc::hotkey_result_path(&dirs.root));
-            crate::log::log("hotkey cleared, capture started");
-        }
-    });
-    if data.capturing_hotkey {
-        // The daemon watches the physical keyboard (the window may not hold
-        // focus) and reports the captured combination through this file.
-        if let Some(text) = crate::ipc::take_hotkey_result(&dirs.root) {
-            data.capturing_hotkey = false;
-            crate::ipc::set_hotkey_capture(&dirs.root, false);
-            if text != "cancel" {
-                if let Some(hotkey) = crate::hotkey::parse(&text) {
-                    data.config.hotkey = hotkey.label();
-                    crate::log::log(&format!("hotkey captured: {}", data.config.hotkey));
-                    apply_settings(data, dirs);
-                }
-            }
-        }
-    }
-    if data.capturing_hotkey {
-        let captured = ui.input(|input| {
-            for event in &input.events {
-                if let egui::Event::Key {
-                    key,
-                    pressed: true,
-                    modifiers,
-                    ..
-                } = event
-                {
-                    crate::log::log(&format!(
-                        "hotkey capture saw key {key:?} ctrl={} alt={} shift={}",
-                        modifiers.ctrl, modifiers.alt, modifiers.shift
-                    ));
-                    if *key == egui::Key::Escape {
-                        return Some(None);
-                    }
-                    // A global shortcut needs a modifier (or an F-key); otherwise
-                    // a stray Tab or letter would be captured and then stolen from
-                    // every application.
-                    let has_modifier = modifiers.ctrl || modifiers.alt || modifiers.shift;
-                    if let Some(vk) = crate::hotkey::vk_from_egui(*key) {
-                        if has_modifier || (0x70..=0x87).contains(&vk) {
-                            return Some(Some(crate::hotkey::Hotkey {
-                                ctrl: modifiers.ctrl,
-                                alt: modifiers.alt,
-                                shift: modifiers.shift,
-                                win: false,
-                                vk,
-                            }));
-                        }
-                    }
-                }
-            }
-            None
-        });
-        if let Some(captured) = captured {
-            data.capturing_hotkey = false;
-            crate::ipc::set_hotkey_capture(&dirs.root, false);
-            if let Some(hotkey) = captured {
-                data.config.hotkey = hotkey.label();
-                crate::log::log(&format!("hotkey captured: {}", data.config.hotkey));
-                apply_settings(data, dirs);
-            }
-        }
-    }
+    hotkey_section(ui, data, dirs, HotkeyField::Record);
+    hotkey_section(ui, data, dirs, HotkeyField::Append);
+    hotkey_section(ui, data, dirs, HotkeyField::Paste);
     ui.separator();
     let (format, model_id) = match data.config.backend {
         Backend::Whisper => (Backend::Whisper, data.config.whisper_model.as_str()),
@@ -775,13 +730,187 @@ fn settings_body(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs) {
     }
     if let Some(err) = &data.last_error {
         ui.label(
-            RichText::new(format!("Error: {err}"))
-                .color(egui::Color32::from_rgb(230, 90, 90)),
+            RichText::new(format!("Error: {err}")).color(egui::Color32::from_rgb(230, 90, 90)),
         );
     }
 }
 
-fn download_section(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs, model_id: &str) {    let active = data
+/// Which config shortcut a hotkey section edits.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HotkeyField {
+    /// Plain record start/stop shortcut.
+    Record,
+    /// "Append to the last message" shortcut.
+    Append,
+    /// Record a new message and paste it at the caret.
+    Paste,
+}
+
+impl HotkeyField {
+    fn stored(self, data: &Data) -> &str {
+        match self {
+            HotkeyField::Record => &data.config.hotkey,
+            HotkeyField::Append => &data.config.append_hotkey,
+            HotkeyField::Paste => &data.config.paste_hotkey,
+        }
+    }
+
+    fn stored_mut(self, data: &mut Data) -> &mut String {
+        match self {
+            HotkeyField::Record => &mut data.config.hotkey,
+            HotkeyField::Append => &mut data.config.append_hotkey,
+            HotkeyField::Paste => &mut data.config.paste_hotkey,
+        }
+    }
+
+    fn capturing(self, data: &Data) -> bool {
+        match self {
+            HotkeyField::Record => data.capturing_hotkey,
+            HotkeyField::Append => data.capturing_append_hotkey,
+            HotkeyField::Paste => data.capturing_paste_hotkey,
+        }
+    }
+
+    fn set_capturing(self, data: &mut Data, value: bool) {
+        match self {
+            HotkeyField::Record => data.capturing_hotkey = value,
+            HotkeyField::Append => data.capturing_append_hotkey = value,
+            HotkeyField::Paste => data.capturing_paste_hotkey = value,
+        }
+    }
+}
+
+/// The Settings window starts capturing one shortcut at a time.
+fn start_hotkey_capture(data: &mut Data, dirs: &AppDirs, field: HotkeyField) {
+    for other in [HotkeyField::Record, HotkeyField::Append, HotkeyField::Paste] {
+        other.set_capturing(data, other == field);
+    }
+    // Release the global hotkeys while capturing, otherwise the very
+    // combination being typed would toggle recording instead of
+    // reaching this window.
+    crate::ipc::set_hotkey_capture(&dirs.root, field == HotkeyField::Record);
+    crate::ipc::set_append_hotkey_capture(&dirs.root, field == HotkeyField::Append);
+    crate::ipc::set_paste_hotkey_capture(&dirs.root, field == HotkeyField::Paste);
+    let _ = std::fs::remove_file(crate::ipc::hotkey_result_path(&dirs.root));
+    crate::log::log("hotkey capture started");
+}
+
+fn stop_hotkey_capture(data: &mut Data, dirs: &AppDirs) {
+    for field in [HotkeyField::Record, HotkeyField::Append, HotkeyField::Paste] {
+        field.set_capturing(data, false);
+    }
+    crate::ipc::set_hotkey_capture(&dirs.root, false);
+    crate::ipc::set_append_hotkey_capture(&dirs.root, false);
+    crate::ipc::set_paste_hotkey_capture(&dirs.root, false);
+}
+
+fn hotkey_section(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs, field: HotkeyField) {
+    let heading = match field {
+        HotkeyField::Record => "Global hotkey",
+        HotkeyField::Append => "Append hotkey (continue the last message)",
+        HotkeyField::Paste => "Paste hotkey (type at the cursor)",
+    };
+    ui.heading(heading);
+    ui.label(
+        RichText::new(match field {
+            HotkeyField::Record => {
+                "Records a new message; the transcribed text is copied to the clipboard and saved as a new history entry."
+            }
+            HotkeyField::Append => {
+                "Records a piece and appends it to the last message; the full merged text is copied to the clipboard afterwards."
+            }
+            HotkeyField::Paste => {
+                "Records a new message and pastes it at the cursor of the window that was active when recording started; the previous clipboard content is restored afterwards."
+            }
+        })
+        .weak(),
+    );
+    let stored = field.stored(data).to_string();
+    ui.horizontal(|ui| {
+        if stored.is_empty() {
+            ui.monospace("disabled");
+        } else {
+            ui.monospace(stored);
+        }
+        if field.capturing(data) {
+            ui.label(
+                RichText::new("press Ctrl/Alt/Shift + key (or an F-key), Esc cancels")
+                    .color(egui::Color32::from_rgb(230, 170, 60)),
+            );
+        } else if ui.button("Record shortcut").clicked() {
+            start_hotkey_capture(data, dirs, field);
+        }
+        if ui.button("Clear").clicked() {
+            field.stored_mut(data).clear();
+            apply_settings(data, dirs);
+            // Clearing means "pick a new one": start listening right away.
+            start_hotkey_capture(data, dirs, field);
+        }
+    });
+    if !field.capturing(data) {
+        return;
+    }
+    let mut apply_captured = |captured: Option<crate::hotkey::Hotkey>| {
+        stop_hotkey_capture(data, dirs);
+        if let Some(hotkey) = captured {
+            let label = hotkey.label();
+            *field.stored_mut(data) = label.clone();
+            crate::log::log(&format!("hotkey captured: {label}"));
+            apply_settings(data, dirs);
+        }
+    };
+    // The daemon watches the physical keyboard (the window may not hold
+    // focus) and reports the captured combination through this file.
+    if let Some(text) = crate::ipc::take_hotkey_result(&dirs.root) {
+        apply_captured(if text == "cancel" {
+            None
+        } else {
+            crate::hotkey::parse(&text)
+        });
+    }
+    // Duplicate path when the window holds focus: read the events directly.
+    let captured = ui.input(|input| {
+        for event in &input.events {
+            if let egui::Event::Key {
+                key,
+                pressed: true,
+                modifiers,
+                ..
+            } = event
+            {
+                crate::log::log(&format!(
+                    "hotkey capture saw key {key:?} ctrl={} alt={} shift={}",
+                    modifiers.ctrl, modifiers.alt, modifiers.shift
+                ));
+                if *key == egui::Key::Escape {
+                    return Some(None);
+                }
+                // A global shortcut needs a modifier (or an F-key); otherwise
+                // a stray Tab or letter would be captured and then stolen from
+                // every application.
+                let has_modifier = modifiers.ctrl || modifiers.alt || modifiers.shift;
+                if let Some(vk) = crate::hotkey::vk_from_egui(*key) {
+                    if has_modifier || (0x70..=0x87).contains(&vk) {
+                        return Some(Some(crate::hotkey::Hotkey {
+                            ctrl: modifiers.ctrl,
+                            alt: modifiers.alt,
+                            shift: modifiers.shift,
+                            win: false,
+                            vk,
+                        }));
+                    }
+                }
+            }
+        }
+        None
+    });
+    if let Some(captured) = captured {
+        apply_captured(captured);
+    }
+}
+
+fn download_section(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs, model_id: &str) {
+    let active = data
         .download
         .as_ref()
         .map(|d| d.model == model_id && d.error.is_none() && !d.done)
@@ -841,8 +970,11 @@ fn whisper_section(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs, locked: b
             .selected_text(if custom {
                 "Custom file...".to_string()
             } else {
-                let marker =
-                    if model_manager::is_ready(&dirs.models, &data.config.whisper_model) { "" } else { " (not downloaded)" };
+                let marker = if model_manager::is_ready(&dirs.models, &data.config.whisper_model) {
+                    ""
+                } else {
+                    " (not downloaded)"
+                };
                 let size = model_manager::find_model(&data.config.whisper_model)
                     .map(|m| m.size)
                     .unwrap_or("");
@@ -853,7 +985,11 @@ fn whisper_section(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs, locked: b
                     if model.format != Backend::Whisper {
                         continue;
                     }
-                    let marker = if model_manager::is_ready(&dirs.models, model.id) { "" } else { " (not downloaded)" };
+                    let marker = if model_manager::is_ready(&dirs.models, model.id) {
+                        ""
+                    } else {
+                        " (not downloaded)"
+                    };
                     changed |= ui
                         .selectable_value(
                             &mut data.config.whisper_model,
@@ -863,7 +999,11 @@ fn whisper_section(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs, locked: b
                         .changed();
                 }
                 changed |= ui
-                    .selectable_value(&mut data.config.whisper_model, "custom".to_string(), "Custom file...")
+                    .selectable_value(
+                        &mut data.config.whisper_model,
+                        "custom".to_string(),
+                        "Custom file...",
+                    )
                     .changed();
             });
     });
@@ -911,8 +1051,11 @@ fn onnx_section(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs, locked: bool
             .selected_text(if custom {
                 "Custom folder...".to_string()
             } else {
-                let marker =
-                    if model_manager::is_ready(&dirs.models, &data.config.onnx_model) { "" } else { " (not downloaded)" };
+                let marker = if model_manager::is_ready(&dirs.models, &data.config.onnx_model) {
+                    ""
+                } else {
+                    " (not downloaded)"
+                };
                 let size = model_manager::find_model(&data.config.onnx_model)
                     .map(|m| m.size)
                     .unwrap_or("");
@@ -923,7 +1066,11 @@ fn onnx_section(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs, locked: bool
                     if model.format != Backend::Onnx {
                         continue;
                     }
-                    let marker = if model_manager::is_ready(&dirs.models, model.id) { "" } else { " (not downloaded)" };
+                    let marker = if model_manager::is_ready(&dirs.models, model.id) {
+                        ""
+                    } else {
+                        " (not downloaded)"
+                    };
                     changed |= ui
                         .selectable_value(
                             &mut data.config.onnx_model,
@@ -933,7 +1080,11 @@ fn onnx_section(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs, locked: bool
                         .changed();
                 }
                 changed |= ui
-                    .selectable_value(&mut data.config.onnx_model, "custom".to_string(), "Custom folder...")
+                    .selectable_value(
+                        &mut data.config.onnx_model,
+                        "custom".to_string(),
+                        "Custom folder...",
+                    )
                     .changed();
             });
     });
@@ -953,18 +1104,22 @@ fn onnx_section(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs, locked: bool
                 let path = PathBuf::from(&folder);
                 let family = model_manager::detect_family(&path);
                 let model_ok = model_manager::onnx_folder_ready(&path, family);
-                let vocab_ok =
-                    path.join("vocab.txt").exists() || path.join("vocab.json").exists();
+                let vocab_ok = path.join("vocab.txt").exists() || path.join("vocab.json").exists();
                 let graph_ok = path.join("model.onnx").exists()
                     || (path.join("encoder.onnx").exists()
                         && path.join("decoder.onnx").exists()
                         && path.join("joint.onnx").exists());
                 if model_ok {
-                    ui.label(RichText::new("Model files found.").color(egui::Color32::from_rgb(90, 200, 120)));
+                    ui.label(
+                        RichText::new("Model files found.")
+                            .color(egui::Color32::from_rgb(90, 200, 120)),
+                    );
                 } else {
                     let missing = [
                         (!vocab_ok).then_some("vocab.txt (or vocab.json)"),
-                        (!graph_ok).then_some("model.onnx (CTC) or encoder.onnx + decoder.onnx + joint.onnx (RNN-T)"),
+                        (!graph_ok).then_some(
+                            "model.onnx (CTC) or encoder.onnx + decoder.onnx + joint.onnx (RNN-T)",
+                        ),
                     ]
                     .into_iter()
                     .flatten()
@@ -1007,9 +1162,7 @@ fn capture_body(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs, expanded: &m
                         .color(egui::Color32::from_rgb(220, 60, 60)),
                 );
             } else {
-                ui.label(
-                    RichText::new("REC").color(egui::Color32::from_rgb(220, 60, 60)),
-                );
+                ui.label(RichText::new("REC").color(egui::Color32::from_rgb(220, 60, 60)));
             }
             ui.add_space(4.0);
             // A dedicated read-only field makes the live state visible even
@@ -1037,10 +1190,7 @@ fn capture_body(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs, expanded: &m
             });
         }
         crate::state::Status::Transcribing => {
-            ui.label(
-                RichText::new("Transcribing…")
-                    .color(egui::Color32::from_rgb(230, 150, 40)),
-            );
+            ui.label(RichText::new("Transcribing…").color(egui::Color32::from_rgb(230, 150, 40)));
         }
         _ => {
             let download_busy = data
@@ -1048,13 +1198,9 @@ fn capture_body(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs, expanded: &m
                 .as_ref()
                 .map(|d| !d.done && d.error.is_none())
                 .unwrap_or(false);
-            let can_record =
-                status != crate::state::Status::NoModel && !download_busy;
+            let can_record = status != crate::state::Status::NoModel && !download_busy;
             if !can_record {
-                ui.label(
-                    RichText::new("Recording is unavailable until a model is ready.")
-                        .weak(),
-                );
+                ui.label(RichText::new("Recording is unavailable until a model is ready.").weak());
             }
             if ui
                 .add_enabled(can_record, egui::Button::new("Start recording"))
@@ -1090,6 +1236,19 @@ fn history_row_offsets(
                         .y
                 });
                 height += text_height + spacing + 4.0;
+                // Every appended piece adds its own row (copy button + time)
+                // and its wrapped text below the full message.
+                for part in &entry.parts {
+                    let part_height = ui.fonts(|f| {
+                        f.layout(part.text.clone(), font.clone(), color, wrap_width)
+                            .size()
+                            .y
+                    });
+                    height += ui.spacing().interact_size.y + part_height + 2.0 * spacing;
+                }
+                if !entry.parts.is_empty() {
+                    height += spacing;
+                }
             }
         }
         offsets.push(offsets[index] + height);
@@ -1106,7 +1265,9 @@ fn visible_history_range(
     if rows == 0 {
         return 0..0;
     }
-    let first_visible = offsets.partition_point(|&end| end < viewport_min).min(rows - 1);
+    let first_visible = offsets
+        .partition_point(|&end| end < viewport_min)
+        .min(rows - 1);
     let first = first_visible.saturating_sub(1);
     let mut last = first + 1;
     while last < rows && offsets[last] <= viewport_max {
@@ -1142,8 +1303,8 @@ fn history_body(ui: &mut egui::Ui, data: &mut Data, expanded: &mut Option<usize>
                         continue;
                     };
                     let is_open = *expanded == Some(index);
-                    let full_text = if is_open {
-                        data.history.entry(index).ok().map(|entry| entry.text)
+                    let full_entry = if is_open {
+                        data.history.entry(index).ok()
                     } else {
                         None
                     };
@@ -1160,14 +1321,38 @@ fn history_body(ui: &mut egui::Ui, data: &mut Data, expanded: &mut Option<usize>
                                         )),
                                     }
                                 }
-                                ui.weak(format!("{} · {}", row.at(), row.model()));
+                                ui.weak(format!(
+                                    "{} · {}{}",
+                                    row.at(),
+                                    row.model(),
+                                    if row.pieces() > 0 {
+                                        format!(" · +{} piece(s)", row.pieces())
+                                    } else {
+                                        String::new()
+                                    }
+                                ));
                                 if ui.selectable_label(is_open, row.preview()).clicked() {
                                     toggle = Some(index);
                                 }
                             });
-                            if let Some(text) = full_text {
-                                ui.add(egui::Label::new(text).wrap(true));
+                            if let Some(entry) = full_entry {
+                                ui.add(egui::Label::new(entry.text).wrap(true));
                                 ui.add_space(4.0);
+                                // Pieces appended with the append hotkey are
+                                // listed under the full message, each with its
+                                // own time and copy button.
+                                for (part_index, part) in entry.parts.iter().enumerate() {
+                                    ui.push_id(part_index, |ui| {
+                                        ui.add_space(2.0);
+                                        ui.horizontal(|ui| {
+                                            if ui.small_button("Copy").clicked() {
+                                                copied = Some(part.text.clone());
+                                            }
+                                            ui.weak(format!("appended {}", part.at));
+                                        });
+                                        ui.label(RichText::new(&part.text).weak());
+                                    });
+                                }
                             }
                             ui.separator();
                         });
@@ -1176,7 +1361,11 @@ fn history_body(ui: &mut egui::Ui, data: &mut Data, expanded: &mut Option<usize>
             });
         });
     if let Some(index) = toggle {
-        *expanded = if *expanded == Some(index) { None } else { Some(index) };
+        *expanded = if *expanded == Some(index) {
+            None
+        } else {
+            Some(index)
+        };
     }
     if let Some(text) = copied {
         copy_to_clipboard(&text);
@@ -1243,7 +1432,9 @@ fn show_about_modal(ctx: &egui::Context, open: &mut bool, dirs: &AppDirs) {
                 );
                 ui.separator();
                 if ui.button("Open log folder").clicked() {
-                    let _ = std::process::Command::new("explorer").arg(&dirs.root).spawn();
+                    let _ = std::process::Command::new("explorer")
+                        .arg(&dirs.root)
+                        .spawn();
                 }
             });
         });

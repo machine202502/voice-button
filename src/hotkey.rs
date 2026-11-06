@@ -1,10 +1,7 @@
-//! Global recording hotkey: a canonical text form ("Ctrl+Alt+R"), parsing to a
+//! Global recording hotkeys: a canonical text form ("Ctrl+Alt+R"), parsing to a
 //! Windows virtual-key code, and a capture helper for the settings window.
 
 use serde::{Deserialize, Serialize};
-
-/// Default shortcut offered on a fresh install.
-pub const DEFAULT: &str = "Ctrl+Alt+R";
 
 const MOD_ALT: u32 = 0x0001;
 const MOD_CONTROL: u32 = 0x0002;

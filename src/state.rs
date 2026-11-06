@@ -1,5 +1,5 @@
 use crate::config::{Backend, Config};
-pub use crate::history::{History, HistoryEntry};
+pub use crate::history::{History, HistoryChunk, HistoryEntry};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
@@ -53,6 +53,10 @@ pub struct Data {
     pub live_started_ms: i64,
     /// The settings window is waiting for the user to press a shortcut.
     pub capturing_hotkey: bool,
+    /// Same as above, for the append-to-last-message shortcut.
+    pub capturing_append_hotkey: bool,
+    /// Same as above, for the record-and-paste shortcut.
+    pub capturing_paste_hotkey: bool,
     pub history: History,
     pub quit: bool,
 }
@@ -79,6 +83,8 @@ impl Shared {
                 live_text: String::new(),
                 live_started_ms: 0,
                 capturing_hotkey: false,
+                capturing_append_hotkey: false,
+                capturing_paste_hotkey: false,
                 history,
                 quit: false,
             }),

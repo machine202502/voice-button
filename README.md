@@ -15,6 +15,28 @@ Site: https://machine202502.github.io/voice-button/
 - Recording is unavailable until a usable model is downloaded. During an active
   download the tray click opens Settings instead of starting recording.
 
+### Global hotkeys
+
+Both shortcuts start unbound; set them in **Settings → Global hotkey**.
+
+- **Global hotkey** — starts and stops a recording that becomes a new history
+  entry.
+- **Append hotkey (continue the last message)** — records a short piece and
+  appends it to the last history entry, starting a new line. This is meant for
+  dictating a long message in small pieces instead of knowing the whole text up
+  front. If the history is empty, the piece becomes the first entry.
+- **Paste hotkey (type at the cursor)** — records a new history entry and, once
+  the text is ready, pastes it at the caret of the window that was active when
+  recording started (the text is placed in the clipboard and Ctrl+V is sent).
+  The clipboard content that was there before is restored afterwards.
+
+After any hotkey stops, the clipboard receives the complete message: the new
+text for the plain hotkey, the whole merged message in append mode, and the new
+text in paste mode (only while pasting). The **Last Copy** tray item and the
+**Copy** button in the history list also copy the complete message. In the
+expanded history row each appended piece is listed with its own time; press the
+small **Copy** on a piece to copy just that piece.
+
 The application has two executables that must stay beside each other:
 
 - `voice-button.exe` — tray daemon, recording, transcription, downloads, history.

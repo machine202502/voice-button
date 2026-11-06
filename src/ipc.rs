@@ -86,8 +86,41 @@ pub fn hotkey_capture_path(root: &Path) -> PathBuf {
     root.join("hotkey.capture")
 }
 
+/// Same as the above but for the append-to-last-message shortcut.
+pub fn append_hotkey_capture_path(root: &Path) -> PathBuf {
+    root.join("hotkey2.capture")
+}
+
+/// Same as the above but for the record-and-paste shortcut.
+pub fn paste_hotkey_capture_path(root: &Path) -> PathBuf {
+    root.join("hotkey3.capture")
+}
+
 pub fn set_hotkey_capture(root: &Path, active: bool) {
-    let path = hotkey_capture_path(root);
+    set_flag_file(hotkey_capture_path(root), active);
+}
+
+pub fn hotkey_capture_active(root: &Path) -> bool {
+    hotkey_capture_path(root).exists()
+}
+
+pub fn set_append_hotkey_capture(root: &Path, active: bool) {
+    set_flag_file(append_hotkey_capture_path(root), active);
+}
+
+pub fn append_hotkey_capture_active(root: &Path) -> bool {
+    append_hotkey_capture_path(root).exists()
+}
+
+pub fn set_paste_hotkey_capture(root: &Path, active: bool) {
+    set_flag_file(paste_hotkey_capture_path(root), active);
+}
+
+pub fn paste_hotkey_capture_active(root: &Path) -> bool {
+    paste_hotkey_capture_path(root).exists()
+}
+
+fn set_flag_file(path: PathBuf, active: bool) {
     if active {
         let _ = std::fs::File::create(path);
     } else {
@@ -95,9 +128,6 @@ pub fn set_hotkey_capture(root: &Path, active: bool) {
     }
 }
 
-pub fn hotkey_capture_active(root: &Path) -> bool {
-    hotkey_capture_path(root).exists()
-}
 /// The daemon watches the physical keyboard while the Settings window captures a
 /// shortcut and writes the result here; the window may not hold keyboard focus.
 pub fn hotkey_result_path(root: &Path) -> PathBuf {
