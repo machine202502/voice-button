@@ -513,40 +513,42 @@ mod tests {
 
     #[test]
     fn rnnt_catalog_entry_contains_all_required_files() {
-        let model = find_model("v3_e2e_rnnt").expect("RNN-T model in catalog");
+        let model = find_model("gigaam-v3-rnnt").expect("RNN-T model in catalog");
         let files = model
             .files
             .iter()
             .map(|file| file.rel.rsplit('/').next().unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(files, ["vocab.txt", "encoder.onnx", "decoder.onnx", "joint.onnx"]);
-        assert!(model.files.iter().all(|file| {
-            file.url.contains("322c3b29492673eb7d0b434bfa9dfb8653e34d02")
-        }));
+        assert_eq!(files, ["vocab.txt", "encoder.onnx", "decoder.onnx", "joiner.onnx"]);
+        assert!(model.files.iter().all(|file| file
+            .url
+            .contains("csukuangfj/sherpa-onnx-nemo-transducer-giga-am-v3-russian")));
     }
 
     #[test]
-    fn onnx_catalog_is_ordered_and_int8_only() {
+    fn onnx_catalog_is_ordered_and_quantized() {
         let onnx = MODELS
             .iter()
             .filter(|model| model.format == Backend::Onnx)
             .map(|model| model.id)
             .collect::<Vec<_>>();
+        // Multilingual entries first, then the Russian-focused ones.
         assert_eq!(onnx, [
-            "multi-gigaam-ctc",
-            "multi-gigaam-large-ctc",
-            "v3_ctc",
-            "v3_e2e_ctc",
-            "v3_rnnt",
-            "v3_e2e_rnnt",
+            "whisper-base-onnx",
+            "sense-voice",
+            "qwen3-asr-0.6b",
             "gigaam-v3-sherpa-int8",
+            "gigaam-v3-ctc-punct",
+            "gigaam-v3-rnnt",
+            "gigaam-v3-rnnt-punct",
+            "gigaam-v2-ctc",
         ]);
         for model in MODELS.iter().filter(|model| model.format == Backend::Onnx) {
-            for file in model.files {
-                if file.url.ends_with(".onnx") {
-                    assert!(file.url.contains(".int8.onnx"), "{}", file.url);
-                }
-            }
+            assert!(
+                model.files.iter().any(|file| file.url.contains(".int8.onnx")),
+                "{} has no quantized weights",
+                model.id
+            );
         }
     }
 }
