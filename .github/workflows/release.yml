@@ -1,4 +1,4 @@
-﻿name: Release
+name: Release
 
 on:
   push:
@@ -53,7 +53,7 @@ jobs:
           stripdown: true
           cache: true
       - name: Test
-        run: cargo test --release
+        run: cargo test --release --lib --bins
       - name: Install Inno Setup
         run: choco install innosetup --yes --no-progress
       - name: Package and publish

@@ -6,6 +6,14 @@
 
 #[test]
 fn ui_snapshots_render() {
+    // The hosted Windows runner has no interactive desktop: the app starts but
+    // never renders the window, so no PNGs appear. The visual check therefore
+    // runs only on a real desktop; the committed copies in `Tests/` are still
+    // regenerated locally with `VB_SNAPSHOT=Tests cargo run --release`.
+    if std::env::var_os("CI").is_some() {
+        eprintln!("skipping UI snapshot test on CI (no interactive desktop)");
+        return;
+    }
     let exe = env!("CARGO_BIN_EXE_voice-button");
     let out = std::env::temp_dir().join(format!("voice-button-snaptest-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&out);
