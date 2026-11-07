@@ -46,6 +46,31 @@ fn now_stamp() -> String {
     chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
+/// Windows can leave a virtual cable as the default input device; such devices
+/// record silence, which looks like broken transcription. When no microphone
+/// was chosen explicitly, prefer the first real device and persist it.
+fn ensure_real_microphone(cfg: &mut config::Config, root: &std::path::Path) {
+    if !cfg.input_device.is_empty() {
+        return;
+    }
+    let Some(default) = voice_button::recorder::default_input_device_name() else {
+        return;
+    };
+    if !voice_button::recorder::is_virtual_device_name(&default) {
+        return;
+    }
+    let Some(real) = voice_button::recorder::first_real_input_device() else {
+        return;
+    };
+    log::log(&format!(
+        "default microphone {default:?} is a virtual device; selecting {real:?}"
+    ));
+    cfg.input_device = real;
+    if let Err(e) = config::save_config(root, cfg) {
+        log::log(&format!("failed to save the selected microphone: {e:#}"));
+    }
+}
+
 /// Text copied for record-and-paste ends with the configured separator (a
 /// space by default, or a line break), so the next dictation inserted at the
 /// same caret does not run into this one. History keeps the clean text.
@@ -810,6 +835,7 @@ fn run_daemon() {
         std::process::exit(0);
     }
     let mut cfg = config::load_config(&dirs.root);
+    ensure_real_microphone(&mut cfg, &dirs.root);
     if cfg.autostart {
         let _ = autostart::set_enabled(cfg.silent_start, true);
     }
@@ -1086,6 +1112,7 @@ fn run_daemon() {
         if mtime_key.is_some() && mtime_key != last_config_mtime {
             last_config_mtime = mtime_key;
             cfg = config::load_config(&dirs.root);
+            ensure_real_microphone(&mut cfg, &dirs.root);
             shared.lock().config = cfg.clone();
             let _ = tray_cmds.send(tray::TrayCommand::SetHotkey(voice_button::hotkey::parse(
                 &cfg.hotkey,

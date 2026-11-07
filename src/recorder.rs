@@ -152,6 +152,36 @@ impl Recorder {
     }
 }
 
+/// Names of devices that capture silence unless something is routed into them.
+pub fn is_virtual_device_name(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    [
+        "cable",
+        "vb-audio",
+        "virtual",
+        "streaming",
+        "loopback",
+        "stereo mix",
+        "what u hear",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+/// Name of the Windows default input device.
+pub fn default_input_device_name() -> Option<String> {
+    cpal::default_host()
+        .default_input_device()
+        .and_then(|device| device.name().ok())
+}
+
+/// First input device that is not a virtual cable/loopback.
+pub fn first_real_input_device() -> Option<String> {
+    input_device_names()
+        .into_iter()
+        .find(|name| !is_virtual_device_name(name))
+}
+
 /// Human-readable names of the available input devices (duplicates removed).
 /// Used by Settings so the user can pick a real microphone instead of a
 /// virtual cable, which records silence.
@@ -172,7 +202,7 @@ pub fn input_device_names() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::mono_frames;
+    use super::{is_virtual_device_name, mono_frames};
 
     #[test]
     fn stereo_frames_become_one_channel() {
@@ -182,5 +212,17 @@ mod tests {
     #[test]
     fn mono_input_passes_through() {
         assert_eq!(mono_frames(&[0.1, 0.2], 1), vec![0.1, 0.2]);
+    }
+
+    #[test]
+    fn virtual_input_devices_are_recognized() {
+        assert!(is_virtual_device_name(
+            "CABLE Output (VB-Audio Virtual Cable)"
+        ));
+        assert!(is_virtual_device_name("AMD Streaming Audio Device"));
+        assert!(is_virtual_device_name("Stereo Mix (Realtek(R) Audio)"));
+        assert!(!is_virtual_device_name(
+            "Набор микрофонов (Realtek(R) Audio)"
+        ));
     }
 }

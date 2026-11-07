@@ -15,6 +15,8 @@ Site: https://machine202502.github.io/voice-button/
   swap the left and middle button actions.
 - If transcriptions are empty, pick the real microphone under
   **Settings → Microphone**: a virtual cable such as VB-Audio records silence.
+  When the Windows default input is a virtual cable, a real microphone is
+  selected automatically.
 - **Settings → Paste** chooses what follows inserted text in record-and-paste
   mode: a space (default) or a new line.
 - Open **Capture** to start/stop from the window and watch the live transcript.
@@ -120,7 +122,10 @@ This creates both release forms in `dist/`:
 - `voice-button-VERSION-windows-x64-setup.exe` — installer for all users.
 
 Both packages contain the two executables, `LICENSE`, `NOTICE`, `AISOFTWARE`,
-and `THIRD-PARTY.txt`. `scripts/publish.ps1` attaches them to a GitHub release
+and `THIRD-PARTY.txt`. The portable zip also carries the Visual C++ runtime
+DLLs and the Vulkan loader, so it runs on a clean machine. The installer runs
+`vc_redist.x64.exe` silently during setup and installs the same DLLs app-local.
+`scripts/publish.ps1` attaches them to a GitHub release
 using the authenticated GitHub CLI.
 
 CI tests pushes and pull requests. A version change in `Cargo.toml` on `master`

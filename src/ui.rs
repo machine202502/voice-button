@@ -728,6 +728,13 @@ fn settings_body(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs) {
             )
             .weak(),
         );
+    } else {
+        ui.label(
+            RichText::new(
+                "Used for new recordings. If the Windows default is a virtual cable, a real microphone is selected automatically.",
+            )
+            .weak(),
+        );
     }
     ui.separator();
     ui.heading("Mouse");

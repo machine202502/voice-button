@@ -1,2 +1,4 @@
 target/
 dist/
+# Downloaded by scripts/package.ps1 at package time (25 MB, not source).
+installer/vc_redist.x64.exe

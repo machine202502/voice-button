@@ -33,12 +33,17 @@ function New-ThirdPartyNotice {
     [void]$text.AppendLine('')
     [void]$text.AppendLine("Source for this version: https://github.com/machine202502/voice-button/tree/v$Version")
     [void]$text.AppendLine('')
-    foreach ($file in @('ONNX-Runtime-MIT.txt', 'whisper.cpp-MIT.txt', 'sherpa-onnx-Apache-2.0.txt')) {
+    foreach ($file in @('ONNX-Runtime-MIT.txt', 'whisper.cpp-MIT.txt', 'sherpa-onnx-Apache-2.0.txt', 'Vulkan-Loader-Apache-2.0.txt')) {
         [void]$text.AppendLine("==== $file ====")
         [void]$text.AppendLine('')
         [void]$text.AppendLine([System.IO.File]::ReadAllText((Join-Path $root "licenses\$file")).TrimEnd())
         [void]$text.AppendLine('')
     }
+    [void]$text.AppendLine('==== Microsoft Visual C++ Redistributable ====')
+    [void]$text.AppendLine('')
+    [void]$text.AppendLine('The Windows packages include the Microsoft Visual C++ Redistributable (vc_redist.x64.exe) and its runtime DLLs. They are redistributed under the Microsoft Visual Studio license terms:')
+    [void]$text.AppendLine('https://visualstudio.microsoft.com/license-terms/')
+    [void]$text.AppendLine('')
     [void]$text.AppendLine('==== Bundled sound cues ====')
     [void]$text.AppendLine('')
     [void]$text.AppendLine([System.IO.File]::ReadAllText((Join-Path $root 'assets\CREDITS.md')).TrimEnd())
@@ -131,6 +136,42 @@ if ($MyInvocation.InvocationName -ne '.') {
 
     $dist = Join-Path $Root 'dist'
     New-Item -ItemType Directory -Force -Path $dist | Out-Null
+
+    # The app imports the Visual C++ runtime. Install it silently during setup
+    # and also keep app-local copies so the portable zip runs on a clean
+    # machine without a system-wide redistributable.
+    $vcredist = Join-Path $Root 'installer\vc_redist.x64.exe'
+    if (-not (Test-Path $vcredist)) {
+        Write-Host 'Downloading Microsoft Visual C++ Redistributable'
+        Invoke-WebRequest -Uri 'https://aka.ms/vs/17/release/vc_redist.x64.exe' -OutFile $vcredist -UseBasicParsing
+    }
+    if (-not (Test-Path $vcredist)) { throw 'Could not obtain vc_redist.x64.exe' }
+
+    $redistDir = Join-Path $dist 'redist'
+    if (Test-Path $redistDir) { Remove-Item $redistDir -Recurse -Force }
+    New-Item -ItemType Directory -Force -Path $redistDir | Out-Null
+    $runtimeDlls = @('msvcp140.dll', 'vcruntime140.dll', 'vcruntime140_1.dll')
+    foreach ($dll in $runtimeDlls) {
+        $source = Join-Path $env:WINDIR "System32\$dll"
+        if (-not (Test-Path $source)) { throw "Missing $dll on the build machine" }
+        Copy-Item $source (Join-Path $redistDir $dll)
+    }
+    Copy-Item $vcredist (Join-Path $redistDir 'vc_redist.x64.exe')
+
+    # The Vulkan loader allows the app to start even when no vendor driver
+    # provides vulkan-1.dll. Without an ICD the Whisper backend uses the CPU.
+    $vulkan = @(
+        (Join-Path $Root 'installer\vulkan-1.dll'),
+        $(if ($env:VULKAN_SDK) { Join-Path $env:VULKAN_SDK 'Bin\vulkan-1.dll' }),
+        $(if ($env:VULKAN_SDK) { Join-Path $env:VULKAN_SDK 'Bin32\vulkan-1.dll' }),
+        (Join-Path $env:WINDIR 'System32\vulkan-1.dll')
+    ) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+    if ($vulkan) {
+        Copy-Item $vulkan (Join-Path $redistDir 'vulkan-1.dll')
+    } else {
+        Write-Warning 'vulkan-1.dll was not found; packages will need a Vulkan driver, as before'
+    }
+
     $thirdParty = Join-Path $dist 'THIRD-PARTY.txt'
     Set-Content -Path $thirdParty -Encoding utf8 -Value (New-ThirdPartyNotice -Version $Version)
 
@@ -143,6 +184,15 @@ if ($MyInvocation.InvocationName -ne '.') {
     Copy-Item $ui (Join-Path $stage 'voice-button-ui.exe')
     foreach ($dll in @('sherpa-onnx-c-api.dll', 'sherpa-onnx-cxx-api.dll', 'onnxruntime.dll')) {
         Copy-Item (Join-Path $TargetDir "release\$dll") (Join-Path $stage $dll)
+    }
+    # Portable builds must run without a system-wide VC++ installation and
+    # without a vendor Vulkan driver.
+    foreach ($dll in $runtimeDlls) {
+        Copy-Item (Join-Path $redistDir $dll) (Join-Path $stage $dll)
+    }
+    $vulkanDll = Join-Path $redistDir 'vulkan-1.dll'
+    if (Test-Path $vulkanDll) {
+        Copy-Item $vulkanDll (Join-Path $stage 'vulkan-1.dll')
     }
     foreach ($name in @('LICENSE', 'NOTICE', 'AISOFTWARE')) {
         Copy-Item (Join-Path $Root $name) (Join-Path $stage $name)
@@ -159,7 +209,7 @@ if ($MyInvocation.InvocationName -ne '.') {
         "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
     ) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
     if (-not $iscc) { throw 'Inno Setup 6 (ISCC.exe) was not found' }
-    & $iscc "/DAppVersion=$Version" "/DSourceDir=$TargetDir\release" "/DThirdParty=$thirdParty" (Join-Path $Root 'installer\voice-button.iss')
+    & $iscc "/DAppVersion=$Version" "/DSourceDir=$TargetDir\release" "/DRedistDir=$redistDir" "/DThirdParty=$thirdParty" (Join-Path $Root 'installer\voice-button.iss')
     if ($LASTEXITCODE -ne 0) { throw 'ISCC failed' }
     Write-Host "Installer: $dist\voice-button-$Version-windows-x64-setup.exe"
 }
