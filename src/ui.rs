@@ -1,5 +1,5 @@
 use crate::autostart;
-use crate::config::{self, AppDirs, Backend};
+use crate::config::{self, AppDirs, Backend, PasteSeparator};
 use crate::model_manager;
 use crate::state::{self, Data, Shared};
 use arboard;
@@ -748,6 +748,34 @@ fn settings_body(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs) {
         })
         .weak(),
     );
+    ui.separator();
+    ui.heading("Paste");
+    ui.label(
+        RichText::new(
+            "After the text inserted in record-and-paste mode (paste hotkey or middle click):",
+        )
+        .weak(),
+    );
+    let mut separator_changed = false;
+    ui.horizontal(|ui| {
+        separator_changed |= ui
+            .radio_value(
+                &mut data.config.paste_separator,
+                PasteSeparator::Space,
+                "Add a space",
+            )
+            .changed();
+        separator_changed |= ui
+            .radio_value(
+                &mut data.config.paste_separator,
+                PasteSeparator::Newline,
+                "Start a new line",
+            )
+            .changed();
+    });
+    if separator_changed {
+        apply_settings(data, dirs);
+    }
     ui.separator();
     hotkey_section(ui, data, dirs, HotkeyField::Record);
     hotkey_section(ui, data, dirs, HotkeyField::Append);

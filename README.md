@@ -15,6 +15,8 @@ Site: https://machine202502.github.io/voice-button/
   swap the left and middle button actions.
 - If transcriptions are empty, pick the real microphone under
   **Settings → Microphone**: a virtual cable such as VB-Audio records silence.
+- **Settings → Paste** chooses what follows inserted text in record-and-paste
+  mode: a space (default) or a new line.
 - Open **Capture** to start/stop from the window and watch the live transcript.
 - The tray menu also contains **Settings**, **Capture**, **Last Copy**, and **Quit**.
 - Recording is unavailable until a usable model is downloaded. During an active

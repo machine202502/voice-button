@@ -46,6 +46,25 @@ fn now_stamp() -> String {
     chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
+/// Text copied for record-and-paste ends with the configured separator (a
+/// space by default, or a line break), so the next dictation inserted at the
+/// same caret does not run into this one. History keeps the clean text.
+fn with_separator(text: &str, separator: config::PasteSeparator) -> String {
+    let mut out = text.to_string();
+    let ends_with_whitespace = out
+        .chars()
+        .last()
+        .map(|c| c.is_whitespace())
+        .unwrap_or(true);
+    if !ends_with_whitespace {
+        match separator {
+            config::PasteSeparator::Space => out.push(' '),
+            config::PasteSeparator::Newline => out.push('\n'),
+        }
+    }
+    out
+}
+
 /// Window that is in the foreground right now, as a raw handle (0 when none).
 fn foreground_window() -> isize {
     use windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
@@ -911,15 +930,24 @@ fn run_daemon() {
                         .map(|prev| merged_entry(prev.clone(), &text).text)
                         .unwrap_or_else(|| text.clone());
                     let text_is_empty = text.trim().is_empty();
+                    let paste_mode = paste_target.is_some() && !text_is_empty;
+                    // Record-and-paste leaves the configured separator in the
+                    // clipboard so the next dictation starts apart.
+                    let separator = shared.lock().config.paste_separator;
+                    let clipboard_text = if paste_mode {
+                        with_separator(&to_copy, separator)
+                    } else {
+                        to_copy.clone()
+                    };
                     // Record-and-paste borrows the clipboard only for Ctrl+V:
                     // save what the user had there before replacing it.
-                    let clipboard_before = if paste_target.is_some() && !text_is_empty {
+                    let clipboard_before = if paste_mode {
                         snapshot_clipboard()
                     } else {
                         None
                     };
                     if !(paste_target.is_some() && text_is_empty) {
-                        copy_to_clipboard(&to_copy);
+                        copy_to_clipboard(&clipboard_text);
                     }
                     // The transcription is complete and the text is already in
                     // the clipboard, so the end cue now means "text is ready".
@@ -977,7 +1005,7 @@ fn run_daemon() {
                     // daemon keeps handling hotkeys while focus and the
                     // clipboard are juggled.
                     if let Some(hwnd) = paste_target.filter(|_| !text_is_empty) {
-                        paste_at_cursor(hwnd, clipboard_before, to_copy.clone());
+                        paste_at_cursor(hwnd, clipboard_before, clipboard_text);
                     }
                     set_status(&shared, &tray_cmds, &dirs, Status::Idle);
                 }
@@ -1158,7 +1186,8 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{merged_entry, recording_toggle_allowed};
+    use super::{merged_entry, recording_toggle_allowed, with_separator};
+    use voice_button::config::PasteSeparator;
     use voice_button::state::{HistoryChunk, HistoryEntry, Status};
 
     fn entry(text: &str) -> HistoryEntry {
@@ -1206,5 +1235,32 @@ mod tests {
     fn append_to_an_empty_message_does_not_leave_a_leading_newline() {
         let merged = merged_entry(entry("   "), "Кусочек.");
         assert_eq!(merged.text, "Кусочек.");
+    }
+
+    #[test]
+    fn paste_text_gets_exactly_one_space_by_default() {
+        assert_eq!(with_separator("Привет", PasteSeparator::Space), "Привет ");
+        assert_eq!(with_separator("Привет ", PasteSeparator::Space), "Привет ");
+        assert_eq!(
+            with_separator("Привет\n", PasteSeparator::Space),
+            "Привет\n"
+        );
+        assert_eq!(with_separator("", PasteSeparator::Space), "");
+    }
+
+    #[test]
+    fn paste_text_can_end_with_a_line_break() {
+        assert_eq!(
+            with_separator("Привет", PasteSeparator::Newline),
+            "Привет\n"
+        );
+        assert_eq!(
+            with_separator("Привет\n", PasteSeparator::Newline),
+            "Привет\n"
+        );
+        assert_eq!(
+            with_separator("Привет ", PasteSeparator::Newline),
+            "Привет "
+        );
     }
 }

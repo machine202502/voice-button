@@ -9,6 +9,17 @@ pub enum Backend {
     Onnx,
 }
 
+/// What record-and-paste appends after the inserted text so the next dictation
+/// does not run into it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum PasteSeparator {
+    /// A single space (the default).
+    #[default]
+    Space,
+    /// A line break, so the next dictation starts on a new line.
+    Newline,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub backend: Backend,
@@ -29,6 +40,9 @@ pub struct Config {
     /// Swap the tray icon's left and middle mouse actions.
     #[serde(default)]
     pub swap_mouse_buttons: bool,
+    /// Separator added after text inserted by record-and-paste.
+    #[serde(default)]
+    pub paste_separator: PasteSeparator,
     #[serde(default = "default_true")]
     pub autostart: bool,
     #[serde(default = "default_true")]
@@ -79,6 +93,7 @@ impl Default for Config {
             language: "auto".to_string(),
             input_device: String::new(),
             swap_mouse_buttons: false,
+            paste_separator: PasteSeparator::Space,
             autostart: true,
             silent_start: true,
             play_start_sound: true,
