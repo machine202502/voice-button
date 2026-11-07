@@ -1,6 +1,6 @@
 [package]
 name = "voice-button"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2021"
 description = "Offline voice-to-text in the Windows tray"
 license = "MIT"
