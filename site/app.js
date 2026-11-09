@@ -1,6 +1,7 @@
 document.querySelector("[data-year]").textContent = new Date().getFullYear();
 
 const releasePage = "https://github.com/machine202502/voice-button/releases/latest";
+const sizeUnit = () => (document.documentElement.lang || "").toLowerCase().startsWith("ru") ? "МБ" : "MB";
 const versionNodes = [...document.querySelectorAll("[data-version]")];
 const downloadNodes = [...document.querySelectorAll("[data-dl-setup], [data-dl-zip]")];
 const tokenNodes = [
@@ -36,11 +37,11 @@ if (hasTokens) {
       }
       if (setup) {
         document.querySelectorAll("[data-dl-setup]").forEach((link) => { link.href = setup.browser_download_url; });
-        document.querySelector("[data-size-setup]").textContent = `${(setup.size / 1048576).toFixed(1)} МБ`;
+        document.querySelectorAll("[data-size-setup]").forEach((node) => { node.textContent = `${(setup.size / 1048576).toFixed(1)} ${sizeUnit()}`; });
       }
       if (zip) {
         document.querySelectorAll("[data-dl-zip]").forEach((link) => { link.href = zip.browser_download_url; });
-        document.querySelector("[data-size-zip]").textContent = `${(zip.size / 1048576).toFixed(1)} МБ`;
+        document.querySelectorAll("[data-size-zip]").forEach((node) => { node.textContent = `${(zip.size / 1048576).toFixed(1)} ${sizeUnit()}`; });
       }
     })
     .finally(hideTokens);

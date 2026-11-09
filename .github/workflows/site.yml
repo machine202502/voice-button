@@ -71,7 +71,7 @@ jobs:
             -e 's/@@HASH_ZIP@@/${{ steps.release.outputs.zip_hash }}/g' \
             -e 's/@@SIZE_SETUP@@/${{ steps.release.outputs.setup_size }}/g' \
             -e 's/@@SIZE_ZIP@@/${{ steps.release.outputs.zip_size }}/g' \
-            site/index.html site/en/index.html
+            site/index.html site/en/index.html site/zh/index.html
       - uses: actions/upload-pages-artifact@v3
         with: { path: site }
 
