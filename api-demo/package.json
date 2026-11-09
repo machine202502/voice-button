@@ -1,0 +1,13 @@
+{
+  "name": "voice-button-api-demo",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Microphone demo page for the local Voice Button API",
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

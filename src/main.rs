@@ -4,17 +4,22 @@ use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::Duration;
 use voice_button::recorder::{Recorder, Recording};
-use voice_button::state::{self, Shared, Status};
+use voice_button::state::{
+    self, ApiResult, Interactor, InteractorKind, ModelChoice, Session, Shared, Status,
+};
 use voice_button::{autostart, config, ipc, log, model_manager, tray, ui};
 
 enum AppEvent {
-    /// A recording finished; `append` selects the append-to-last-message mode,
-    /// `paste_target` carries the window to paste into (record-and-paste mode).
+    /// A session finished; `append` selects the append-to-last-message mode,
+    /// `paste_target` carries the window to paste into (record-and-paste mode),
+    /// `clipboard` says whether the text belongs to the user's clipboard (API
+    /// audio goes back to its caller instead).
     Transcribed {
         text: String,
         model: String,
         append: bool,
         paste_target: Option<isize>,
+        clipboard: bool,
     },
     Failed(String),
 }
@@ -24,6 +29,26 @@ fn selected_model(config: &config::Config) -> String {
         config::Backend::Whisper => config.whisper_model.clone(),
         config::Backend::Onnx => config.onnx_model.clone(),
     }
+}
+
+/// The user's settings with the open API session's model override applied. The
+/// saved settings are never modified, so the server cannot change what the user
+/// picked in Settings.
+fn effective_config(data: &state::Data) -> config::Config {
+    let mut cfg = data.config.clone();
+    if let Some(model) = data.session.as_ref().and_then(|session| session.model.as_ref()) {
+        model.apply_to(&mut cfg);
+    }
+    cfg
+}
+
+/// A model the API server may use is one this build offers and that is already
+/// on disk.
+fn model_choice_ready(dirs: &config::AppDirs, model: &ModelChoice) -> bool {
+    model_manager::find_model(&model.id)
+        .map(|known| known.format == model.backend)
+        .unwrap_or(false)
+        && model_manager::is_ready(&dirs.models, &model.id)
 }
 
 /// Shared control between the main loop and the live-transcription worker.
@@ -419,7 +444,7 @@ fn spawn_final_transcription(
     paste_target: Option<isize>,
 ) {
     std::thread::spawn(move || {
-        let config = shared.lock().config.clone();
+        let config = effective_config(&shared.lock());
         let model = selected_model(&config);
         let event = match voice_button::transcribe::resolve(&config, &dirs)
             .and_then(|t| t.transcribe(recording))
@@ -434,6 +459,7 @@ fn spawn_final_transcription(
                     model,
                     append,
                     paste_target,
+                    clipboard: true,
                 }
             }
             Err(e) => {
@@ -496,7 +522,7 @@ fn spawn_live_worker(
             std::thread::sleep(Duration::from_millis(50));
             continue;
         }
-        let config = shared.lock().config.clone();
+        let config = effective_config(&shared.lock());
         let model = selected_model(&config);
         let transcriber = match voice_button::transcribe::resolve(&config, &dirs) {
             Ok(t) => t,
@@ -597,6 +623,7 @@ fn spawn_live_worker(
                             model: model.clone(),
                             append,
                             paste_target,
+                            clipboard: true,
                         }
                     }
                     Err(e) if !live_text.is_empty() => {
@@ -608,6 +635,7 @@ fn spawn_live_worker(
                             model: model.clone(),
                             append,
                             paste_target,
+                            clipboard: true,
                         }
                     }
                     Err(e) => AppEvent::Failed(format!("{e:#}")),
@@ -624,7 +652,30 @@ fn recording_toggle_allowed(status: Status, recorder_active: bool) -> bool {
     recorder_active || status != Status::Transcribing
 }
 
+/// Monotonic id of a recording session, so stops and results can be attributed
+/// to the session that produced them. Starts at 1.
+fn next_session_id() -> u64 {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+}
+
+/// Parse the interactor out of a record-request file: the UI writes
+/// `{"kind":"user"}`, anything else is treated as the user.
+fn parse_interactor(content: &str) -> Interactor {
+    let value: serde_json::Value = serde_json::from_str(content).unwrap_or(serde_json::Value::Null);
+    if value.get("kind").and_then(|k| k.as_str()) == Some("server") {
+        return Interactor::server();
+    }
+    Interactor::user()
+}
+
+/// Start or stop a recording on behalf of `interactor`. The session records who
+/// owns it and, for an API session, the model it asked for. A stop is refused
+/// when the caller may not stop the open session (the server never stops the
+/// user's recording).
 fn toggle_record(
+    interactor: Interactor,
+    model: Option<ModelChoice>,
     recorder: &mut Recorder,
     shared: &Arc<Shared>,
     dirs: &config::AppDirs,
@@ -634,11 +685,30 @@ fn toggle_record(
     paste: bool,
 ) {
     let ctx = LIVE.get().expect("live context initialized");
+    // An API session has no microphone of its own; the user's press means stop
+    // it (they are privileged and can always end it).
+    if shared.lock().stream.is_some() {
+        if interactor.is_user() {
+            stop_stream_session(shared, dirs, tray_cmds, interactor);
+        }
+        return;
+    }
     if !recording_toggle_allowed(shared.lock().status, recorder.is_active()) {
         log::log("record start ignored while transcription is finishing");
         return;
     }
     if recorder.is_active() {
+        // Stop permission: a human user may stop any session, the API server
+        // only the sessions it started itself.
+        let session = shared.lock().session.clone();
+        let may_stop = session
+            .as_ref()
+            .map(|s| interactor.may_stop(s))
+            .unwrap_or(true);
+        if !may_stop {
+            log::log("record stop rejected: interactor may not stop this session");
+            return;
+        }
         let recording = match recorder.stop() {
             Ok(r) => r,
             Err(e) => {
@@ -654,6 +724,11 @@ fn toggle_record(
             hwnd => Some(hwnd),
         };
         ctx.recording.store(false, Ordering::SeqCst);
+        // Who ended the session is part of its result: the server learns that
+        // the user stopped its recording.
+        if let Some(session) = shared.lock().session.as_mut() {
+            session.stopped_by = Some(interactor);
+        }
         // The end cue belongs to the finished transcription, not to the
         // keypress: it plays once the text is in the clipboard.
         set_status(shared, tray_cmds, dirs, Status::Transcribing);
@@ -697,6 +772,18 @@ fn toggle_record(
                     ));
                 }
                 ctx.paste_target.store(target, Ordering::SeqCst);
+                // The session must be visible to the live worker before it
+                // picks up the recording, so the model override applies.
+                {
+                    let mut data = shared.lock();
+                    data.session = Some(Session {
+                        id: next_session_id(),
+                        owner: interactor,
+                        model,
+                        stopped_by: None,
+                    });
+                }
+                ipc::write_session(&dirs.root, shared.lock().session.as_ref());
                 ctx.recording.store(true, Ordering::SeqCst);
                 ipc::clear_live(&dirs.root);
                 set_status(shared, tray_cmds, dirs, Status::Recording);
@@ -717,6 +804,267 @@ fn toggle_record(
     }
 }
 
+/// Turn incoming audio into one session: the caller's sound replaces the local
+/// microphone, so nothing here touches the recorder.
+fn begin_stream_session(
+    shared: &Arc<Shared>,
+    dirs: &config::AppDirs,
+    tray_cmds: &mpsc::Sender<tray::TrayCommand>,
+    events_tx: mpsc::Sender<AppEvent>,
+    model: Option<ModelChoice>,
+    sample_rate: u32,
+) -> u64 {
+    let id = next_session_id();
+    {
+        let mut data = shared.lock();
+        data.session = Some(Session {
+            id,
+            owner: Interactor::server(),
+            model: model.clone(),
+            stopped_by: None,
+        });
+        data.stream = Some(state::StreamSession {
+            id,
+            model,
+            sample_rate,
+            buffer: Arc::new(Mutex::new(Vec::new())),
+            received_samples: 0,
+            live_text: String::new(),
+            stop: Arc::new(AtomicBool::new(false)),
+        });
+    }
+    ipc::write_session(&dirs.root, shared.lock().session.as_ref());
+    log::log(&format!(
+        "api stream session {id} started ({sample_rate} Hz)"
+    ));
+    set_status(shared, tray_cmds, dirs, Status::Recording);
+    let (play, volume) = {
+        let data = shared.lock();
+        (data.config.play_start_sound, data.config.sound_volume)
+    };
+    if play {
+        voice_button::sound::play_start(volume);
+    }
+    spawn_stream_worker(shared.clone(), dirs.clone(), events_tx, id);
+    id
+}
+
+/// Stop receiving audio and let the worker decode the whole buffer. Kept in one
+/// place so the caller and the user's window share exactly one mechanism.
+fn stop_stream_session(
+    shared: &Arc<Shared>,
+    dirs: &config::AppDirs,
+    tray_cmds: &mpsc::Sender<tray::TrayCommand>,
+    interactor: Interactor,
+) -> bool {
+    let stopped = {
+        let mut data = shared.lock();
+        match data.stream.take() {
+            Some(stream) => {
+                // Tell the worker to finish; it holds its own handles.
+                stream.stop.store(true, Ordering::SeqCst);
+                if let Some(session) = data.session.as_mut() {
+                    if interactor.may_stop(session) {
+                        session.stopped_by = Some(interactor);
+                    }
+                }
+                true
+            }
+            None => false,
+        }
+    };
+    if stopped {
+        log::log("api stream session stopped, transcribing the received audio");
+        set_status(shared, tray_cmds, dirs, Status::Transcribing);
+    }
+    stopped
+}
+
+/// Preview the received audio while it arrives and decode the final text once
+/// the caller stops. Mirrors the live worker used for the local microphone.
+fn spawn_stream_worker(
+    shared: Arc<Shared>,
+    dirs: config::AppDirs,
+    events_tx: mpsc::Sender<AppEvent>,
+    session_id: u64,
+) {
+    std::thread::spawn(move || {
+        let (buffer, sample_rate, stop, config) = {
+            let data = shared.lock();
+            let Some(stream) = data.stream.as_ref().filter(|s| s.id == session_id) else {
+                return;
+            };
+            (
+                stream.buffer.clone(),
+                stream.sample_rate,
+                stream.stop.clone(),
+                effective_config(&data),
+            )
+        };
+        let model = selected_model(&config);
+        let transcriber = match voice_button::transcribe::resolve(&config, &dirs) {
+            Ok(transcriber) => transcriber,
+            Err(e) => {
+                log::log(&format!("stream transcription unavailable: {e:#}"));
+                let _ = events_tx.send(AppEvent::Failed(format!("{e:#}")));
+                return;
+            }
+        };
+        // A live preview re-decodes the whole buffer, which only pays off for
+        // the light ONNX models; Whisper stays quiet until the final decode.
+        let preview = matches!(config.backend, config::Backend::Onnx);
+        let interval = Duration::from_millis(1000);
+        let mut last_attempt = std::time::Instant::now()
+            .checked_sub(interval)
+            .unwrap_or_else(std::time::Instant::now);
+        let mut last_len = 0usize;
+        while !stop.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(100));
+            if !preview || last_attempt.elapsed() < interval {
+                continue;
+            }
+            let samples = buffer.lock().unwrap().clone();
+            if samples.len() < last_len + sample_rate as usize / 4 {
+                continue;
+            }
+            last_attempt = std::time::Instant::now();
+            last_len = samples.len();
+            match transcribe_stream_piece(
+                transcriber.as_ref(),
+                &samples,
+                sample_rate,
+                "stream live",
+            ) {
+                Ok(text) => {
+                    if let Some(stream) = shared
+                        .lock()
+                        .stream
+                        .as_mut()
+                        .filter(|s| s.id == session_id)
+                    {
+                        stream.live_text = text;
+                    }
+                }
+                Err(e) => log::log(&format!("stream live transcription failed: {e:#}")),
+            }
+        }
+        let samples = buffer.lock().unwrap().clone();
+        let event = if samples.is_empty() {
+            AppEvent::Failed("no audio was received".to_string())
+        } else {
+            match transcribe_stream_piece(transcriber.as_ref(), &samples, sample_rate, "stream final")
+            {
+                Ok(text) => AppEvent::Transcribed {
+                    text,
+                    model,
+                    append: false,
+                    paste_target: None,
+                    clipboard: false,
+                },
+                Err(e) => AppEvent::Failed(format!("{e:#}")),
+            }
+        };
+        let _ = events_tx.send(event);
+    });
+}
+
+/// Answer one command from the API server. The daemon owns the transcription
+/// session, so the HTTP thread asks here instead of holding a model.
+fn handle_api_request(
+    request: voice_button::api::ApiRequest,
+    recorder: &mut Recorder,
+    shared: &Arc<Shared>,
+    dirs: &config::AppDirs,
+    tray_cmds: &mpsc::Sender<tray::TrayCommand>,
+    events_tx: mpsc::Sender<AppEvent>,
+) {
+    use voice_button::api::{ApiAction, ApiResponse};
+    let reply = request.reply;
+    match request.action {
+        ApiAction::StreamStart { model, sample_rate } => {
+            let busy = {
+                let data = shared.lock();
+                data.session.is_some() || recorder.is_active()
+            };
+            if busy {
+                // One session at a time: the user's dictation or another API
+                // session is still running.
+                let _ = reply.send(ApiResponse::Rejected(
+                    "the app is busy with another session".to_string(),
+                ));
+                return;
+            }
+            let ready = match &model {
+                Some(model) => model_choice_ready(dirs, model),
+                None => recording_allowed(shared, dirs),
+            };
+            if !ready {
+                let _ = reply.send(ApiResponse::Rejected(
+                    "no downloaded model to transcribe with".to_string(),
+                ));
+                return;
+            }
+            let session = begin_stream_session(
+                shared,
+                dirs,
+                tray_cmds,
+                events_tx,
+                model,
+                sample_rate,
+            );
+            let _ = reply.send(ApiResponse::StreamStarted { session });
+        }
+        ApiAction::StreamChunk { session, samples } => {
+            let buffer = {
+                let data = shared.lock();
+                match data.stream.as_ref().filter(|s| s.id == session) {
+                    Some(stream) => Some(stream.buffer.clone()),
+                    None => None,
+                }
+            };
+            let Some(buffer) = buffer else {
+                let _ = reply.send(ApiResponse::Rejected(
+                    "no active stream session with that id".to_string(),
+                ));
+                return;
+            };
+            let count = samples.len() as u64;
+            buffer.lock().unwrap().extend(samples);
+            let (received_ms, live) = {
+                let mut data = shared.lock();
+                match data.stream.as_mut().filter(|s| s.id == session) {
+                    Some(stream) => {
+                        stream.received_samples += count;
+                        let ms = stream
+                            .received_samples
+                            .saturating_mul(1000)
+                            .saturating_div(stream.sample_rate.max(1) as u64);
+                        (ms, stream.live_text.clone())
+                    }
+                    None => (0, String::new()),
+                }
+            };
+            let _ = reply.send(ApiResponse::ChunkAccepted { received_ms, live });
+        }
+        ApiAction::StreamStop { session } => {
+            let active = shared.lock().stream.as_ref().map(|stream| stream.id);
+            match active {
+                Some(id) if session == 0 || session == id => {
+                    stop_stream_session(shared, dirs, tray_cmds, Interactor::server());
+                    let _ = reply.send(ApiResponse::StreamStopped);
+                }
+                Some(_) => {
+                    let _ = reply.send(ApiResponse::Rejected(
+                        "that is not the active session".to_string(),
+                    ));
+                }
+                None => {
+                    let _ = reply.send(ApiResponse::StreamStopped);
+                }
+            }
+        }
+    }
+}
 /// Bring the existing UI window to the front, if the UI process is running.
 fn focus_ui_window() {
     use windows_sys::Win32::UI::WindowsAndMessaging::{FindWindowW, SetForegroundWindow};
@@ -830,6 +1178,9 @@ fn run_daemon() {
     ipc::set_hotkey_capture(&dirs.root, false);
     ipc::set_append_hotkey_capture(&dirs.root, false);
     ipc::set_paste_hotkey_capture(&dirs.root, false);
+    // A session file left behind by a crashed run would keep the window
+    // claiming that the API server is recording.
+    ipc::write_session(&dirs.root, None);
     if !ensure_single_instance() {
         log::log("another daemon instance is already running, exiting");
         std::process::exit(0);
@@ -841,6 +1192,11 @@ fn run_daemon() {
     }
     let history = state::load_history(&dirs.root);
     let shared = Arc::new(Shared::new(cfg.clone(), history));
+    // Commands from the API server thread. The daemon owns the microphone, so
+    // the HTTP layer asks here and gets one answer per request.
+    let (api_tx, api_rx) = mpsc::channel::<voice_button::api::ApiRequest>();
+    let mut api_server: Option<voice_button::api::ApiServer> = None;
+    let mut api_applied: Option<(bool, String, u16)> = None;
     let (action_tx, action_rx) = mpsc::channel::<tray::TrayAction>();
     let tray_cmds = tray::start(
         action_tx,
@@ -903,6 +1259,8 @@ fn run_daemon() {
                         if not_double_click {
                             last_click = Some(now);
                             toggle_record(
+                                Interactor::user(),
+                                None,
                                 &mut recorder,
                                 &shared,
                                 &dirs,
@@ -935,7 +1293,17 @@ fn run_daemon() {
                     model,
                     append,
                     paste_target,
+                    clipboard,
                 } => {
+                    // The session is still open while its text is being stored;
+                    // it says who started this recording.
+                    let session = shared.lock().session.clone();
+                    let source = match session.as_ref().map(|s| s.owner.kind) {
+                        Some(InteractorKind::Server) => state::Source::Server,
+                        _ => state::Source::User,
+                    };
+                    let api_text = text.clone();
+                    let api_model = model.clone();
                     // Append mode: the piece continues the last history entry;
                     // the clipboard gets the full merged message either way.
                     let previous = if append && !text.trim().is_empty() {
@@ -951,29 +1319,35 @@ fn run_daemon() {
                     } else {
                         None
                     };
-                    let to_copy = previous
-                        .as_ref()
-                        .map(|prev| merged_entry(prev.clone(), &text).text)
-                        .unwrap_or_else(|| text.clone());
                     let text_is_empty = text.trim().is_empty();
-                    let paste_mode = paste_target.is_some() && !text_is_empty;
-                    // Record-and-paste leaves the configured separator in the
-                    // clipboard so the next dictation starts apart.
-                    let separator = shared.lock().config.paste_separator;
-                    let clipboard_text = if paste_mode {
-                        with_separator(&to_copy, separator)
-                    } else {
-                        to_copy.clone()
-                    };
-                    // Record-and-paste borrows the clipboard only for Ctrl+V:
-                    // save what the user had there before replacing it.
-                    let clipboard_before = if paste_mode {
-                        snapshot_clipboard()
-                    } else {
-                        None
-                    };
-                    if !(paste_target.is_some() && text_is_empty) {
-                        copy_to_clipboard(&clipboard_text);
+                    let mut clipboard_text = String::new();
+                    let mut clipboard_before: Option<ClipboardSnapshot> = None;
+                    // A transcription of the caller's audio goes back to the
+                    // caller; the user's clipboard stays untouched.
+                    if clipboard {
+                        let to_copy = previous
+                            .as_ref()
+                            .map(|prev| merged_entry(prev.clone(), &text).text)
+                            .unwrap_or_else(|| text.clone());
+                        let paste_mode = paste_target.is_some() && !text_is_empty;
+                        // Record-and-paste leaves the configured separator in the
+                        // clipboard so the next dictation starts apart.
+                        let separator = shared.lock().config.paste_separator;
+                        clipboard_text = if paste_mode {
+                            with_separator(&to_copy, separator)
+                        } else {
+                            to_copy
+                        };
+                        // Record-and-paste borrows the clipboard only for Ctrl+V:
+                        // save what the user had there before replacing it.
+                        clipboard_before = if paste_mode {
+                            snapshot_clipboard()
+                        } else {
+                            None
+                        };
+                        if !(paste_target.is_some() && text_is_empty) {
+                            copy_to_clipboard(&clipboard_text);
+                        }
                     }
                     // The transcription is complete and the text is already in
                     // the clipboard, so the end cue now means "text is ready".
@@ -1015,6 +1389,7 @@ fn run_daemon() {
                                     text,
                                     model,
                                     parts: Vec::new(),
+                                    source,
                                 };
                                 match voice_button::history::append(&dirs.root, &entry) {
                                     Ok(row) => shared.lock().history.push_row(row),
@@ -1033,10 +1408,52 @@ fn run_daemon() {
                     if let Some(hwnd) = paste_target.filter(|_| !text_is_empty) {
                         paste_at_cursor(hwnd, clipboard_before, clipboard_text);
                     }
+                    // Close the session: the server (if it owns the session) can
+                    // now read the text, and the next queued request may start.
+                    let finished = shared.lock().session.take();
+                    ipc::write_session(&dirs.root, None);
+                    if let Some(session) = finished {
+                        if session.owner.kind == InteractorKind::Server {
+                            shared.lock().api_result = Some(ApiResult {
+                                session: session.id,
+                                text: api_text,
+                                model: api_model,
+                                at: now_stamp(),
+                                stopped_by: session
+                                    .stopped_by
+                                    .map(|interactor| interactor.kind)
+                                    .unwrap_or(InteractorKind::Server),
+                                error: None,
+                            });
+                        }
+                    }
                     set_status(&shared, &tray_cmds, &dirs, Status::Idle);
                 }
                 AppEvent::Failed(msg) => {
-                    shared.set_error(msg);
+                    shared.set_error(msg.clone());
+                    // A failed API session may still be receiving; let its
+                    // worker leave the loop instead of previewing forever.
+                    if let Some(stream) = shared.lock().stream.take() {
+                        stream.stop.store(true, Ordering::SeqCst);
+                    }
+                    let finished = shared.lock().session.take();
+                    ipc::write_session(&dirs.root, None);
+                    if let Some(session) = finished {
+                        if session.owner.kind == InteractorKind::Server {
+                            let model = selected_model(&effective_config(&shared.lock()));
+                            shared.lock().api_result = Some(ApiResult {
+                                session: session.id,
+                                text: String::new(),
+                                model,
+                                at: now_stamp(),
+                                stopped_by: session
+                                    .stopped_by
+                                    .map(|interactor| interactor.kind)
+                                    .unwrap_or(InteractorKind::Server),
+                                error: Some(msg),
+                            });
+                        }
+                    }
                     set_status(&shared, &tray_cmds, &dirs, Status::Idle);
                 }
             }
@@ -1054,11 +1471,25 @@ fn run_daemon() {
                 model_manager::start_download(shared.clone(), dirs.models.clone(), model_id);
             }
         }
+        // API server → daemon: start/stop requests, answered per request.
+        while let Ok(request) = api_rx.try_recv() {
+            handle_api_request(
+                request,
+                &mut recorder,
+                &shared,
+                &dirs,
+                &tray_cmds,
+                events_tx.clone(),
+            );
+        }
         // UI → daemon: start/stop recording.
-        if ipc::take_record_request(&dirs.root) {
+        if let Some(interactor_json) = ipc::take_record_request(&dirs.root) {
+            let interactor = parse_interactor(&interactor_json);
             if recording_allowed(&shared, &dirs) || recorder.is_active() {
                 // The UI start button always records a fresh message.
                 toggle_record(
+                    interactor,
+                    None,
                     &mut recorder,
                     &shared,
                     &dirs,
@@ -1124,6 +1555,65 @@ fn run_daemon() {
                 voice_button::hotkey::parse(&cfg.paste_hotkey),
             ));
             let _ = tray_cmds.send(tray::TrayCommand::SetMouseSwap(cfg.swap_mouse_buttons));
+        }
+        // API server lifecycle follows the settings: enabling, disabling or
+        // moving it restarts the listener and republishes its real address.
+        let wanted_api = (cfg.api_enabled, cfg.api_host.clone(), cfg.api_port);
+        if api_applied.as_ref() != Some(&wanted_api) {
+            api_applied = Some(wanted_api.clone());
+            if let Some(server) = api_server.take() {
+                server.stop();
+            }
+            if wanted_api.0 {
+                match voice_button::api::ApiServer::bind(
+                    &wanted_api.1,
+                    wanted_api.2,
+                    shared.clone(),
+                    dirs.root.clone(),
+                    api_tx.clone(),
+                ) {
+                    Ok(server) => {
+                        let addr = server.addr();
+                        log::log(&format!("api server listening on {addr}"));
+                        ipc::write_api_state(
+                            &dirs.root,
+                            &ipc::ApiSnapshot {
+                                running: true,
+                                host: addr.ip().to_string(),
+                                port: addr.port(),
+                                error: None,
+                            },
+                        );
+                        api_server = Some(server);
+                    }
+                    Err(e) => {
+                        let error = format!(
+                            "cannot listen on {}:{} ({e})",
+                            wanted_api.1, wanted_api.2
+                        );
+                        log::log(&format!("api server not started: {error}"));
+                        ipc::write_api_state(
+                            &dirs.root,
+                            &ipc::ApiSnapshot {
+                                running: false,
+                                host: wanted_api.1.clone(),
+                                port: wanted_api.2,
+                                error: Some(error),
+                            },
+                        );
+                    }
+                }
+            } else {
+                ipc::write_api_state(
+                    &dirs.root,
+                    &ipc::ApiSnapshot {
+                        running: false,
+                        host: String::new(),
+                        port: 0,
+                        error: None,
+                    },
+                );
+            }
         }
         // The Settings window asks for the shortcut(s) to be released while it
         // captures a new combination, otherwise its keystrokes would toggle
@@ -1213,9 +1703,18 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{merged_entry, recording_toggle_allowed, with_separator};
-    use voice_button::config::PasteSeparator;
-    use voice_button::state::{HistoryChunk, HistoryEntry, Status};
+    use super::{handle_api_request, merged_entry, recording_toggle_allowed, with_separator};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use voice_button::api::{ApiAction, ApiRequest, ApiResponse};
+    use voice_button::config::{AppDirs, Config, PasteSeparator};
+    use voice_button::history::History;
+    use voice_button::recorder::Recorder;
+    use voice_button::state::{
+        HistoryChunk, HistoryEntry, Interactor, Session, Shared, Status, StreamSession,
+    };
 
     fn entry(text: &str) -> HistoryEntry {
         HistoryEntry {
@@ -1223,7 +1722,185 @@ mod tests {
             text: text.to_string(),
             model: "model".to_string(),
             parts: Vec::new(),
+            source: voice_button::state::Source::User,
         }
+    }
+
+    fn empty_shared() -> Arc<Shared> {
+        Arc::new(Shared::new(Config::default(), History::from_entries(Vec::new())))
+    }
+
+    fn temp_dirs(name: &str) -> AppDirs {
+        let root = std::env::temp_dir().join(format!(
+            "voice-button-main-{name}-{}",
+            std::process::id()
+        ));
+        let models = root.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        AppDirs { root, models }
+    }
+
+    fn user_session() -> Session {
+        Session {
+            id: 1,
+            owner: Interactor::user(),
+            model: None,
+            stopped_by: None,
+        }
+    }
+
+    /// Drive the daemon's API command handler exactly like the main loop does.
+    fn ask(
+        action: ApiAction,
+        recorder: &mut Recorder,
+        shared: &Arc<Shared>,
+        dirs: &AppDirs,
+    ) -> ApiResponse {
+        let (reply, responses) = mpsc::channel();
+        let (tray_cmds, _tray_rx) = mpsc::channel();
+        let (events_tx, _events_rx) = mpsc::channel();
+        handle_api_request(
+            ApiRequest { action, reply },
+            recorder,
+            shared,
+            dirs,
+            &tray_cmds,
+            events_tx,
+        );
+        responses
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the daemon must answer every API command")
+    }
+
+    fn stream_session(id: u64) -> (Session, StreamSession) {
+        (
+            Session {
+                id,
+                owner: Interactor::server(),
+                model: None,
+                stopped_by: None,
+            },
+            StreamSession {
+                id,
+                model: None,
+                sample_rate: 16_000,
+                buffer: Arc::new(Mutex::new(Vec::new())),
+                received_samples: 0,
+                live_text: String::new(),
+                stop: Arc::new(AtomicBool::new(false)),
+            },
+        )
+    }
+
+    #[test]
+    fn a_second_session_is_refused_while_the_user_is_dictating() {
+        let shared = empty_shared();
+        shared.lock().session = Some(user_session());
+        shared.lock().status = Status::Recording;
+        let dirs = temp_dirs("api-busy");
+        let mut recorder = Recorder::new();
+        let answer = ask(
+            ApiAction::StreamStart {
+                model: None,
+                sample_rate: 16_000,
+            },
+            &mut recorder,
+            &shared,
+            &dirs,
+        );
+        assert_eq!(
+            answer,
+            ApiResponse::Rejected("the app is busy with another session".to_string())
+        );
+        assert!(shared.lock().stream.is_none());
+        let _ = std::fs::remove_dir_all(&dirs.root);
+    }
+
+    #[test]
+    fn audio_chunks_are_appended_to_the_stream_buffer() {
+        let shared = empty_shared();
+        let (session, stream) = stream_session(3);
+        shared.lock().session = Some(session);
+        shared.lock().stream = Some(stream);
+        shared.lock().status = Status::Recording;
+        let dirs = temp_dirs("api-chunk");
+        let mut recorder = Recorder::new();
+        let answer = ask(
+            ApiAction::StreamChunk {
+                session: 3,
+                samples: vec![0.1; 1600],
+            },
+            &mut recorder,
+            &shared,
+            &dirs,
+        );
+        assert_eq!(
+            answer,
+            ApiResponse::ChunkAccepted {
+                received_ms: 100,
+                live: String::new()
+            }
+        );
+        assert_eq!(shared.lock().stream.as_ref().unwrap().buffer.lock().unwrap().len(), 1600);
+        // A chunk for a session that is over is refused.
+        let answer = ask(
+            ApiAction::StreamChunk {
+                session: 99,
+                samples: vec![0.0; 8],
+            },
+            &mut recorder,
+            &shared,
+            &dirs,
+        );
+        assert!(matches!(answer, ApiResponse::Rejected(_)));
+        let _ = std::fs::remove_dir_all(&dirs.root);
+    }
+
+    #[test]
+    fn stopping_a_stream_marks_who_ended_it_and_goes_to_transcribing() {
+        let shared = empty_shared();
+        let (session, stream) = stream_session(4);
+        shared.lock().session = Some(session);
+        shared.lock().stream = Some(stream);
+        shared.lock().status = Status::Recording;
+        let dirs = temp_dirs("api-stop");
+        let mut recorder = Recorder::new();
+        let answer = ask(
+            ApiAction::StreamStop { session: 4 },
+            &mut recorder,
+            &shared,
+            &dirs,
+        );
+        assert_eq!(answer, ApiResponse::StreamStopped);
+        assert!(shared.lock().stream.is_none());
+        assert_eq!(shared.lock().status, Status::Transcribing);
+        assert_eq!(
+            shared.lock().session.as_ref().unwrap().stopped_by,
+            Some(Interactor::server())
+        );
+        let _ = std::fs::remove_dir_all(&dirs.root);
+    }
+
+    #[test]
+    fn the_user_can_end_an_api_session() {
+        let shared = empty_shared();
+        let (session, stream) = stream_session(5);
+        shared.lock().session = Some(session);
+        shared.lock().stream = Some(stream);
+        let dirs = temp_dirs("api-user-stop");
+        let (tray_cmds, _tray_rx) = mpsc::channel();
+        assert!(super::stop_stream_session(
+            &shared,
+            &dirs,
+            &tray_cmds,
+            Interactor::user()
+        ));
+        assert!(shared.lock().stream.is_none());
+        assert_eq!(
+            shared.lock().session.as_ref().unwrap().stopped_by,
+            Some(Interactor::user())
+        );
+        let _ = std::fs::remove_dir_all(&dirs.root);
     }
 
     #[test]

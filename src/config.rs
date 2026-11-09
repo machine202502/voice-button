@@ -9,6 +9,16 @@ pub enum Backend {
     Onnx,
 }
 
+impl Backend {
+    /// Engine name used by the public API, e.g. in `Onnx/gigaam-v3-rnnt`.
+    pub fn label(self) -> &'static str {
+        match self {
+            Backend::Whisper => "Whisper",
+            Backend::Onnx => "Onnx",
+        }
+    }
+}
+
 /// What record-and-paste appends after the inserted text so the next dictation
 /// does not run into it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -67,6 +77,15 @@ pub struct Config {
     /// the paste. Empty disables it.
     #[serde(default)]
     pub paste_hotkey: String,
+    /// Whether the local API server listens at all.
+    #[serde(default)]
+    pub api_enabled: bool,
+    /// Host the local API server binds to; localhost by default.
+    #[serde(default = "default_api_host")]
+    pub api_host: String,
+    /// Port the local API server listens on.
+    #[serde(default = "default_api_port")]
+    pub api_port: u16,
 }
 
 /// Shortcuts start unbound: the user picks them in Settings.
@@ -102,8 +121,19 @@ impl Default for Config {
             hotkey: String::new(),
             append_hotkey: String::new(),
             paste_hotkey: String::new(),
+            api_enabled: false,
+            api_host: default_api_host(),
+            api_port: default_api_port(),
         }
     }
+}
+
+fn default_api_host() -> String {
+    "127.0.0.1".to_string()
+}
+
+fn default_api_port() -> u16 {
+    8931
 }
 
 #[derive(Debug, Clone)]

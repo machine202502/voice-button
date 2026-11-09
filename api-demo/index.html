@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Voice Button API — microphone demo</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main>
+  <header>
+    <h1>Voice Button · API demo</h1>
+    <span class="chip" id="server-chip"><span class="dot" id="dot"></span> <span id="conn">connecting</span></span>
+  </header>
+
+  <p class="intro">
+    Эта страница записывает звук <b>своего</b> микрофона и отправляет его в Voice Button
+    по HTTP. Приложение транскрибирует присланный звук своим микрофоном не пользуется.
+    Текст появляется здесь по мере распознавания.
+  </p>
+
+  <div class="models">
+    <label class="inline" for="api">API:</label>
+    <input type="text" id="api" spellcheck="false">
+    <label class="inline" for="model">Модель:</label>
+    <select id="model"><option value="">как в настройках приложения</option></select>
+    <button id="reload" class="chip" type="button">обновить</button>
+  </div>
+
+  <div class="stage">
+    <button id="mic" data-state="idle" type="button" title="Start / stop">🎤</button>
+    <div class="state">
+      <div class="big" id="state">idle</div>
+      <div class="sub" id="sub">Готов к записи.</div>
+    </div>
+  </div>
+
+  <div class="panels">
+    <section class="panel">
+      <h2><span>Живая транскрибация</span><span id="live-meta"></span></h2>
+      <div class="out" id="live"></div>
+    </section>
+    <section class="panel">
+      <h2><span>Результат</span><span id="result-meta"></span></h2>
+      <div class="out" id="result"></div>
+    </section>
+  </div>
+
+  <div class="err" id="err"></div>
+
+  <footer>
+    Эндпоинты: <code>POST /api/record/start</code>, <code>POST /api/record/audio</code>,
+    <code>POST /api/record/stop</code>, <code>GET /api/status</code>,
+    <code>GET /api/models</code>, <code>GET /api/record/live</code>,
+    <code>GET /api/record/text</code>.
+  </footer>
+</main>
+<script type="module" src="app.js"></script>
+</body>
+</html>

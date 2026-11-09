@@ -12,6 +12,17 @@ pub struct HistoryChunk {
     pub text: String,
 }
 
+/// Who started the recording that produced an entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Source {
+    /// Dictated by a human through the window, a shortcut or the tray icon.
+    #[default]
+    User,
+    /// Started by the local API server.
+    Server,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryEntry {
     pub at: String,
@@ -21,6 +32,10 @@ pub struct HistoryEntry {
     /// Appended pieces in chronological order; empty for plain recordings.
     #[serde(default)]
     pub parts: Vec<HistoryChunk>,
+    /// Interactor that started the recording (old entries have no field and
+    /// read back as the user).
+    #[serde(default)]
+    pub source: Source,
 }
 
 #[derive(Debug, Clone)]
@@ -31,6 +46,7 @@ pub struct HistoryRow {
     offset: u64,
     len: usize,
     pieces: usize,
+    source: Source,
     inline_entry: Option<HistoryEntry>,
 }
 
@@ -52,6 +68,7 @@ impl HistoryRow {
             offset,
             len,
             pieces: entry.parts.len(),
+            source: entry.source,
             inline_entry: None,
         }
     }
@@ -64,6 +81,7 @@ impl HistoryRow {
             offset: 0,
             len: 0,
             pieces: entry.parts.len(),
+            source: entry.source,
             inline_entry: Some(entry),
         }
     }
@@ -87,6 +105,11 @@ impl HistoryRow {
     /// Number of pieces appended to this message after it was created.
     pub fn pieces(&self) -> usize {
         self.pieces
+    }
+
+    /// Who started the recording behind this entry.
+    pub fn source(&self) -> Source {
+        self.source
     }
 }
 
@@ -315,6 +338,7 @@ mod tests {
             text: format!("Сообщение номер {index}, которое должно сохраниться полностью"),
             model: format!("model-{index}"),
             parts: Vec::new(),
+            source: super::Source::User,
         }
     }
 
@@ -434,7 +458,22 @@ mod tests {
         .unwrap();
         let history = History::load(&root);
         assert_eq!(history.row(0).unwrap().model(), "unknown model");
+        assert_eq!(history.row(0).unwrap().source(), super::Source::User);
         assert_eq!(history.entry(0).unwrap().text, "Старая запись");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn server_entries_keep_their_source_through_the_index() {
+        let root = test_root("history-source");
+        let mut recorded = entry(1);
+        recorded.source = super::Source::Server;
+        append(&root, &recorded).unwrap();
+        append(&root, &entry(2)).unwrap();
+        let history = History::load(&root);
+        assert_eq!(history.row(0).unwrap().source(), super::Source::User);
+        assert_eq!(history.row(1).unwrap().source(), super::Source::Server);
+        assert_eq!(history.entry(1).unwrap().source, super::Source::Server);
         let _ = std::fs::remove_dir_all(root);
     }
 }

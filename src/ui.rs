@@ -15,6 +15,25 @@ pub const WINDOW_TITLE: &str = "Voice Button";
 enum Tab {
     Capture,
     Settings,
+    Api,
+}
+
+/// Which transcriptions the history list shows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HistoryFilter {
+    All,
+    User,
+    Server,
+}
+
+impl HistoryFilter {
+    fn matches(self, source: state::Source) -> bool {
+        match self {
+            HistoryFilter::All => true,
+            HistoryFilter::User => source == state::Source::User,
+            HistoryFilter::Server => source == state::Source::Server,
+        }
+    }
 }
 
 /// UI process entry point. Launched by the daemon as
@@ -53,24 +72,28 @@ pub fn run_from_args() {
                         text: "And print two copies of the contract.".to_string(),
                     },
                 ],
+                source: state::Source::User,
             },
             state::HistoryEntry {
                 at: "2026-11-05 11:02:17".to_string(),
                 text: "Add milk, bread, eggs and coffee to the shopping list, and do not forget the cat food.".to_string(),
                 model: "v3_e2e_ctc".to_string(),
                 parts: Vec::new(),
+                source: state::Source::User,
             },
             state::HistoryEntry {
                 at: "2026-11-04 18:45:03".to_string(),
                 text: "Tomorrow at ten there is a team meeting; prepare the slides for the second section.".to_string(),
                 model: "large-v3-turbo-q5_0".to_string(),
                 parts: Vec::new(),
+                source: state::Source::User,
             },
             state::HistoryEntry {
                 at: "2026-11-04 15:20:44".to_string(),
                 text: "Translate the sentence into English: I would be glad to see you at the exhibition on Thursday.".to_string(),
                 model: "multi-gigaam-ctc".to_string(),
                 parts: Vec::new(),
+                source: state::Source::User,
             },
         ]);
         // Simulate a UI process opened while the daemon is already recording.
@@ -97,6 +120,8 @@ fn run_ui(config: config::Config, history: state::History, dirs: AppDirs, tab: S
     spawn_file_poller(shared.clone(), dirs.clone());
     let initial_tab = if tab == "settings" {
         Tab::Settings
+    } else if tab == "api" {
+        Tab::Api
     } else {
         Tab::Capture
     };
@@ -114,7 +139,9 @@ fn run_ui(config: config::Config, history: state::History, dirs: AppDirs, tab: S
         tab: initial_tab,
         show_about: false,
         expanded_history: None,
+        history_filter: HistoryFilter::All,
         download_done_seen: false,
+        api_copied_at: 0.0,
         snapshot_dir: std::env::var("VB_SNAPSHOT").ok().map(PathBuf::from),
         snapshot_frame: 0,
     };
@@ -211,6 +238,8 @@ fn spawn_file_poller(shared: Arc<Shared>, dirs: AppDirs) {
         let download_path = dirs.root.join("download.state.json");
         let status_path = dirs.root.join("status.txt");
         let live_path = dirs.root.join("live.json");
+        let api_path = dirs.root.join("api.state.json");
+        let session_path = dirs.root.join("session.json");
         let mut config_meta = meta_key(&std::fs::metadata(&config_path).ok());
         let mut history_meta = meta_key(&std::fs::metadata(&history_path).ok());
         // None forces an initial read when a file already exists. This is
@@ -218,6 +247,8 @@ fn spawn_file_poller(shared: Arc<Shared>, dirs: AppDirs) {
         let mut download_meta = None;
         let mut status_meta = None;
         let mut live_meta = None;
+        let mut api_meta = None;
+        let mut session_meta = None;
         loop {
             std::thread::sleep(Duration::from_millis(300));
             let m = meta_key(&std::fs::metadata(&config_path).ok());
@@ -275,6 +306,19 @@ fn spawn_file_poller(shared: Arc<Shared>, dirs: AppDirs) {
                     }
                 }
             }
+            let m = meta_key(&std::fs::metadata(&api_path).ok());
+            if m != api_meta {
+                api_meta = m;
+                if let Some(state) = crate::ipc::read_api_state(&dirs.root) {
+                    shared.lock().api = Some(state.into());
+                }
+            }
+            let m = meta_key(&std::fs::metadata(&session_path).ok());
+            if m != session_meta {
+                session_meta = m;
+                let view = crate::ipc::read_session(&dirs.root).map(Into::into);
+                shared.lock().session_view = view;
+            }
         }
     });
 }
@@ -285,7 +329,11 @@ pub struct MainWindow {
     tab: Tab,
     show_about: bool,
     expanded_history: Option<usize>,
+    history_filter: HistoryFilter,
     download_done_seen: bool,
+    /// egui timestamp of the last "Copy" click on the API address; drives the
+    /// transient "Copied!" feedback in the API tab.
+    api_copied_at: f64,
     snapshot_dir: Option<PathBuf>,
     snapshot_frame: u32,
 }
@@ -301,6 +349,7 @@ impl eframe::App for MainWindow {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.tab, Tab::Capture, "Capture");
                 ui.selectable_value(&mut self.tab, Tab::Settings, "Settings");
+                ui.selectable_value(&mut self.tab, Tab::Api, "API");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("About").clicked() {
                         self.show_about = true;
@@ -309,7 +358,13 @@ impl eframe::App for MainWindow {
             });
             ui.separator();
             match self.tab {
-                Tab::Capture => capture_body(ui, &mut data, &self.dirs, &mut self.expanded_history),
+                Tab::Capture => capture_body(
+                    ui,
+                    &mut data,
+                    &self.dirs,
+                    &mut self.expanded_history,
+                    &mut self.history_filter,
+                ),
                 Tab::Settings => {
                     // The settings page is taller than the window on small
                     // screens, so keep everything reachable by scrolling.
@@ -318,6 +373,7 @@ impl eframe::App for MainWindow {
                         .auto_shrink([false, false])
                         .show(ui, |ui| settings_body(ui, &mut data, &self.dirs));
                 }
+                Tab::Api => api_body(ui, &mut data, &self.dirs, ctx, &mut self.api_copied_at),
             }
         });
         // A finished download may make a pending model selection applicable.
@@ -358,7 +414,27 @@ impl MainWindow {
                 self.tab = Tab::Settings;
             }
             10 => self.capture(&dir.join("settings.png")),
-            12 => self.tab = Tab::Capture,
+            11 => {
+                // Illustrative state for the screenshot: the server is on and
+                // the address is shown. Nothing is persisted (apply_settings is
+                // not called from the snapshot walk).
+                let mut data = self.shared.lock();
+                data.config.api_enabled = true;
+                data.api = Some(state::ApiStatus {
+                    running: true,
+                    host: "127.0.0.1".to_string(),
+                    port: 8931,
+                    error: None,
+                });
+                self.tab = Tab::Api;
+            }
+            13 => self.capture(&dir.join("api.png")),
+            14 => {
+                let mut data = self.shared.lock();
+                data.config.api_enabled = false;
+                data.api = None;
+                self.tab = Tab::Capture;
+            }
             18 => self.capture(&dir.join("history.png")),
             19 => self.expanded_history = Some(0),
             23 => self.capture(&dir.join("history-expanded.png")),
@@ -655,12 +731,24 @@ fn settings_body(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs) {
             "Play sound when recording starts",
         )
         .changed();
+    ui.horizontal(|ui| {
+        if ui.small_button("Play").clicked() {
+            crate::sound::play_start(data.config.sound_volume);
+        }
+        ui.label(RichText::new("Preview the start cue at the volume above.").weak());
+    });
     sounds_changed |= ui
         .checkbox(
             &mut data.config.play_end_sound,
             "Play sound when recording ends",
         )
         .changed();
+    ui.horizontal(|ui| {
+        if ui.small_button("Play").clicked() {
+            crate::sound::play_end(data.config.sound_volume);
+        }
+        ui.label(RichText::new("Preview the end cue at the volume above.").weak());
+    });
     if sounds_changed {
         apply_settings(data, dirs);
     }
@@ -832,6 +920,119 @@ fn settings_body(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs) {
         ui.label(
             RichText::new(format!("Error: {err}")).color(egui::Color32::from_rgb(230, 90, 90)),
         );
+    }
+}
+
+/// API tab: switch the local server on or off, pick where it listens, and open
+/// the bundled test page with a microphone.
+fn api_body(
+    ui: &mut egui::Ui,
+    data: &mut Data,
+    dirs: &AppDirs,
+    ctx: &egui::Context,
+    copied_at: &mut f64,
+) {
+    ui.heading("API server");
+    ui.label(
+        RichText::new(
+            "Accepts sound from a page or a script (PCM16, mono) and returns the transcription. The app's own microphone is not used.",
+        )
+        .weak(),
+    );
+    ui.add_space(6.0);
+    // Edited in place, but only saved (and the server only restarted) when the
+    // field is committed: Enter, leaving a field, or toggling the switch.
+    let mut commit = ui
+        .checkbox(&mut data.config.api_enabled, "Enable the local API server")
+        .changed();
+    ui.add_enabled_ui(data.config.api_enabled, |ui| {
+        ui.horizontal(|ui| {
+            ui.label("Host:");
+            let host = ui.add(
+                egui::TextEdit::singleline(&mut data.config.api_host)
+                    .desired_width(150.0)
+                    .hint_text("127.0.0.1"),
+            );
+            commit |= host.lost_focus();
+            ui.label("Port:");
+            let port = ui.add(
+                egui::DragValue::new(&mut data.config.api_port).clamp_range(1..=65535),
+            );
+            commit |= port.drag_stopped() || port.lost_focus();
+        });
+    });
+    if commit {
+        data.config.api_host = data.config.api_host.trim().to_string();
+        apply_settings(data, dirs);
+    }
+    let loopback = matches!(data.config.api_host.as_str(), "127.0.0.1" | "localhost" | "::1");
+    if data.config.api_enabled && !loopback {
+        ui.label(
+            RichText::new(
+                "This host is reachable from the network: anyone who can open the port can start recordings.",
+            )
+            .color(egui::Color32::from_rgb(230, 170, 60)),
+        );
+    }
+
+    ui.separator();
+    let running = data.api.as_ref().map(|s| s.running).unwrap_or(false);
+    if running {
+        let status = data.api.as_ref().expect("checked above");
+        let url = format!("http://{}:{}/", browse_host(&status.host), status.port);
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(&url)
+                    .monospace()
+                    .color(egui::Color32::from_rgb(90, 200, 120)),
+            );
+            if ui.button("Copy").clicked() {
+                if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                    let _ = clipboard.set_text(&url);
+                }
+                *copied_at = ctx.input(|i| i.time);
+            }
+        });
+        // Transient "Copied!" feedback right after a copy click.
+        if *copied_at > 0.0 && ctx.input(|i| i.time) < *copied_at + 2.0 {
+            ui.label(RichText::new("Copied!").color(egui::Color32::from_rgb(90, 200, 120)));
+        }
+    } else if data.config.api_enabled {
+        match data.api.as_ref().and_then(|s| s.error.clone()) {
+            Some(error) => ui.label(
+                RichText::new(format!("Not listening: {error}"))
+                    .color(egui::Color32::from_rgb(230, 90, 90)),
+            ),
+            None => ui.label(RichText::new("Starting…").color(egui::Color32::GRAY)),
+        };
+    } else {
+        ui.label(RichText::new("Stopped").color(egui::Color32::GRAY));
+    }
+
+    ui.separator();
+    ui.heading("Endpoints");
+    ui.label("GET  /api/help          — full contract for integrations (JSON).");
+    ui.label("GET  /api/status        — state, live text, received audio.");
+    ui.label("GET  /api/models        — models this build can use.");
+    ui.label("POST /api/record/start  — open a session (model, sampleRate).");
+    ui.label("POST /api/record/audio  — PCM16 LE mono chunk (?session=N).");
+    ui.label("POST /api/record/stop   — finish and transcribe the buffer.");
+    ui.label("GET  /api/record/live   — live text of the session.");
+    ui.label("GET  /api/record/text   — transcript of the last session.");
+    ui.add_space(4.0);
+    ui.label(
+        RichText::new(
+            "The test page is a separate project: api-demo/ (run: node api-demo/server.mjs). The API has no authentication — anyone who can reach the port can send audio.",
+        )
+        .weak(),
+    );
+}
+
+/// Host to put in a clickable link: a wildcard bind address is not browsable.
+fn browse_host(host: &str) -> &str {
+    match host {
+        "" | "0.0.0.0" | "::" => "127.0.0.1",
+        other => other,
     }
 }
 
@@ -1244,7 +1445,13 @@ fn onnx_section(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs, locked: bool
     }
 }
 
-fn capture_body(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs, expanded: &mut Option<usize>) {
+fn capture_body(
+    ui: &mut egui::Ui,
+    data: &mut Data,
+    dirs: &AppDirs,
+    expanded: &mut Option<usize>,
+    filter: &mut HistoryFilter,
+) {
     let status = data.status;
     match status {
         crate::state::Status::Recording => {
@@ -1252,42 +1459,63 @@ fn capture_body(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs, expanded: &m
                 .button(RichText::new("Stop recording").color(egui::Color32::from_rgb(200, 60, 60)))
                 .clicked()
             {
-                crate::ipc::write_record_request(&dirs.root);
+                crate::ipc::write_record_request(&dirs.root, r#"{"kind":"user"}"#);
             }
-            if data.live_started_ms > 0 {
-                let elapsed = chrono::Local::now().timestamp_millis() - data.live_started_ms;
-                let secs = (elapsed / 1000).max(0);
+            // The same controls and cues serve both interactors; only the
+            // attribution and the audio source differ.
+            let server_session = data
+                .session_view
+                .as_ref()
+                .filter(|session| session.owner == crate::state::InteractorKind::Server)
+                .map(|session| session.model.clone());
+            if let Some(model) = server_session {
+                let model = model.map(|model| format!(" · {model}")).unwrap_or_default();
                 ui.label(
-                    RichText::new(format!("REC {secs}s"))
-                        .color(egui::Color32::from_rgb(220, 60, 60)),
+                    RichText::new(format!("API session: receiving audio{model}"))
+                        .color(egui::Color32::from_rgb(230, 170, 60)),
+                );
+                ui.label(
+                    RichText::new(
+                        "The sound comes from the API client, not from this machine. The text goes back to the caller and is saved in the history; Stop ends the session.",
+                    )
+                    .weak(),
                 );
             } else {
-                ui.label(RichText::new("REC").color(egui::Color32::from_rgb(220, 60, 60)));
-            }
-            ui.add_space(4.0);
-            // A dedicated read-only field makes the live state visible even
-            // before the first words arrive. Its width is bounded, so egui
-            // wraps the transcript instead of growing one endless line.
-            egui::Frame::group(ui.style()).show(ui, |ui| {
-                let size = egui::vec2(ui.available_width(), 140.0);
-                ui.allocate_ui(size, |ui| {
-                    egui::ScrollArea::vertical()
-                        .id_source("live_transcript")
-                        .auto_shrink([false, false])
-                        .stick_to_bottom(true)
-                        .show(ui, |ui| {
-                            ui.add(
-                                egui::Label::new(if data.live_text.is_empty() {
-                                    "Listening…"
-                                } else {
-                                    &data.live_text
-                                })
-                                .wrap(true)
-                                .selectable(false),
-                            );
-                        });
+                if data.live_started_ms > 0 {
+                    let elapsed = chrono::Local::now().timestamp_millis() - data.live_started_ms;
+                    let secs = (elapsed / 1000).max(0);
+                    ui.label(
+                        RichText::new(format!("REC {secs}s"))
+                            .color(egui::Color32::from_rgb(220, 60, 60)),
+                    );
+                } else {
+                    ui.label(RichText::new("REC").color(egui::Color32::from_rgb(220, 60, 60)));
+                }
+                ui.add_space(4.0);
+                // A dedicated read-only field makes the live state visible even
+                // before the first words arrive. Its width is bounded, so egui
+                // wraps the transcript instead of growing one endless line.
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    let size = egui::vec2(ui.available_width(), 140.0);
+                    ui.allocate_ui(size, |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_source("live_transcript")
+                            .auto_shrink([false, false])
+                            .stick_to_bottom(true)
+                            .show(ui, |ui| {
+                                ui.add(
+                                    egui::Label::new(if data.live_text.is_empty() {
+                                        "Listening…"
+                                    } else {
+                                        &data.live_text
+                                    })
+                                    .wrap(true)
+                                    .selectable(false),
+                                );
+                            });
+                    });
                 });
-            });
+            }
         }
         crate::state::Status::Transcribing => {
             ui.label(RichText::new("Transcribing…").color(egui::Color32::from_rgb(230, 150, 40)));
@@ -1306,17 +1534,20 @@ fn capture_body(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs, expanded: &m
                 .add_enabled(can_record, egui::Button::new("Start recording"))
                 .clicked()
             {
-                crate::ipc::write_record_request(&dirs.root);
+                crate::ipc::write_record_request(&dirs.root, r#"{"kind":"user"}"#);
             }
         }
     }
     ui.separator();
-    history_body(ui, data, expanded);
+    history_body(ui, data, expanded, filter);
 }
 
+/// Take the visible rows of `indices` (newest first) and their heights. Only
+/// matching entries are laid out, so filtering keeps the virtualized list exact.
 fn history_row_offsets(
     ui: &mut egui::Ui,
     history: &state::History,
+    indices: &[usize],
     expanded: Option<usize>,
 ) -> Vec<f32> {
     let spacing = ui.spacing().item_spacing.y;
@@ -1324,9 +1555,9 @@ fn history_row_offsets(
     let wrap_width = ui.available_width().max(32.0);
     let font = egui::TextStyle::Body.resolve(ui.style());
     let color = ui.visuals().text_color();
-    let mut offsets = Vec::with_capacity(history.len() + 1);
+    let mut offsets = Vec::with_capacity(indices.len() + 1);
     offsets.push(0.0);
-    for index in 0..history.len() {
+    for (position, &index) in indices.iter().enumerate() {
         let mut height = base_height;
         if expanded == Some(index) {
             if let Ok(entry) = history.entry(index) {
@@ -1351,7 +1582,7 @@ fn history_row_offsets(
                 }
             }
         }
-        offsets.push(offsets[index] + height);
+        offsets.push(offsets[position] + height);
     }
     offsets
 }
@@ -1376,17 +1607,43 @@ fn visible_history_range(
     first..(last + 1).min(rows)
 }
 
-fn history_body(ui: &mut egui::Ui, data: &mut Data, expanded: &mut Option<usize>) {
-    ui.heading("History");
+fn history_body(
+    ui: &mut egui::Ui,
+    data: &mut Data,
+    expanded: &mut Option<usize>,
+    filter: &mut HistoryFilter,
+) {
+    ui.horizontal(|ui| {
+        ui.heading("History");
+        ui.add_space(10.0);
+        ui.label(RichText::new("show:").weak());
+        let mut next = *filter;
+        ui.selectable_value(&mut next, HistoryFilter::All, "All");
+        ui.selectable_value(&mut next, HistoryFilter::User, "User");
+        ui.selectable_value(&mut next, HistoryFilter::Server, "Server");
+        *filter = next;
+    });
     ui.separator();
-    if data.history.is_empty() {
-        ui.label("No transcriptions yet.");
+    let indices: Vec<usize> = (0..data.history.len())
+        .filter(|&index| {
+            data.history
+                .row(index)
+                .map(|row| filter.matches(row.source()))
+                .unwrap_or(false)
+        })
+        .collect();
+    if indices.is_empty() {
+        ui.label(match filter {
+            HistoryFilter::All => "No transcriptions yet.",
+            HistoryFilter::User => "No transcriptions dictated by the user yet.",
+            HistoryFilter::Server => "No transcriptions started by the API server yet.",
+        });
         return;
     }
 
     let mut copied: Option<String> = None;
     let mut toggle: Option<usize> = None;
-    let offsets = history_row_offsets(ui, &data.history, *expanded);
+    let offsets = history_row_offsets(ui, &data.history, &indices, *expanded);
     let total_height = offsets.last().copied().unwrap_or(0.0);
     ScrollArea::vertical()
         .id_source("history_rows")
@@ -1398,7 +1655,8 @@ fn history_body(ui: &mut egui::Ui, data: &mut Data, expanded: &mut Option<usize>
             let y_max = ui.max_rect().top() + offsets[range.end];
             let rect = egui::Rect::from_x_y_ranges(ui.max_rect().x_range(), y_min..=y_max);
             ui.allocate_ui_at_rect(rect, |ui| {
-                for index in range {
+                for position in range {
+                    let index = indices[position];
                     let Some(row) = data.history.row(index).cloned() else {
                         continue;
                     };
@@ -1408,7 +1666,7 @@ fn history_body(ui: &mut egui::Ui, data: &mut Data, expanded: &mut Option<usize>
                     } else {
                         None
                     };
-                    let height = offsets[index + 1] - offsets[index];
+                    let height = offsets[position + 1] - offsets[position];
                     let width = ui.available_width();
                     ui.push_id(index, |ui| {
                         ui.allocate_ui(egui::vec2(width, height), |ui| {
@@ -1431,6 +1689,13 @@ fn history_body(ui: &mut egui::Ui, data: &mut Data, expanded: &mut Option<usize>
                                         String::new()
                                     }
                                 ));
+                                if row.source() == state::Source::Server {
+                                    ui.label(
+                                        RichText::new("server")
+                                            .small()
+                                            .color(egui::Color32::from_rgb(230, 170, 60)),
+                                    );
+                                }
                                 if ui.selectable_label(is_open, row.preview()).clicked() {
                                     toggle = Some(index);
                                 }

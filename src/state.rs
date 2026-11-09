@@ -1,5 +1,7 @@
 use crate::config::{Backend, Config};
-pub use crate::history::{History, HistoryChunk, HistoryEntry};
+pub use crate::history::{History, HistoryChunk, HistoryEntry, Source};
+use serde::{Deserialize, Serialize};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
@@ -12,6 +14,166 @@ pub enum Status {
     /// No usable model selected: recording is unavailable and the tray icon
     /// is shown grayed out.
     NoModel,
+}
+
+/// Who is asking the app to record. Every input path (button, hotkey, tray
+/// click, API request) speaks through this abstraction, so sounds, the tray
+/// icon and history attribution work the same for all of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum InteractorKind {
+    /// A human being, via the window, a global shortcut or the tray icon.
+    #[default]
+    User,
+    /// The local API server, on behalf of a page or a script.
+    Server,
+}
+
+impl InteractorKind {
+    /// Name used in JSON snapshots and the API.
+    pub fn label(self) -> &'static str {
+        match self {
+            InteractorKind::User => "user",
+            InteractorKind::Server => "server",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Interactor {
+    pub kind: InteractorKind,
+}
+
+impl Interactor {
+    pub fn user() -> Self {
+        Self {
+            kind: InteractorKind::User,
+        }
+    }
+
+    pub fn server() -> Self {
+        Self {
+            kind: InteractorKind::Server,
+        }
+    }
+
+    pub fn is_user(&self) -> bool {
+        self.kind == InteractorKind::User
+    }
+
+    /// A human user may stop any session; the API server only its own. This is
+    /// the whole privilege model: the user's dictation is never interrupted by
+    /// the server.
+    pub fn may_stop(&self, session: &Session) -> bool {
+        self.is_user() || session.owner.kind == InteractorKind::Server
+    }
+}
+
+/// A model the API server may use for the sessions it starts, without touching
+/// the model the user picked in Settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelChoice {
+    pub backend: Backend,
+    pub id: String,
+}
+
+impl ModelChoice {
+    /// Stable identifier used by the API: `Onnx/gigaam-v3-rnnt`.
+    pub fn api_id(&self) -> String {
+        format!("{}/{}", self.backend.label(), self.id)
+    }
+
+    /// Parse an API model identifier. `None` for anything that is not
+    /// `Engine/id` with a known engine.
+    pub fn parse(text: &str) -> Option<Self> {
+        let (engine, id) = text.trim().split_once('/')?;
+        let id = id.trim();
+        if id.is_empty() {
+            return None;
+        }
+        let backend = match engine.trim().to_ascii_lowercase().as_str() {
+            "whisper" => Backend::Whisper,
+            "onnx" => Backend::Onnx,
+            _ => return None,
+        };
+        Some(Self {
+            backend,
+            id: id.to_string(),
+        })
+    }
+
+    /// Apply the selection to a copy of the user's settings.
+    pub fn apply_to(&self, cfg: &mut Config) {
+        cfg.backend = self.backend;
+        match self.backend {
+            Backend::Whisper => {
+                cfg.whisper_model = self.id.clone();
+                cfg.whisper_file = None;
+            }
+            Backend::Onnx => {
+                cfg.onnx_model = self.id.clone();
+                cfg.onnx_folder = None;
+            }
+        }
+    }
+}
+
+/// A recording session: who started it, with which model, and who ended it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Session {
+    pub id: u64,
+    pub owner: Interactor,
+    /// Model override for this session only; `None` uses the user's settings.
+    pub model: Option<ModelChoice>,
+    /// Set when the session is being stopped (kept through transcription so the
+    /// result can say who ended it).
+    pub stopped_by: Option<Interactor>,
+}
+
+impl Session {
+    /// Model shown in history for this session.
+    pub fn model_label(&self) -> Option<String> {
+        self.model.as_ref().map(ModelChoice::api_id)
+    }
+}
+
+/// Audio pushed by an API caller instead of the local microphone: the page (or
+/// script) captures its own sound and sends PCM here.
+pub struct StreamSession {
+    pub id: u64,
+    /// Model chosen by the caller for this session only.
+    pub model: Option<ModelChoice>,
+    /// Sample rate of the incoming mono PCM.
+    pub sample_rate: u32,
+    /// Mono f32 samples, appended by the API thread.
+    pub buffer: Arc<Mutex<Vec<f32>>>,
+    pub received_samples: u64,
+    /// Latest live preview produced by the stream worker.
+    pub live_text: String,
+    /// Set when the session stops receiving; the worker then decodes the final
+    /// text from the whole buffer.
+    pub stop: Arc<AtomicBool>,
+}
+
+/// Result of the last API-owned session, readable by the caller that started
+/// it. The server never sees the user's own dictations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiResult {
+    pub session: u64,
+    pub text: String,
+    pub model: String,
+    pub at: String,
+    pub stopped_by: InteractorKind,
+    pub error: Option<String>,
+}
+
+/// Session info published to the UI process (it cannot read the daemon's
+/// memory).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionView {
+    pub id: u64,
+    pub owner: InteractorKind,
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -63,6 +225,28 @@ pub struct Data {
     pub input_devices_at: Option<std::time::Instant>,
     pub history: History,
     pub quit: bool,
+    /// Runtime state of the local API server, as published by the daemon and
+    /// mirrored into the UI.
+    pub api: Option<ApiStatus>,
+    /// The recording session that is currently open (daemon-side, authoritative);
+    /// it stays set while the recording is being transcribed.
+    pub session: Option<Session>,
+    /// Same session, mirrored into the UI process through `session.json`.
+    pub session_view: Option<SessionView>,
+    /// Active audio upload from an API caller; `None` when the app is not
+    /// transcribing uploaded sound.
+    pub stream: Option<StreamSession>,
+    /// Last result produced for an API session.
+    pub api_result: Option<ApiResult>,
+}
+
+/// Runtime status of the local API server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiStatus {
+    pub running: bool,
+    pub host: String,
+    pub port: u16,
+    pub error: Option<String>,
 }
 
 pub struct Shared {
@@ -93,6 +277,11 @@ impl Shared {
                 input_devices_at: None,
                 history,
                 quit: false,
+                api: None,
+                session: None,
+                session_view: None,
+                stream: None,
+                api_result: None,
             }),
         }
     }
@@ -159,4 +348,56 @@ impl Shared {
 
 pub fn load_history(root: &std::path::Path) -> History {
     History::load(root)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Interactor, ModelChoice, Session};
+    use crate::config::{Backend, Config};
+
+    fn session(owner: Interactor) -> Session {
+        Session {
+            id: 1,
+            owner,
+            model: None,
+            stopped_by: None,
+        }
+    }
+
+    #[test]
+    fn the_user_stops_any_session_and_the_server_only_its_own() {
+        let user_session = session(Interactor::user());
+        let server_session = session(Interactor::server());
+        assert!(Interactor::user().may_stop(&user_session));
+        assert!(Interactor::user().may_stop(&server_session));
+        assert!(!Interactor::server().may_stop(&user_session));
+        assert!(Interactor::server().may_stop(&server_session));
+    }
+
+    #[test]
+    fn model_choice_round_trips_through_its_api_id() {
+        for text in ["Onnx/gigaam-v3-rnnt", "Whisper/medium-q5_0"] {
+            let choice = ModelChoice::parse(text).expect("valid id");
+            assert_eq!(choice.api_id(), text);
+        }
+        assert!(ModelChoice::parse("gigaam-v3-rnnt").is_none());
+        assert!(ModelChoice::parse("Other/model").is_none());
+        assert!(ModelChoice::parse("Onnx/").is_none());
+    }
+
+    #[test]
+    fn a_model_override_does_not_leak_into_the_user_settings() {
+        let mut cfg = Config::default();
+        cfg.backend = Backend::Onnx;
+        cfg.onnx_model = "gigaam-v3-rnnt-punct".to_string();
+        let mut overridden = cfg.clone();
+        ModelChoice::parse("Whisper/medium-q5_0")
+            .unwrap()
+            .apply_to(&mut overridden);
+        assert_eq!(overridden.backend, Backend::Whisper);
+        assert_eq!(overridden.whisper_model, "medium-q5_0");
+        // The user's own selection is untouched.
+        assert_eq!(cfg.backend, Backend::Onnx);
+        assert_eq!(cfg.onnx_model, "gigaam-v3-rnnt-punct");
+    }
 }

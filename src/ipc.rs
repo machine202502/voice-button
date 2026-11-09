@@ -73,6 +73,98 @@ pub fn remove_download_state(root: &Path) {
 }
 
 // ---------------------------------------------------------------------------
+// Voice Button API server status (daemon → UI), so the API tab can show
+// running/stopped and the address that is actually bound.
+
+#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq, Eq)]
+pub struct ApiSnapshot {
+    pub running: bool,
+    pub host: String,
+    pub port: u16,
+    pub error: Option<String>,
+}
+
+impl From<ApiSnapshot> for crate::state::ApiStatus {
+    fn from(s: ApiSnapshot) -> Self {
+        Self {
+            running: s.running,
+            host: s.host,
+            port: s.port,
+            error: s.error,
+        }
+    }
+}
+
+pub fn api_state_path(root: &Path) -> PathBuf {
+    root.join("api.state.json")
+}
+
+pub fn write_api_state(root: &Path, snap: &ApiSnapshot) {
+    if let Ok(text) = serde_json::to_string(snap) {
+        atomic_write(api_state_path(root), text.as_bytes());
+    }
+}
+
+pub fn read_api_state(root: &Path) -> Option<ApiSnapshot> {
+    let text = std::fs::read_to_string(api_state_path(root)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+// ---------------------------------------------------------------------------
+// The recording session (daemon → UI), so the window can show that a recording
+// was started by the API server. Removed when the session ends.
+
+#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq, Eq)]
+pub struct SessionSnapshot {
+    pub id: u64,
+    pub owner: crate::state::InteractorKind,
+    pub model: Option<String>,
+}
+
+impl From<&crate::state::Session> for SessionSnapshot {
+    fn from(session: &crate::state::Session) -> Self {
+        Self {
+            id: session.id,
+            owner: session.owner.kind,
+            model: session.model_label(),
+        }
+    }
+}
+
+impl From<SessionSnapshot> for crate::state::SessionView {
+    fn from(s: SessionSnapshot) -> Self {
+        Self {
+            id: s.id,
+            owner: s.owner,
+            model: s.model,
+        }
+    }
+}
+
+pub fn session_path(root: &Path) -> PathBuf {
+    root.join("session.json")
+}
+
+/// Publish the open session, or remove the file when it is over.
+pub fn write_session(root: &Path, session: Option<&crate::state::Session>) {
+    match session {
+        Some(session) => {
+            if let Ok(text) = serde_json::to_string(&SessionSnapshot::from(session)) {
+                atomic_write(session_path(root), text.as_bytes());
+            }
+        }
+        None => {
+            let _ = std::fs::remove_file(session_path(root));
+        }
+    }
+}
+
+pub fn read_session(root: &Path) -> Option<SessionSnapshot> {
+    let text = std::fs::read_to_string(session_path(root)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+// ---------------------------------------------------------------------------
 // Recording status (daemon → UI), so the UI can lock model/backend switching
 // while recording or transcribing.
 
@@ -196,25 +288,25 @@ pub fn clear_live(root: &Path) {
 }
 
 // ---------------------------------------------------------------------------
-// Recording toggle requests from the UI.
+// Recording toggle requests from the UI or from the API server.
 
 pub fn record_request_path(root: &Path) -> PathBuf {
     root.join("record.request")
 }
 
-pub fn write_record_request(root: &Path) {
-    atomic_write(record_request_path(root), b"toggle");
+/// Written by the UI (human interactor) or by the API server (API interactor).
+/// The content is either an interactor JSON object or legacy plain text.
+pub fn write_record_request(root: &Path, interactor_json: &str) {
+    atomic_write(record_request_path(root), interactor_json.as_bytes());
 }
 
-/// Returns true once per UI request and consumes it.
-pub fn take_record_request(root: &Path) -> bool {
+/// Returns the pending interactor (or legacy content) and consumes the request.
+pub fn take_record_request(root: &Path) -> Option<String> {
     let path = record_request_path(root);
-    if path.exists() {
-        let _ = std::fs::remove_file(&path);
-        true
-    } else {
-        false
-    }
+    let content = std::fs::read_to_string(&path).ok()?;
+    let _ = std::fs::remove_file(&path);
+    let content = content.trim().to_string();
+    (!content.is_empty()).then_some(content)
 }
 
 /// Write via a temp file + rename so concurrent readers never see a partial

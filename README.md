@@ -54,6 +54,36 @@ The application has two executables that must stay beside each other:
 All application assets and Windows resources are embedded at build time.
 Models are not bundled.
 
+## Local API
+
+The app can also transcribe audio that a page, an editor plugin or a script
+sends it, instead of using its own microphone. Enable it under **API**, pick the
+host (default `127.0.0.1`) and port (default `8931`). The caller streams 16-bit
+PCM and receives live and final text; the result is saved to history with the
+`server` source.
+
+- `GET /api/help` — the whole contract as JSON: endpoints, audio format, session
+  rules, error codes and runnable examples. Hand it to an agent or a tool that
+  has to integrate the app; it does not need the binary.
+- `POST /api/record/start` → `POST /api/record/audio?session=N` (PCM16 LE mono)
+  → `POST /api/record/stop`, then poll `GET /api/status` and read
+  `GET /api/record/text`.
+- `GET /api/models` lists the models this build can use. `start` may override
+  the engine and model for that session only, without touching the user's
+  settings.
+- One session at a time: while the user is dictating in the app, the API answers
+  409 instead of interrupting. The user can stop an API session from the window;
+  the text is still transcribed and saved.
+
+A ready-made browser demo (microphone → app) lives in `api-demo/`:
+
+```powershell
+node api-demo/server.mjs      # http://127.0.0.1:8080/
+```
+
+There is no authentication: keep the host on `127.0.0.1` unless the network is
+trusted. Browser microphones work only on localhost or over HTTPS.
+
 ## Models
 
 Settings offers Whisper (whisper.cpp) and ONNX Runtime models. Multilingual

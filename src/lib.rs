@@ -3,6 +3,7 @@ pub mod config;
 pub mod history;
 pub mod hotkey;
 pub mod icons;
+pub mod api;
 pub mod ipc;
 pub mod log;
 pub mod model_manager;
