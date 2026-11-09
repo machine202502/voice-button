@@ -1,6 +1,6 @@
 [package]
 name = "voice-button"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "Offline voice-to-text in the Windows tray"
 license = "MIT"
@@ -35,7 +35,7 @@ arboard = "3"
 winreg = "0.56"
 winit = "0.29"
 image = { version = "0.25", default-features = false, features = ["png"] }
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging", "Win32_Media_Audio", "Win32_Graphics_Gdi", "Win32_Storage_Xps", "Win32_System_LibraryLoader", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging", "Win32_Media_Audio", "Win32_Graphics_Gdi", "Win32_Storage_Xps", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_Globalization"] }
 sherpa-onnx = { version = "2", default-features = false, features = ["shared"] }
 
 [build-dependencies]
