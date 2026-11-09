@@ -125,6 +125,7 @@ h2 { font-size: clamp(36px, 5vw, 62px); line-height: 1.08; letter-spacing: -.045
 .settings-section { display: grid; grid-template-columns: 1fr 1fr; align-items: center; gap: clamp(45px, 7vw, 90px); border-top: 1px solid var(--line); }
 .settings-shot { background: var(--panel); padding: 22px; border-radius: var(--radius); transform: rotate(-1.5deg); }
 .settings-shot img { display: block; width: 100%; max-height: 590px; object-fit: contain; object-position: top; border-radius: 12px; }
+.api-section .settings-shot { transform: rotate(1.2deg); }
 .settings-copy ul { list-style: none; margin-top: 28px; }
 .settings-copy li { padding: 12px 0; border-bottom: 1px solid var(--line); color: #d3dccb; }
 .settings-copy li::before { content: "+"; color: var(--lime); font-weight: 800; margin-right: 13px; }

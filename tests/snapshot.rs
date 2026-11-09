@@ -27,6 +27,7 @@ fn ui_snapshots_render() {
 
     for name in [
         "settings.png",
+        "api.png",
         "history.png",
         "history-expanded.png",
         "about.png",
