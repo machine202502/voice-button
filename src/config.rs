@@ -86,6 +86,10 @@ pub struct Config {
     /// Port the local API server listens on.
     #[serde(default = "default_api_port")]
     pub api_port: u16,
+    /// Interface language: a locale code from `locales/`, empty = the Windows
+    /// language (or English when there is no matching catalog).
+    #[serde(default)]
+    pub ui_language: String,
 }
 
 /// Shortcuts start unbound: the user picks them in Settings.
@@ -124,8 +128,63 @@ impl Default for Config {
             api_enabled: false,
             api_host: default_api_host(),
             api_port: default_api_port(),
+            ui_language: String::new(),
         }
     }
+}
+
+/// Windows UI language, lowercased and without the region: "ru", "en", "zh".
+pub fn system_language() -> String {
+    use windows_sys::Win32::Globalization::GetUserDefaultLocaleName;
+    let mut buffer = [0u16; 85];
+    // SAFETY: the buffer is valid for its stated length and the call only
+    // writes up to that length.
+    let len = unsafe { GetUserDefaultLocaleName(buffer.as_mut_ptr(), buffer.len() as i32) };
+    if len <= 0 {
+        return String::new();
+    }
+    let locale = String::from_utf16_lossy(&buffer[..(len as usize).saturating_sub(1)]);
+    locale
+        .split(['-', '_'])
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase()
+}
+
+/// First-run defaults: a model that fits the language of the system.
+///
+/// Russian speakers get the compact GigaAM RNN-T with punctuation, which handles
+/// Russian better than a small Whisper. English, Chinese, Japanese and Korean
+/// are covered by SenseVoice, which is multilingual and much lighter than a
+/// large Whisper. Everything else starts on the multilingual Whisper model.
+/// After the first run the choice belongs to the user.
+pub fn defaults_for_language(language: &str) -> Config {
+    let mut config = Config::default();
+    config.ui_language = String::new();
+    match language {
+        "ru" => {
+            config.backend = Backend::Onnx;
+            config.onnx_model = "gigaam-v3-rnnt-punct".to_string();
+            config.language = "ru".to_string();
+        }
+        "en" | "zh" | "ja" | "ko" => {
+            config.backend = Backend::Onnx;
+            config.onnx_model = "sense-voice".to_string();
+            // SenseVoice detects the language; it also covers English.
+            config.language = "auto".to_string();
+        }
+        _ => {
+            config.backend = Backend::Whisper;
+            config.whisper_model = "large-v3-turbo-q5_0".to_string();
+            config.language = "auto".to_string();
+        }
+    }
+    config
+}
+
+/// Config used when there is no file yet.
+pub fn default_for_system() -> Config {
+    defaults_for_language(&system_language())
 }
 
 fn default_api_host() -> String {
@@ -173,10 +232,12 @@ pub fn save_config(root: &std::path::Path, cfg: &Config) -> anyhow::Result<()> {
 }
 
 pub fn load_config(root: &std::path::Path) -> Config {
-    let mut config = fs::read_to_string(root.join("config.json"))
-        .ok()
-        .and_then(|s| serde_json::from_str::<Config>(&s).ok())
-        .unwrap_or_default();
+    let mut config = match fs::read_to_string(root.join("config.json")) {
+        // No settings yet: the first launch suggests a model for the system
+        // language instead of a generic default.
+        Err(_) => default_for_system(),
+        Ok(text) => serde_json::from_str::<Config>(&text).unwrap_or_else(|_| default_for_system()),
+    };
     // Retired catalog ids (istupakov exports and older folders) map to the
     // sherpa-onnx conversions this build actually ships.
     config.onnx_model = match config.onnx_model.as_str() {
@@ -192,4 +253,36 @@ pub fn load_config(root: &std::path::Path) -> Config {
     }
     .to_string();
     config
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{defaults_for_language, Backend};
+
+    #[test]
+    fn russian_systems_get_the_gigaam_rnnt_model() {
+        let cfg = defaults_for_language("ru");
+        assert_eq!(cfg.backend, Backend::Onnx);
+        assert_eq!(cfg.onnx_model, "gigaam-v3-rnnt-punct");
+        assert_eq!(cfg.language, "ru");
+        // The interface follows the system language, not a fixed one.
+        assert!(cfg.ui_language.is_empty());
+    }
+
+    #[test]
+    fn english_chinese_japanese_and_korean_get_sense_voice() {
+        for language in ["en", "zh", "ja", "ko"] {
+            let cfg = defaults_for_language(language);
+            assert_eq!(cfg.backend, Backend::Onnx, "{language}");
+            assert_eq!(cfg.onnx_model, "sense-voice", "{language}");
+            assert_eq!(cfg.language, "auto", "{language}");
+        }
+    }
+
+    #[test]
+    fn other_languages_get_the_multilingual_whisper_model() {
+        let cfg = defaults_for_language("de");
+        assert_eq!(cfg.backend, Backend::Whisper);
+        assert_eq!(cfg.whisper_model, "large-v3-turbo-q5_0");
+    }
 }

@@ -54,6 +54,7 @@ Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\NOTICE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\AISOFTWARE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\assets\CREDITS.md"; DestName: "CREDITS.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\locales\*.json"; DestDir: "{app}\locales"; Flags: ignoreversion
 Source: "{#ThirdParty}"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]

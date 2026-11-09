@@ -3,6 +3,7 @@ use crate::icons;
 use crate::state::Status;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
+use crate::i18n::tr;
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
 use tray_icon::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 
@@ -36,6 +37,8 @@ pub enum TrayCommand {
     SetPasteHotkey(Option<Hotkey>),
     /// Swap the left and middle tray mouse actions.
     SetMouseSwap(bool),
+    /// Rebuild the menu and tooltip after the interface language changed.
+    SetLanguage,
     Shutdown,
 }
 
@@ -166,6 +169,50 @@ fn apply_hotkey(
     }
 }
 
+/// Menu entries and their ids, rebuilt when the interface language changes.
+struct MenuIds {
+    settings: MenuId,
+    capture: MenuId,
+    copy_last: MenuId,
+    open_folder: MenuId,
+    quit: MenuId,
+}
+
+fn build_menu() -> (Menu, MenuIds) {
+    let menu = Menu::new();
+    let copy_last = MenuItem::new(tr("Copy last transcription"), true, None);
+    let settings = MenuItem::new(tr("Settings"), true, None);
+    let capture = MenuItem::new(tr("Capture"), true, None);
+    let open_folder = MenuItem::new(tr("Open models folder"), true, None);
+    let separator = PredefinedMenuItem::separator();
+    let quit = MenuItem::new(tr("Quit"), true, None);
+    menu.append_items(&[
+        &copy_last,
+        &settings,
+        &capture,
+        &open_folder,
+        &separator,
+        &quit,
+    ])
+    .expect("failed to build tray menu");
+    let ids = MenuIds {
+        settings: settings.id().clone(),
+        capture: capture.id().clone(),
+        copy_last: copy_last.id().clone(),
+        open_folder: open_folder.id().clone(),
+        quit: quit.id().clone(),
+    };
+    (menu, ids)
+}
+
+fn tooltip(swap_mouse_buttons: bool) -> String {
+    if swap_mouse_buttons {
+        tr("Voice Button - left click: record and paste, middle click: record")
+    } else {
+        tr("Voice Button - left click: record, middle click: record and paste")
+    }
+}
+
 fn run(
     to_app: Sender<TrayAction>,
     rx_cmd: Receiver<TrayCommand>,
@@ -174,35 +221,11 @@ fn run(
     paste_hotkey: Option<Hotkey>,
     mut swap_mouse_buttons: bool,
 ) {
-    let menu = Menu::new();
-    let copy_last = MenuItem::new("Copy last transcription", true, None);
-    let settings = MenuItem::new("Settings", true, None);
-    let history = MenuItem::new("Capture", true, None);
-    let open_folder = MenuItem::new("Open models folder", true, None);
-    let separator = PredefinedMenuItem::separator();
-    let quit = MenuItem::new("Quit", true, None);
-    menu.append_items(&[
-        &copy_last,
-        &settings,
-        &history,
-        &open_folder,
-        &separator,
-        &quit,
-    ])
-    .expect("failed to build tray menu");
-    let settings_id = settings.id().clone();
-    let history_id = history.id().clone();
-    let copy_last_id = copy_last.id().clone();
-    let open_folder_id = open_folder.id().clone();
-    let quit_id = quit.id().clone();
+    let (menu, mut ids) = build_menu();
     let tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_menu_on_left_click(false)
-        .with_tooltip(if swap_mouse_buttons {
-            "Voice Button - left click: record and paste, middle click: record"
-        } else {
-            "Voice Button - left click: record, middle click: record and paste"
-        })
+        .with_tooltip(tooltip(swap_mouse_buttons))
         .with_icon(icons::icon_idle())
         .build()
         .expect("failed to create tray icon");
@@ -270,12 +293,15 @@ fn run(
                 ),
                 TrayCommand::SetMouseSwap(swap) => {
                     swap_mouse_buttons = swap;
-                    let _ = tray.set_tooltip(Some(if swap {
-                        "Voice Button - left click: record and paste, middle click: record"
-                    } else {
-                        "Voice Button - left click: record, middle click: record and paste"
-                    }));
+                    let _ = tray.set_tooltip(Some(tooltip(swap)));
                     crate::log::log(&format!("tray mouse buttons swapped: {swap}"));
+                }
+                TrayCommand::SetLanguage => {
+                    let (menu, next) = build_menu();
+                    tray.set_menu(Some(Box::new(menu)));
+                    ids = next;
+                    let _ = tray.set_tooltip(Some(tooltip(swap_mouse_buttons)));
+                    crate::log::log("tray menu rebuilt for the new interface language");
                 }
                 TrayCommand::Shutdown => {
                     apply_hotkey(hotkey_window, HOTKEY_ID, &mut registered, None, "record");
@@ -330,15 +356,15 @@ fn run(
             }
         }
         for id in poll_menu_ids() {
-            let action = if id == settings_id {
+            let action = if id == ids.settings {
                 Some(TrayAction::OpenSettings)
-            } else if id == history_id {
+            } else if id == ids.capture {
                 Some(TrayAction::OpenCapture)
-            } else if id == copy_last_id {
+            } else if id == ids.copy_last {
                 Some(TrayAction::CopyLast)
-            } else if id == open_folder_id {
+            } else if id == ids.open_folder {
                 Some(TrayAction::OpenModelsFolder)
-            } else if id == quit_id {
+            } else if id == ids.quit {
                 Some(TrayAction::Quit)
             } else {
                 None

@@ -182,6 +182,9 @@ if ($MyInvocation.InvocationName -ne '.') {
     New-Item -ItemType Directory -Force -Path $stage | Out-Null
     Copy-Item $daemon (Join-Path $stage 'voice-button.exe')
     Copy-Item $ui (Join-Path $stage 'voice-button-ui.exe')
+    # Interface translations are plain files so a language can be added or
+    # fixed without rebuilding.
+    Copy-Item (Join-Path $Root 'locales') (Join-Path $stage 'locales') -Recurse
     foreach ($dll in @('sherpa-onnx-c-api.dll', 'sherpa-onnx-cxx-api.dll', 'onnxruntime.dll')) {
         Copy-Item (Join-Path $TargetDir "release\$dll") (Join-Path $stage $dll)
     }

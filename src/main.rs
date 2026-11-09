@@ -1186,7 +1186,19 @@ fn run_daemon() {
         std::process::exit(0);
     }
     let mut cfg = config::load_config(&dirs.root);
+    let first_run = !dirs.root.join("config.json").exists();
+    // The tray menu is built from the catalog, so load it before the tray starts.
+    voice_button::i18n::init(&dirs.root, &cfg.ui_language);
     ensure_real_microphone(&mut cfg, &dirs.root);
+    if first_run {
+        // Persist the language-suggested model so the choice is visible and
+        // stable across restarts.
+        if let Err(e) = config::save_config(&dirs.root, &cfg) {
+            log::log(&format!("failed to save the first-run settings: {e:#}"));
+        } else {
+            log::log("first run: saved the defaults for the system language");
+        }
+    }
     if cfg.autostart {
         let _ = autostart::set_enabled(cfg.silent_start, true);
     }
@@ -1222,6 +1234,7 @@ fn run_daemon() {
     let mut key_state = [false; 256];
 
     let mut last_model_ready: Option<bool> = None;
+    let mut ui_language = cfg.ui_language.clone();
     let mut ui_child: Option<std::process::Child> = None;
     let mut last_config_mtime: Option<(u64, u32)> = None;
     let mut published_download: Option<String> = None;
@@ -1545,6 +1558,12 @@ fn run_daemon() {
             cfg = config::load_config(&dirs.root);
             ensure_real_microphone(&mut cfg, &dirs.root);
             shared.lock().config = cfg.clone();
+            if cfg.ui_language != ui_language {
+                ui_language = cfg.ui_language.clone();
+                voice_button::i18n::init(&dirs.root, &ui_language);
+                // The menu labels were built at startup; rebuild them in place.
+                let _ = tray_cmds.send(tray::TrayCommand::SetLanguage);
+            }
             let _ = tray_cmds.send(tray::TrayCommand::SetHotkey(voice_button::hotkey::parse(
                 &cfg.hotkey,
             )));

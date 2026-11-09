@@ -105,6 +105,16 @@ Whisper, and SenseVoice folders are also supported.
 
 ## Settings and data
 
+Interface language is picked under **Settings → Interface language**: Russian,
+English and Chinese ship as JSON catalogs in `locales/` next to the executable,
+and "System" follows the Windows language (falling back to English). Adding a
+language means dropping another `<code>.json` into that folder (or into
+`%APPDATA%\voice-button\locales`): no rebuild, and the file appears in the
+picker. On the first launch the app also suggests a model that fits the system
+language: GigaAM RNN-T with punctuation for Russian, SenseVoice for English,
+Chinese, Japanese and Korean, multilingual Whisper for everything else. After
+that the choice belongs to the user.
+
 Sound toggles, sound volume, language, and autostart apply immediately. A model
 selection applies only when its files are ready. Downloads run in the daemon,
 show progress, and can be cancelled; closing the UI does not cancel them.

@@ -1,6 +1,7 @@
 use crate::autostart;
 use crate::config::{self, AppDirs, Backend, PasteSeparator};
 use crate::model_manager;
+use crate::i18n::{tr, trf};
 use crate::state::{self, Data, Shared};
 use arboard;
 use eframe::egui;
@@ -50,9 +51,18 @@ pub fn run_from_args() {
     crate::log::log(&format!("ui process starting (tab={tab})"));
     let config = config::load_config(&dirs.root);
     let mut history = state::load_history(&dirs.root);
-    if std::env::var("VB_SNAPSHOT").is_ok() {
+    let snapshot = std::env::var("VB_SNAPSHOT").is_ok();
+    // Snapshots keep the English UI so the committed screenshots stay stable.
+    let language = if snapshot {
+        "en"
+    } else {
+        config.ui_language.as_str()
+    };
+    crate::i18n::init(&dirs.root, language);
+    if snapshot {
         // Deterministic state for the UI snapshot run.
         let mut cfg = config;
+        cfg.ui_language = "en".to_string();
         cfg.backend = Backend::Onnx;
         cfg.onnx_model = "gigaam-v3-sherpa-int8".to_string();
         cfg.language = "auto".to_string();
@@ -112,6 +122,40 @@ pub fn run_from_args() {
     run_ui(config, history, dirs, tab);
 }
 
+/// egui's bundled font covers Latin, Greek and Cyrillic but no CJK glyphs, so a
+/// Chinese, Japanese or Korean translation would render as boxes. Add the
+/// Windows system fonts for those scripts as fallbacks (no fonts are bundled
+/// into the binary).
+fn install_cjk_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    let mut added = false;
+    for (name, candidates) in [
+        ("cjk-zh", &["msyh.ttc", "simsun.ttc"][..]),
+        ("cjk-ja", &["YuGothM.ttc", "YuGothR.ttc"][..]),
+        ("cjk-ko", &["malgun.ttf"][..]),
+    ] {
+        for file in candidates {
+            let path = std::path::Path::new("C:\\Windows\\Fonts").join(file);
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            fonts
+                .font_data
+                .insert(name.to_string(), egui::FontData::from_owned(bytes));
+            for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+                fonts.families.entry(family).or_default().push(name.to_string());
+            }
+            added = true;
+            break;
+        }
+    }
+    if added {
+        ctx.set_fonts(fonts);
+    } else {
+        crate::log::log("no CJK font found; Chinese/Japanese/Korean may render as boxes");
+    }
+}
+
 fn run_ui(config: config::Config, history: state::History, dirs: AppDirs, tab: String) {
     let shared = Arc::new(Shared::new(config, history));
     if let Some(pid) = current_parent_pid() {
@@ -146,7 +190,10 @@ fn run_ui(config: config::Config, history: state::History, dirs: AppDirs, tab: S
         snapshot_frame: 0,
     };
     let creator: Box<dyn FnOnce(&eframe::CreationContext<'_>) -> Box<dyn eframe::App>> =
-        Box::new(move |_cc| Box::new(app));
+        Box::new(move |cc| {
+            install_cjk_fonts(&cc.egui_ctx);
+            Box::new(app)
+        });
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         eframe::run_native("voice-button", options, creator)
     }));
@@ -347,11 +394,11 @@ impl eframe::App for MainWindow {
         egui::CentralPanel::default().show(ctx, |ui| {
             show_download_banner(ui, &mut data, &self.dirs);
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.tab, Tab::Capture, "Capture");
-                ui.selectable_value(&mut self.tab, Tab::Settings, "Settings");
-                ui.selectable_value(&mut self.tab, Tab::Api, "API");
+                ui.selectable_value(&mut self.tab, Tab::Capture, tr("Capture"));
+                ui.selectable_value(&mut self.tab, Tab::Settings, tr("Settings"));
+                ui.selectable_value(&mut self.tab, Tab::Api, tr("API"));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("About").clicked() {
+                    if ui.button(tr("About")).clicked() {
                         self.show_about = true;
                     }
                 });
@@ -584,17 +631,22 @@ fn show_download_banner(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs) {
                 .show_percentage()
                 .desired_width(220.0),
         );
-        ui.label(format!(
-            "{} — file {}/{}: {}{}",
-            dl.model,
-            dl.file + 1,
-            dl.files,
-            bytes_to_mb(dl.downloaded),
-            dl.total
-                .map(|t| format!(" / {}", bytes_to_mb(t)))
-                .unwrap_or_default(),
+        ui.label(trf(
+            "{model} — file {file}/{files}: {done}{total}",
+            &[
+                ("model", &dl.model),
+                ("file", &(dl.file + 1).to_string()),
+                ("files", &dl.files.to_string()),
+                ("done", &bytes_to_mb(dl.downloaded)),
+                (
+                    "total",
+                    &dl.total
+                        .map(|t| format!(" / {}", bytes_to_mb(t)))
+                        .unwrap_or_default(),
+                ),
+            ],
         ));
-        if ui.button("Cancel").clicked() {
+        if ui.button(tr("Cancel")).clicked() {
             // Cancellation crosses process borders via a flag file.
             crate::ipc::request_cancel(&dirs.root);
         }
@@ -660,7 +712,50 @@ fn apply_settings(data: &mut Data, dirs: &AppDirs) {
 }
 
 fn settings_body(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs) {
-    ui.heading("Model format");
+    ui.heading(tr("Interface language"));
+    let locales = crate::i18n::available();
+    let selected = if data.config.ui_language.is_empty() {
+        tr("System (automatic)")
+    } else {
+        locales
+            .iter()
+            .find(|(code, _)| *code == data.config.ui_language)
+            .map(|(_, name)| name.clone())
+            .unwrap_or_else(|| data.config.ui_language.clone())
+    };
+    let mut language_changed = false;
+    ui.horizontal(|ui| {
+        ui.label(tr("Language:"));
+        egui::ComboBox::from_id_source("ui_language")
+            .selected_text(selected)
+            .show_ui(ui, |ui| {
+                language_changed |= ui
+                    .selectable_value(
+                        &mut data.config.ui_language,
+                        String::new(),
+                        tr("System (automatic)"),
+                    )
+                    .changed();
+                for (code, name) in locales {
+                    language_changed |= ui
+                        .selectable_value(&mut data.config.ui_language, code, name)
+                        .changed();
+                }
+            });
+    });
+    if language_changed {
+        apply_settings(data, dirs);
+        // Swap the catalog in place; the rest of this frame already uses it.
+        crate::i18n::init(&dirs.root, &data.config.ui_language);
+    }
+    ui.label(
+        RichText::new(tr(
+            "Interface translations are JSON files in the locales folder next to the executable. Drop a file there to add a language.",
+        ))
+        .weak(),
+    );
+    ui.separator();
+    ui.heading(tr("Model format"));
     let model_switch_locked = matches!(
         data.status,
         crate::state::Status::Recording | crate::state::Status::Transcribing
@@ -672,21 +767,21 @@ fn settings_body(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs) {
                 .radio_value(
                     &mut data.config.backend,
                     Backend::Whisper,
-                    "Whisper (whisper.cpp)",
+                    tr("Whisper (whisper.cpp)"),
                 )
                 .changed();
             format_changed |= ui
                 .radio_value(
                     &mut data.config.backend,
                     Backend::Onnx,
-                    "ONNX (ONNX Runtime)",
+                    tr("ONNX (ONNX Runtime)"),
                 )
                 .changed();
         });
     });
     if model_switch_locked {
         ui.label(
-            RichText::new("Model and runtime switching is locked while recording or transcribing.")
+            RichText::new(tr("Model and runtime switching is locked while recording or transcribing."))
                 .weak(),
         );
     }
@@ -700,18 +795,18 @@ fn settings_body(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs) {
     }
     if selection_pending(data) {
         ui.label(
-            RichText::new("The selected model is not downloaded yet — the selection applies once it is ready.")
+            RichText::new(tr("The selected model is not downloaded yet — the selection applies once it is ready."))
                 .color(egui::Color32::from_rgb(230, 170, 60)),
         );
     }
     ui.separator();
-    if ui.button("Open models folder").clicked() {
+    if ui.button(tr("Open models folder")).clicked() {
         let _ = std::process::Command::new("explorer")
             .arg(&dirs.models)
             .spawn();
     }
     ui.separator();
-    ui.heading("Sounds");
+    ui.heading(tr("Sounds"));
     let mut sounds_changed = false;
     let mut volume_pct = (data.config.sound_volume * 100.0).round().clamp(0.0, 100.0);
     if ui
@@ -728,34 +823,34 @@ fn settings_body(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs) {
     sounds_changed |= ui
         .checkbox(
             &mut data.config.play_start_sound,
-            "Play sound when recording starts",
+            tr("Play sound when recording starts"),
         )
         .changed();
     ui.horizontal(|ui| {
-        if ui.small_button("Play").clicked() {
+        if ui.small_button(tr("Play")).clicked() {
             crate::sound::play_start(data.config.sound_volume);
         }
-        ui.label(RichText::new("Preview the start cue at the volume above.").weak());
+        ui.label(RichText::new(tr("Preview the start cue at the volume above.")).weak());
     });
     sounds_changed |= ui
         .checkbox(
             &mut data.config.play_end_sound,
-            "Play sound when recording ends",
+            tr("Play sound when recording ends"),
         )
         .changed();
     ui.horizontal(|ui| {
-        if ui.small_button("Play").clicked() {
+        if ui.small_button(tr("Play")).clicked() {
             crate::sound::play_end(data.config.sound_volume);
         }
-        ui.label(RichText::new("Preview the end cue at the volume above.").weak());
+        ui.label(RichText::new(tr("Preview the end cue at the volume above.")).weak());
     });
     if sounds_changed {
         apply_settings(data, dirs);
     }
     ui.separator();
-    ui.heading("Startup");
+    ui.heading(tr("Startup"));
     if ui
-        .checkbox(&mut data.config.autostart, "Run at Windows startup")
+        .checkbox(&mut data.config.autostart, tr("Run at Windows startup"))
         .changed()
     {
         apply_autostart(data);
@@ -764,7 +859,7 @@ fn settings_body(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs) {
     if ui
         .checkbox(
             &mut data.config.silent_start,
-            "Start silently (no windows when launched at startup)",
+            tr("Start silently (no windows when launched at startup)"),
         )
         .changed()
     {
@@ -772,7 +867,7 @@ fn settings_body(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs) {
         apply_settings(data, dirs);
     }
     ui.separator();
-    ui.heading("Microphone");
+    ui.heading(tr("Microphone"));
     // Device enumeration creates COM objects, so refresh it at most every two
     // seconds instead of on every frame.
     let refresh_devices = data
@@ -797,7 +892,7 @@ fn settings_body(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs) {
                 .selectable_value(
                     &mut data.config.input_device,
                     String::new(),
-                    "System default",
+                    tr("System default"),
                 )
                 .changed();
             for name in &devices {
@@ -812,24 +907,24 @@ fn settings_body(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs) {
     if data.config.input_device.is_empty() {
         ui.label(
             RichText::new(
-                "Using the Windows default device. Virtual cables (VB-Audio, streaming devices) record silence — pick your real microphone above if transcriptions are empty.",
+                tr("Using the Windows default device. Virtual cables (VB-Audio, streaming devices) record silence — pick your real microphone above if transcriptions are empty."),
             )
             .weak(),
         );
     } else {
         ui.label(
             RichText::new(
-                "Used for new recordings. If the Windows default is a virtual cable, a real microphone is selected automatically.",
+                tr("Used for new recordings. If the Windows default is a virtual cable, a real microphone is selected automatically."),
             )
             .weak(),
         );
     }
     ui.separator();
-    ui.heading("Mouse");
+    ui.heading(tr("Mouse"));
     if ui
         .checkbox(
             &mut data.config.swap_mouse_buttons,
-            "Swap left and middle mouse button actions on the tray icon",
+            tr("Swap left and middle mouse button actions on the tray icon"),
         )
         .changed()
     {
@@ -837,17 +932,17 @@ fn settings_body(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs) {
     }
     ui.label(
         RichText::new(if data.config.swap_mouse_buttons {
-            "Left click records and pastes at the cursor; middle click records a new message."
+            tr("Left click records and pastes at the cursor; middle click records a new message.")
         } else {
-            "Left click records a new message; middle click records and pastes at the cursor."
+            tr("Left click records a new message; middle click records and pastes at the cursor.")
         })
         .weak(),
     );
     ui.separator();
-    ui.heading("Paste");
+    ui.heading(tr("Paste"));
     ui.label(
         RichText::new(
-            "After the text inserted in record-and-paste mode (paste hotkey or middle click):",
+            tr("After the text inserted in record-and-paste mode (paste hotkey or middle click):"),
         )
         .weak(),
     );
@@ -857,14 +952,14 @@ fn settings_body(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs) {
             .radio_value(
                 &mut data.config.paste_separator,
                 PasteSeparator::Space,
-                "Add a space",
+                tr("Add a space"),
             )
             .changed();
         separator_changed |= ui
             .radio_value(
                 &mut data.config.paste_separator,
                 PasteSeparator::Newline,
-                "Start a new line",
+                tr("Start a new line"),
             )
             .changed();
     });
@@ -883,7 +978,7 @@ fn settings_body(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs) {
     let supports_auto = model_manager::supports_auto(format, model_id);
     let mut language_changed = false;
     ui.horizontal(|ui| {
-        ui.label("Language code:");
+        ui.label(tr("Language code:"));
         egui::ComboBox::from_id_source("language_code")
             .selected_text(data.config.language.clone())
             .show_ui(ui, |ui| {
@@ -892,7 +987,7 @@ fn settings_body(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs) {
                         .selectable_value(
                             &mut data.config.language,
                             "auto".to_string(),
-                            "auto (detect automatically)",
+                            tr("auto (detect automatically)"),
                         )
                         .changed();
                 }
@@ -911,14 +1006,14 @@ fn settings_body(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs) {
     if data.config.language == "auto" && !supports_auto {
         ui.label(
             RichText::new(
-                "The current model cannot detect the language automatically — pick a language code.",
+                tr("The current model cannot detect the language automatically — pick a language code."),
             )
             .color(egui::Color32::from_rgb(230, 170, 60)),
         );
     }
     if let Some(err) = &data.last_error {
         ui.label(
-            RichText::new(format!("Error: {err}")).color(egui::Color32::from_rgb(230, 90, 90)),
+            RichText::new(trf("Error: {error}", &[("error", err)])).color(egui::Color32::from_rgb(230, 90, 90)),
         );
     }
 }
@@ -932,10 +1027,10 @@ fn api_body(
     ctx: &egui::Context,
     copied_at: &mut f64,
 ) {
-    ui.heading("API server");
+    ui.heading(tr("API server"));
     ui.label(
         RichText::new(
-            "Accepts sound from a page or a script (PCM16, mono) and returns the transcription. The app's own microphone is not used.",
+            tr("Accepts sound from a page or a script (PCM16, mono) and returns the transcription. The app's own microphone is not used."),
         )
         .weak(),
     );
@@ -943,18 +1038,18 @@ fn api_body(
     // Edited in place, but only saved (and the server only restarted) when the
     // field is committed: Enter, leaving a field, or toggling the switch.
     let mut commit = ui
-        .checkbox(&mut data.config.api_enabled, "Enable the local API server")
+        .checkbox(&mut data.config.api_enabled, tr("Enable the local API server"))
         .changed();
     ui.add_enabled_ui(data.config.api_enabled, |ui| {
         ui.horizontal(|ui| {
-            ui.label("Host:");
+            ui.label(tr("Host:"));
             let host = ui.add(
                 egui::TextEdit::singleline(&mut data.config.api_host)
                     .desired_width(150.0)
                     .hint_text("127.0.0.1"),
             );
             commit |= host.lost_focus();
-            ui.label("Port:");
+            ui.label(tr("Port:"));
             let port = ui.add(
                 egui::DragValue::new(&mut data.config.api_port).clamp_range(1..=65535),
             );
@@ -969,7 +1064,7 @@ fn api_body(
     if data.config.api_enabled && !loopback {
         ui.label(
             RichText::new(
-                "This host is reachable from the network: anyone who can open the port can start recordings.",
+                tr("This host is reachable from the network: anyone who can open the port can start recordings."),
             )
             .color(egui::Color32::from_rgb(230, 170, 60)),
         );
@@ -986,7 +1081,7 @@ fn api_body(
                     .monospace()
                     .color(egui::Color32::from_rgb(90, 200, 120)),
             );
-            if ui.button("Copy").clicked() {
+            if ui.button(tr("Copy")).clicked() {
                 if let Ok(mut clipboard) = arboard::Clipboard::new() {
                     let _ = clipboard.set_text(&url);
                 }
@@ -995,34 +1090,34 @@ fn api_body(
         });
         // Transient "Copied!" feedback right after a copy click.
         if *copied_at > 0.0 && ctx.input(|i| i.time) < *copied_at + 2.0 {
-            ui.label(RichText::new("Copied!").color(egui::Color32::from_rgb(90, 200, 120)));
+            ui.label(RichText::new(tr("Copied!")).color(egui::Color32::from_rgb(90, 200, 120)));
         }
     } else if data.config.api_enabled {
         match data.api.as_ref().and_then(|s| s.error.clone()) {
             Some(error) => ui.label(
-                RichText::new(format!("Not listening: {error}"))
+                RichText::new(trf("Not listening: {error}", &[("error", &error)]))
                     .color(egui::Color32::from_rgb(230, 90, 90)),
             ),
-            None => ui.label(RichText::new("Starting…").color(egui::Color32::GRAY)),
+            None => ui.label(RichText::new(tr("Starting…")).color(egui::Color32::GRAY)),
         };
     } else {
-        ui.label(RichText::new("Stopped").color(egui::Color32::GRAY));
+        ui.label(RichText::new(tr("Stopped")).color(egui::Color32::GRAY));
     }
 
     ui.separator();
-    ui.heading("Endpoints");
-    ui.label("GET  /api/help          — full contract for integrations (JSON).");
-    ui.label("GET  /api/status        — state, live text, received audio.");
-    ui.label("GET  /api/models        — models this build can use.");
-    ui.label("POST /api/record/start  — open a session (model, sampleRate).");
-    ui.label("POST /api/record/audio  — PCM16 LE mono chunk (?session=N).");
-    ui.label("POST /api/record/stop   — finish and transcribe the buffer.");
-    ui.label("GET  /api/record/live   — live text of the session.");
-    ui.label("GET  /api/record/text   — transcript of the last session.");
+    ui.heading(tr("Endpoints"));
+    ui.label(tr("GET  /api/help          — full contract for integrations (JSON)."));
+    ui.label(tr("GET  /api/status        — state, live text, received audio."));
+    ui.label(tr("GET  /api/models        — models this build can use."));
+    ui.label(tr("POST /api/record/start  — open a session (model, sampleRate)."));
+    ui.label(tr("POST /api/record/audio  — PCM16 LE mono chunk (?session=N)."));
+    ui.label(tr("POST /api/record/stop   — finish and transcribe the buffer."));
+    ui.label(tr("GET  /api/record/live   — live text of the session."));
+    ui.label(tr("GET  /api/record/text   — transcript of the last session."));
     ui.add_space(4.0);
     ui.label(
         RichText::new(
-            "The test page is a separate project: api-demo/ (run: node api-demo/server.mjs). The API has no authentication — anyone who can reach the port can send audio.",
+            tr("The test page is a separate project: api-demo/ (run: node api-demo/server.mjs). The API has no authentication — anyone who can reach the port can send audio."),
         )
         .weak(),
     );
@@ -1106,22 +1201,22 @@ fn stop_hotkey_capture(data: &mut Data, dirs: &AppDirs) {
 }
 
 fn hotkey_section(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs, field: HotkeyField) {
-    let heading = match field {
+    let heading = tr(match field {
         HotkeyField::Record => "Global hotkey",
         HotkeyField::Append => "Append hotkey (continue the last message)",
         HotkeyField::Paste => "Paste hotkey (type at the cursor)",
-    };
+    });
     ui.heading(heading);
     ui.label(
         RichText::new(match field {
             HotkeyField::Record => {
-                "Records a new message; the transcribed text is copied to the clipboard and saved as a new history entry."
+                tr("Records a new message; the transcribed text is copied to the clipboard and saved as a new history entry.")
             }
             HotkeyField::Append => {
-                "Records a piece and appends it to the last message; the full merged text is copied to the clipboard afterwards."
+                tr("Records a piece and appends it to the last message; the full merged text is copied to the clipboard afterwards.")
             }
             HotkeyField::Paste => {
-                "Records a new message and pastes it at the cursor of the window that was active when recording started; the previous clipboard content is restored afterwards."
+                tr("Records a new message and pastes it at the cursor of the window that was active when recording started; the previous clipboard content is restored afterwards.")
             }
         })
         .weak(),
@@ -1129,19 +1224,19 @@ fn hotkey_section(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs, field: Hot
     let stored = field.stored(data).to_string();
     ui.horizontal(|ui| {
         if stored.is_empty() {
-            ui.monospace("disabled");
+            ui.monospace(tr("disabled"));
         } else {
             ui.monospace(stored);
         }
         if field.capturing(data) {
             ui.label(
-                RichText::new("press Ctrl/Alt/Shift + key (or an F-key), Esc cancels")
+                RichText::new(tr("press Ctrl/Alt/Shift + key (or an F-key), Esc cancels"))
                     .color(egui::Color32::from_rgb(230, 170, 60)),
             );
-        } else if ui.button("Record shortcut").clicked() {
+        } else if ui.button(tr("Record shortcut")).clicked() {
             start_hotkey_capture(data, dirs, field);
         }
-        if ui.button("Clear").clicked() {
+        if ui.button(tr("Clear")).clicked() {
             field.stored_mut(data).clear();
             apply_settings(data, dirs);
             // Clearing means "pick a new one": start listening right away.
@@ -1226,31 +1321,36 @@ fn download_section(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs, model_id
                 0.0
             };
             ui.add(ProgressBar::new(fraction).show_percentage());
-            ui.label(format!(
-                "File {}/{}: {}{}",
-                dl.file + 1,
-                dl.files,
-                bytes_to_mb(dl.downloaded),
-                dl.total
-                    .map(|t| format!(" / {}", bytes_to_mb(t)))
-                    .unwrap_or_default()
+            ui.label(trf(
+                "File {file}/{files}: {done}{total}",
+                &[
+                    ("file", &(dl.file + 1).to_string()),
+                    ("files", &dl.files.to_string()),
+                    ("done", &bytes_to_mb(dl.downloaded)),
+                    (
+                        "total",
+                        &dl.total
+                            .map(|t| format!(" / {}", bytes_to_mb(t)))
+                            .unwrap_or_default(),
+                    ),
+                ],
             ));
-            if ui.button("Cancel").clicked() {
+            if ui.button(tr("Cancel")).clicked() {
                 crate::ipc::request_cancel(&dirs.root);
             }
         } else if let Some(err) = &dl.error {
             if dl.model == model_id {
                 ui.label(
-                    RichText::new(format!("Download error: {err}"))
+                    RichText::new(trf("Download error: {error}", &[("error", err)]))
                         .color(egui::Color32::from_rgb(230, 90, 90)),
                 );
             }
         } else if dl.done && dl.model == model_id {
-            ui.label("Download complete.");
+            ui.label(tr("Download complete."));
         }
     }
     let already_downloaded = model_manager::is_ready(&dirs.models, model_id);
-    if !active && !already_downloaded && ui.button(format!("Download {model_id}")).clicked() {
+    if !active && !already_downloaded && ui.button(trf("Download {model}", &[("model", model_id)])).clicked() {
         let busy = data
             .download
             .as_ref()
@@ -1267,14 +1367,14 @@ fn whisper_section(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs, locked: b
     let custom = data.config.whisper_model == "custom";
     let mut changed = false;
     ui.add_enabled_ui(!locked, |ui| {
-        egui::ComboBox::from_label("Whisper model")
+        egui::ComboBox::from_label(tr("Whisper model"))
             .selected_text(if custom {
                 "Custom file...".to_string()
             } else {
                 let marker = if model_manager::is_ready(&dirs.models, &data.config.whisper_model) {
-                    ""
+                    String::new()
                 } else {
-                    " (not downloaded)"
+                    tr(" (not downloaded)")
                 };
                 let size = model_manager::find_model(&data.config.whisper_model)
                     .map(|m| m.size)
@@ -1287,9 +1387,9 @@ fn whisper_section(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs, locked: b
                         continue;
                     }
                     let marker = if model_manager::is_ready(&dirs.models, model.id) {
-                        ""
+                        String::new()
                     } else {
-                        " (not downloaded)"
+                        tr(" (not downloaded)")
                     };
                     changed |= ui
                         .selectable_value(
@@ -1303,7 +1403,7 @@ fn whisper_section(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs, locked: b
                     .selectable_value(
                         &mut data.config.whisper_model,
                         "custom".to_string(),
-                        "Custom file...",
+                        tr("Custom file..."),
                     )
                     .changed();
             });
@@ -1314,7 +1414,7 @@ fn whisper_section(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs, locked: b
     if !custom {
         let id = data.config.whisper_model.clone();
         if model_manager::is_ready(&dirs.models, &id) {
-            ui.label(RichText::new("Model is ready.").color(egui::Color32::from_rgb(90, 200, 120)));
+            ui.label(RichText::new(tr("Model is ready.")).color(egui::Color32::from_rgb(90, 200, 120)));
         }
         download_section(ui, data, dirs, &id);
     } else {
@@ -1323,16 +1423,16 @@ fn whisper_section(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs, locked: b
                 ui.monospace(&file);
                 if !PathBuf::from(&file).exists() {
                     ui.label(
-                        RichText::new("File does not exist.")
+                        RichText::new(tr("File does not exist."))
                             .color(egui::Color32::from_rgb(230, 170, 60)),
                     );
                 }
             }
             None => {
-                ui.label("No file selected.");
+                ui.label(tr("No file selected."));
             }
         }
-        if ui.button("Choose .ggml model file...").clicked() {
+        if ui.button(tr("Choose .ggml model file...")).clicked() {
             if let Some(path) = rfd::FileDialog::new()
                 .add_filter("whisper.cpp model", &["bin", "ggml"])
                 .pick_file()
@@ -1348,14 +1448,14 @@ fn onnx_section(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs, locked: bool
     let custom = data.config.onnx_model == "custom";
     let mut changed = false;
     ui.add_enabled_ui(!locked, |ui| {
-        egui::ComboBox::from_label("ONNX model")
+        egui::ComboBox::from_label(tr("ONNX model"))
             .selected_text(if custom {
                 "Custom folder...".to_string()
             } else {
                 let marker = if model_manager::is_ready(&dirs.models, &data.config.onnx_model) {
-                    ""
+                    String::new()
                 } else {
-                    " (not downloaded)"
+                    tr(" (not downloaded)")
                 };
                 let size = model_manager::find_model(&data.config.onnx_model)
                     .map(|m| m.size)
@@ -1368,9 +1468,9 @@ fn onnx_section(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs, locked: bool
                         continue;
                     }
                     let marker = if model_manager::is_ready(&dirs.models, model.id) {
-                        ""
+                        String::new()
                     } else {
-                        " (not downloaded)"
+                        tr(" (not downloaded)")
                     };
                     changed |= ui
                         .selectable_value(
@@ -1384,7 +1484,7 @@ fn onnx_section(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs, locked: bool
                     .selectable_value(
                         &mut data.config.onnx_model,
                         "custom".to_string(),
-                        "Custom folder...",
+                        tr("Custom folder..."),
                     )
                     .changed();
             });
@@ -1395,7 +1495,7 @@ fn onnx_section(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs, locked: bool
     if !custom {
         let id = data.config.onnx_model.clone();
         if model_manager::is_ready(&dirs.models, &id) {
-            ui.label(RichText::new("Model is ready.").color(egui::Color32::from_rgb(90, 200, 120)));
+            ui.label(RichText::new(tr("Model is ready.")).color(egui::Color32::from_rgb(90, 200, 120)));
         }
         download_section(ui, data, dirs, &id);
     } else {
@@ -1412,31 +1512,31 @@ fn onnx_section(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs, locked: bool
                         && path.join("joint.onnx").exists());
                 if model_ok {
                     ui.label(
-                        RichText::new("Model files found.")
+                        RichText::new(tr("Model files found."))
                             .color(egui::Color32::from_rgb(90, 200, 120)),
                     );
                 } else {
                     let missing = [
-                        (!vocab_ok).then_some("vocab.txt (or vocab.json)"),
-                        (!graph_ok).then_some(
-                            "model.onnx (CTC) or encoder.onnx + decoder.onnx + joint.onnx (RNN-T)",
-                        ),
+                        (!vocab_ok).then(|| "vocab.txt (or vocab.json)".to_string()),
+                        (!graph_ok).then(|| {
+                            tr("model.onnx (CTC) or encoder.onnx + decoder.onnx + joint.onnx (RNN-T)")
+                        }),
                     ]
                     .into_iter()
                     .flatten()
                     .collect::<Vec<_>>()
                     .join(", ");
                     ui.label(
-                        RichText::new(format!("Missing files: {missing}"))
+                        RichText::new(trf("Missing files: {missing}", &[("missing", &missing)]))
                             .color(egui::Color32::from_rgb(230, 170, 60)),
                     );
                 }
             }
             None => {
-                ui.label("No folder selected.");
+                ui.label(tr("No folder selected."));
             }
         }
-        if ui.button("Choose folder...").clicked() {
+        if ui.button(tr("Choose folder...")).clicked() {
             if let Some(path) = rfd::FileDialog::new().pick_folder() {
                 data.config.onnx_folder = Some(path.to_string_lossy().to_string());
                 apply_settings(data, dirs);
@@ -1456,7 +1556,7 @@ fn capture_body(
     match status {
         crate::state::Status::Recording => {
             if ui
-                .button(RichText::new("Stop recording").color(egui::Color32::from_rgb(200, 60, 60)))
+                .button(RichText::new(tr("Stop recording")).color(egui::Color32::from_rgb(200, 60, 60)))
                 .clicked()
             {
                 crate::ipc::write_record_request(&dirs.root, r#"{"kind":"user"}"#);
@@ -1471,12 +1571,12 @@ fn capture_body(
             if let Some(model) = server_session {
                 let model = model.map(|model| format!(" · {model}")).unwrap_or_default();
                 ui.label(
-                    RichText::new(format!("API session: receiving audio{model}"))
+                    RichText::new(trf("API session: receiving audio{model}", &[("model", &model)]))
                         .color(egui::Color32::from_rgb(230, 170, 60)),
                 );
                 ui.label(
                     RichText::new(
-                        "The sound comes from the API client, not from this machine. The text goes back to the caller and is saved in the history; Stop ends the session.",
+                        tr("The sound comes from the API client, not from this machine. The text goes back to the caller and is saved in the history; Stop ends the session."),
                     )
                     .weak(),
                 );
@@ -1485,11 +1585,11 @@ fn capture_body(
                     let elapsed = chrono::Local::now().timestamp_millis() - data.live_started_ms;
                     let secs = (elapsed / 1000).max(0);
                     ui.label(
-                        RichText::new(format!("REC {secs}s"))
+                        RichText::new(trf("REC {secs}s", &[("secs", &secs.to_string())]))
                             .color(egui::Color32::from_rgb(220, 60, 60)),
                     );
                 } else {
-                    ui.label(RichText::new("REC").color(egui::Color32::from_rgb(220, 60, 60)));
+                    ui.label(RichText::new(tr("REC")).color(egui::Color32::from_rgb(220, 60, 60)));
                 }
                 ui.add_space(4.0);
                 // A dedicated read-only field makes the live state visible even
@@ -1505,9 +1605,9 @@ fn capture_body(
                             .show(ui, |ui| {
                                 ui.add(
                                     egui::Label::new(if data.live_text.is_empty() {
-                                        "Listening…"
+                                        tr("Listening…")
                                     } else {
-                                        &data.live_text
+                                        data.live_text.clone()
                                     })
                                     .wrap(true)
                                     .selectable(false),
@@ -1518,7 +1618,7 @@ fn capture_body(
             }
         }
         crate::state::Status::Transcribing => {
-            ui.label(RichText::new("Transcribing…").color(egui::Color32::from_rgb(230, 150, 40)));
+            ui.label(RichText::new(tr("Transcribing…")).color(egui::Color32::from_rgb(230, 150, 40)));
         }
         _ => {
             let download_busy = data
@@ -1528,10 +1628,10 @@ fn capture_body(
                 .unwrap_or(false);
             let can_record = status != crate::state::Status::NoModel && !download_busy;
             if !can_record {
-                ui.label(RichText::new("Recording is unavailable until a model is ready.").weak());
+                ui.label(RichText::new(tr("Recording is unavailable until a model is ready.")).weak());
             }
             if ui
-                .add_enabled(can_record, egui::Button::new("Start recording"))
+                .add_enabled(can_record, egui::Button::new(tr("Start recording")))
                 .clicked()
             {
                 crate::ipc::write_record_request(&dirs.root, r#"{"kind":"user"}"#);
@@ -1614,13 +1714,13 @@ fn history_body(
     filter: &mut HistoryFilter,
 ) {
     ui.horizontal(|ui| {
-        ui.heading("History");
+        ui.heading(tr("History"));
         ui.add_space(10.0);
-        ui.label(RichText::new("show:").weak());
+        ui.label(RichText::new(tr("show:")).weak());
         let mut next = *filter;
-        ui.selectable_value(&mut next, HistoryFilter::All, "All");
-        ui.selectable_value(&mut next, HistoryFilter::User, "User");
-        ui.selectable_value(&mut next, HistoryFilter::Server, "Server");
+        ui.selectable_value(&mut next, HistoryFilter::All, tr("All"));
+        ui.selectable_value(&mut next, HistoryFilter::User, tr("User"));
+        ui.selectable_value(&mut next, HistoryFilter::Server, tr("Server"));
         *filter = next;
     });
     ui.separator();
@@ -1671,7 +1771,7 @@ fn history_body(
                     ui.push_id(index, |ui| {
                         ui.allocate_ui(egui::vec2(width, height), |ui| {
                             ui.horizontal(|ui| {
-                                if ui.small_button("Copy").clicked() {
+                                if ui.small_button(tr("Copy")).clicked() {
                                     match data.history.entry(index) {
                                         Ok(entry) => copied = Some(entry.text),
                                         Err(e) => crate::log::log(&format!(
@@ -1679,19 +1779,21 @@ fn history_body(
                                         )),
                                     }
                                 }
-                                ui.weak(format!(
-                                    "{} · {}{}",
-                                    row.at(),
-                                    row.model(),
-                                    if row.pieces() > 0 {
-                                        format!(" · +{} piece(s)", row.pieces())
-                                    } else {
-                                        String::new()
-                                    }
+                                let pieces = if row.pieces() > 0 {
+                                    trf(
+                                        " · +{count} piece(s)",
+                                        &[("count", &row.pieces().to_string())],
+                                    )
+                                } else {
+                                    String::new()
+                                };
+                                ui.weak(trf(
+                                    "{at} · {model}{pieces}",
+                                    &[("at", row.at()), ("model", row.model()), ("pieces", &pieces)],
                                 ));
                                 if row.source() == state::Source::Server {
                                     ui.label(
-                                        RichText::new("server")
+                                        RichText::new(tr("server"))
                                             .small()
                                             .color(egui::Color32::from_rgb(230, 170, 60)),
                                     );
@@ -1710,10 +1812,10 @@ fn history_body(
                                     ui.push_id(part_index, |ui| {
                                         ui.add_space(2.0);
                                         ui.horizontal(|ui| {
-                                            if ui.small_button("Copy").clicked() {
+                                            if ui.small_button(tr("Copy")).clicked() {
                                                 copied = Some(part.text.clone());
                                             }
-                                            ui.weak(format!("appended {}", part.at));
+                                            ui.weak(trf("appended {at}", &[("at", &part.at)]));
                                         });
                                         ui.label(RichText::new(&part.text).weak());
                                     });
@@ -1737,6 +1839,8 @@ fn history_body(
     }
 }
 
+/// About text: English lines are the keys, translated on each render so a
+/// language switch applies without restarting.
 const ABOUT_LINES: &[&str] = &[
     "Offline voice-to-text tray app.",
     "Records the microphone on tray click,",
@@ -1748,6 +1852,13 @@ const ABOUT_LINES: &[&str] = &[
     "",
     "Free and open source under the MIT License.",
 ];
+
+fn about_lines() -> Vec<String> {
+    ABOUT_LINES
+        .iter()
+        .map(|line| if line.is_empty() { String::new() } else { tr(line) })
+        .collect()
+}
 
 fn show_about_modal(ctx: &egui::Context, open: &mut bool, dirs: &AppDirs) {
     let screen = ctx.screen_rect();
@@ -1774,29 +1885,29 @@ fn show_about_modal(ctx: &egui::Context, open: &mut bool, dirs: &AppDirs) {
                 ui.horizontal(|ui| {
                     ui.heading(format!("Voice Button {}", env!("CARGO_PKG_VERSION")));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("X").clicked() {
+                        if ui.button(tr("X")).clicked() {
                             close_clicked = true;
                         }
                     });
                 });
                 ui.separator();
-                for line in ABOUT_LINES {
+                for line in about_lines() {
                     if line.is_empty() {
                         ui.add_space(4.0);
                     } else {
-                        ui.label(*line);
+                        ui.label(line);
                     }
                 }
                 ui.hyperlink_to(
-                    "GitHub: machine202502/voice-button",
+                    tr("GitHub: machine202502/voice-button"),
                     "https://github.com/machine202502/voice-button",
                 );
                 ui.hyperlink_to(
-                    "MIT License",
+                    tr("MIT License"),
                     "https://github.com/machine202502/voice-button/blob/master/LICENSE",
                 );
                 ui.separator();
-                if ui.button("Open log folder").clicked() {
+                if ui.button(tr("Open log folder")).clicked() {
                     let _ = std::process::Command::new("explorer")
                         .arg(&dirs.root)
                         .spawn();
@@ -1810,7 +1921,10 @@ fn show_about_modal(ctx: &egui::Context, open: &mut bool, dirs: &AppDirs) {
 
 fn apply_autostart(data: &mut Data) {
     if let Err(e) = autostart::set_enabled(data.config.silent_start, data.config.autostart) {
-        data.last_error = Some(format!("failed to update autostart: {e:#}"));
+        data.last_error = Some(trf(
+                "failed to update autostart: {error}",
+                &[("error", &format!("{e:#}"))],
+            ));
     }
 }
 
