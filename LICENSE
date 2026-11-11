@@ -19,3 +19,19 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+---
+
+## Exception: test recordings
+
+Everything in this repository — the source code, the generated sound cues in
+`assets/`, the screenshots, the documentation and the test code — is covered by
+the MIT license above.
+
+The test recordings are not. The audio files under `tests/assets/` (currently
+`dictation-8min.mp3`) and their transcripts (currently `dictation-8min.txt`) are
+recordings of the project author's own voice and speech. All rights to them are
+reserved: they may not be copied, redistributed, published, or used to train or
+evaluate models without the author's prior written consent. They are part of the
+repository only so that the end-to-end tests have a real, long dictation to run
+against.
