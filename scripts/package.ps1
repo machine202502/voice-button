@@ -51,12 +51,27 @@ function New-ThirdPartyNotice {
     [void]$text.AppendLine('==== Rust crates ====')
     [void]$text.AppendLine('')
 
-    Push-Location $root
-    try { $metaJson = (& cargo metadata --format-version 1 | Out-String) }
-    finally { Pop-Location }
-    if ($LASTEXITCODE -ne 0 -or -not $metaJson) { throw 'cargo metadata failed' }
-    if ($PSVersionTable.PSVersion.Major -ge 6) { $meta = $metaJson | ConvertFrom-Json -Depth 100 }
-    else { $meta = $metaJson | ConvertFrom-Json }
+    # cargo metadata describes every crate in the lock file, including the ones
+    # no Windows build ever touches, so it downloads them. A registry hiccup
+    # here used to fail a release after the whole build had already succeeded.
+    $meta = $null
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        Push-Location $root
+        try { $metaJson = (& cargo metadata --format-version 1 2>$null | Out-String) }
+        finally { Pop-Location }
+        if ($LASTEXITCODE -eq 0 -and $metaJson -and $metaJson.TrimStart().StartsWith('{')) {
+            try {
+                if ($PSVersionTable.PSVersion.Major -ge 6) { $meta = $metaJson | ConvertFrom-Json -Depth 100 }
+                else { $meta = $metaJson | ConvertFrom-Json }
+                break
+            } catch { $meta = $null }
+        }
+        if ($attempt -lt 3) {
+            Write-Warning "cargo metadata failed (attempt $attempt of 3), retrying in 15 s"
+            Start-Sleep -Seconds 15
+        }
+    }
+    if (-not $meta) { throw 'cargo metadata failed' }
 
     $nodes = @{}
     foreach ($node in $meta.resolve.nodes) { $nodes[$node.id] = $node }
