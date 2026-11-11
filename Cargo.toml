@@ -1,6 +1,6 @@
 [package]
 name = "voice-button"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 description = "Offline voice-to-text in the Windows tray"
 license = "MIT"
@@ -29,6 +29,7 @@ rfd = "0.15"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tray-icon = "0.19"
+symphonia = { version = "0.5", features = ["mp3", "aac", "isomp4", "alac"] }
 ureq = "2"
 whisper-rs = { version = "0.16", features = ["vulkan"] }
 arboard = "3"
@@ -40,6 +41,10 @@ sherpa-onnx = { version = "2", default-features = false, features = ["shared"] }
 
 [build-dependencies]
 winresource = "0.1"
+
+[dev-dependencies]
+# Test-only: decodes the MP3 dictation asset for the end-to-end tests.
+symphonia = { version = "0.5", default-features = false, features = ["mpa"] }
 
 [profile.release]
 lto = "thin"

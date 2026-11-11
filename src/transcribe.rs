@@ -1,6 +1,6 @@
 use crate::config::{AppDirs, Backend, Config};
 use crate::model_manager;
-use crate::recorder::Recording;
+use crate::state::ModelChoice;
 use anyhow::{anyhow, bail, Context, Result};
 use sherpa_onnx::{
     OfflineModelConfig, OfflineNemoEncDecCtcModelConfig, OfflineQwen3ASRModelConfig,
@@ -12,8 +12,50 @@ use std::path::{Path, PathBuf};
 
 use crate::model_manager::OnnxFamily;
 
+/// Text plus the per-token times the stitcher needs. `times` is empty when the
+/// engine does not report timestamps; the stitcher then merges by text.
+#[derive(Debug, Default, Clone)]
+pub struct Transcript {
+    pub text: String,
+    pub tokens: Vec<String>,
+    pub times: Vec<f32>,
+}
+
+impl Transcript {
+    pub fn plain(text: String) -> Self {
+        Self {
+            text,
+            tokens: Vec::new(),
+            times: Vec::new(),
+        }
+    }
+}
+
+/// Longest audio a single decode may take, in seconds. The segmenter cuts the
+/// stream to this length; the ASR worker refuses anything far beyond it.
+pub const DEFAULT_SEGMENT_SECONDS: f32 = 25.0;
+
+/// Segment length for a model chosen by the API.
+pub fn segment_limit(choice: &ModelChoice) -> f32 {
+    model_manager::max_seconds_override(&choice.id).unwrap_or(DEFAULT_SEGMENT_SECONDS)
+}
+
+/// Identifier of the model selected in Settings.
+pub fn selected_id(cfg: &Config) -> String {
+    match cfg.backend {
+        Backend::Whisper => cfg.whisper_model.clone(),
+        Backend::Onnx => cfg.onnx_model.clone(),
+    }
+}
+
+/// Segment length for the model selected in Settings (including custom models,
+/// which have no catalogue entry and fall back to the default).
+pub fn limit_for_config(cfg: &Config) -> f32 {
+    model_manager::max_seconds_override(&selected_id(cfg)).unwrap_or(DEFAULT_SEGMENT_SECONDS)
+}
+
 pub trait Transcriber: Send {
-    fn transcribe(&self, recording: Recording) -> Result<String>;
+    fn transcribe(&self, samples: &[f32], sample_rate: u32) -> Result<Transcript>;
 }
 
 /// CPAL records at the device rate (usually 48 kHz); every recognizer here wants
@@ -252,19 +294,31 @@ impl SherpaTranscriber {
 }
 
 impl Transcriber for SherpaTranscriber {
-    fn transcribe(&self, recording: Recording) -> Result<String> {
-        let samples = resample_to_16k(recording.samples, recording.sample_rate);
+    fn transcribe(&self, samples: &[f32], sample_rate: u32) -> Result<Transcript> {
+        let samples = resample_to_16k(samples.to_vec(), sample_rate);
         if samples.is_empty() {
             bail!("nothing was recorded");
         }
         let stream = self.recognizer.create_stream();
         stream.accept_waveform(16000, &samples);
         self.recognizer.decode(&stream);
-        let text = stream
-            .get_result()
-            .map(|result| result.text)
-            .unwrap_or_default();
-        Ok(collapse_spaces(&text))
+        let result = stream.get_result();
+        let raw = match result {
+            Some(result) => result,
+            None => return Ok(Transcript::default()),
+        };
+        let tokens = raw.tokens;
+        let times = raw.timestamps.unwrap_or_default();
+        let text = if tokens.is_empty() {
+            collapse_spaces(&raw.text)
+        } else {
+            crate::stitch::join_tokens(&tokens)
+        };
+        Ok(Transcript {
+            text,
+            tokens,
+            times,
+        })
     }
 }
 
@@ -292,6 +346,17 @@ impl WhisperTranscriber {
                 },
             )
             .context("failed to load whisper model")?;
+            // Whisper is built with Vulkan; the list makes it obvious whether a
+            // GPU was picked up or the CPU is doing the work.
+            let devices = whisper_rs::vulkan::list_devices();
+            crate::log::log(&format!(
+                "whisper: {} Vulkan device(s): {:?}",
+                devices.len(),
+                devices
+                    .iter()
+                    .map(|device| device.name.clone())
+                    .collect::<Vec<_>>()
+            ));
             *slot = Some(ctx);
         }
         Ok(std::cell::RefMut::map(slot, |s| s.as_mut().unwrap()))
@@ -299,8 +364,8 @@ impl WhisperTranscriber {
 }
 
 impl Transcriber for WhisperTranscriber {
-    fn transcribe(&self, recording: Recording) -> Result<String> {
-        let samples = resample_to_16k(recording.samples, recording.sample_rate);
+    fn transcribe(&self, samples: &[f32], sample_rate: u32) -> Result<Transcript> {
+        let samples = resample_to_16k(samples.to_vec(), sample_rate);
         if samples.is_empty() {
             bail!("nothing was recorded");
         }
@@ -316,7 +381,7 @@ impl Transcriber for WhisperTranscriber {
         });
         params.set_language(self.language.as_deref());
         params.set_translate(false);
-        params.set_no_timestamps(true);
+        params.set_no_timestamps(false);
         params.set_single_segment(false);
         params.set_no_context(true);
         params.set_temperature_inc(0.2);
@@ -334,33 +399,34 @@ impl Transcriber for WhisperTranscriber {
             .full(params, &samples)
             .context("whisper transcription failed")?;
         let n = state.full_n_segments().max(0);
-        let mut parts = Vec::new();
+        let mut tokens = Vec::new();
+        let mut times = Vec::new();
+        let mut text = String::new();
         for i in 0..n {
             if let Some(segment) = state.get_segment(i) {
-                if let Ok(text) = segment.to_str_lossy() {
-                    parts.push(text.to_string());
+                if let Ok(part) = segment.to_str_lossy() {
+                    let part = collapse_spaces(&part);
+                    if part.is_empty() {
+                        continue;
+                    }
+                    text.push_str(&part);
+                    text.push(' ');
+                    tokens.push(format!("\u{2581}{}", part.replace(' ', "\u{2581}")));
+                    // whisper.cpp reports timestamps in 10 ms units.
+                    times.push(segment.start_timestamp() as f32 / 100.0);
                 }
             }
         }
-        Ok(collapse_spaces(&parts.join(" ")))
+        Ok(Transcript {
+            text: collapse_spaces(&text),
+            tokens,
+            times,
+        })
     }
 }
 
 fn collapse_spaces(input: &str) -> String {
-    let mut out = String::new();
-    let mut prev_space = false;
-    for c in input.chars() {
-        let is_space = c.is_whitespace();
-        if is_space {
-            if !prev_space {
-                out.push(' ');
-            }
-        } else {
-            out.push(c);
-        }
-        prev_space = is_space;
-    }
-    out.trim().to_string()
+    crate::stitch::collapse(input)
 }
 
 pub fn resolve(cfg: &Config, dirs: &AppDirs) -> Result<Box<dyn Transcriber>> {
@@ -437,3 +503,9 @@ pub fn resolve(cfg: &Config, dirs: &AppDirs) -> Result<Box<dyn Transcriber>> {
     }
 }
 
+/// Build a transcriber for a model chosen by an API caller.
+pub fn resolve_choice(choice: &ModelChoice, dirs: &AppDirs) -> Result<Box<dyn Transcriber>> {
+    let mut cfg = Config::default();
+    choice.apply_to(&mut cfg);
+    resolve(&cfg, dirs)
+}

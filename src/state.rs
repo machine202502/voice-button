@@ -11,9 +11,45 @@ pub enum Status {
     Idle,
     Recording,
     Transcribing,
+    /// A recording was interrupted by a crash and is being transcribed now:
+    /// the microphone is blocked and the tray icon is blue.
+    Recovering,
+    /// A file chosen by the user is being transcribed: the tray icon is green
+    /// and the microphone is unavailable.
+    File,
     /// No usable model selected: recording is unavailable and the tray icon
     /// is shown grayed out.
     NoModel,
+}
+
+/// Event sent from a session or the recovery thread to the daemon loop.
+#[derive(Debug)]
+pub enum AppEvent {
+    Transcribed {
+        text: String,
+        model: String,
+        append: bool,
+        paste_target: Option<isize>,
+        /// False for API sessions: the caller's audio never touches the
+        /// clipboard of the user.
+        clipboard: bool,
+        state: crate::history::EntryState,
+        /// Recording directory to clean up once the text is saved.
+        dir: Option<std::path::PathBuf>,
+        /// Who produced the audio: the user, the API, or an imported file.
+        source: crate::history::Source,
+        /// Audio that belongs to the entry (a kept recording or the user's file).
+        audio: Option<String>,
+    },
+    /// A file transcription was cancelled by the user.
+    Cancelled,
+    Failed(String),
+    /// A crash-interrupted recording was transcribed into the history.
+    Recovered {
+        chars: usize,
+        failed_segments: usize,
+        at: String,
+    },
 }
 
 /// Who is asking the app to record. Every input path (button, hotkey, tray
@@ -233,11 +269,18 @@ pub struct Data {
     pub session: Option<Session>,
     /// Same session, mirrored into the UI process through `session.json`.
     pub session_view: Option<SessionView>,
+    /// A crash-interrupted recording is being transcribed: the microphone is
+    /// blocked until it is done.
+    pub recovering: bool,
     /// Active audio upload from an API caller; `None` when the app is not
     /// transcribing uploaded sound.
     pub stream: Option<StreamSession>,
     /// Last result produced for an API session.
     pub api_result: Option<ApiResult>,
+    /// Progress of an imported file, mirrored from `file.state.json`.
+    pub file: Option<crate::ipc::FileSnapshot>,
+    /// When the file state was read last, so the tab polls at a sane rate.
+    pub file_seen: Option<std::time::Instant>,
 }
 
 /// Runtime status of the local API server.
@@ -280,6 +323,9 @@ impl Shared {
                 api: None,
                 session: None,
                 session_view: None,
+                recovering: false,
+                file: None,
+                file_seen: None,
                 stream: None,
                 api_result: None,
             }),

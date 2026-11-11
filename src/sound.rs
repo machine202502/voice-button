@@ -3,6 +3,7 @@ use windows_sys::Win32::Media::Audio::{PlaySoundA, SND_ASYNC, SND_MEMORY, SND_NO
 // Embedded in the binary so the exe stays self-contained.
 const START_WAV: &[u8] = include_bytes!("../assets/start.wav");
 const END_WAV: &[u8] = include_bytes!("../assets/end.wav");
+const ERROR_WAV: &[u8] = include_bytes!("../assets/error.wav");
 
 /// PlaySound with SND_MEMORY requires the buffer to outlive the asynchronous
 /// playback. Keep the current and the previous buffer alive; starting a new
@@ -17,6 +18,12 @@ pub fn play_start(volume: f32) {
 
 pub fn play_end(volume: f32) {
     play(END_WAV, volume);
+}
+
+/// Crash cue: the daemon died and its recording is being recovered. Generated
+/// in-house like the start/stop cues, not a Windows scheme sound.
+pub fn play_error(volume: f32) {
+    play(ERROR_WAV, volume);
 }
 
 /// Scale the 16-bit PCM samples in a copy of the WAV (perceptual: volume²)

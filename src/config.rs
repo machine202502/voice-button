@@ -47,6 +47,10 @@ pub struct Config {
     /// something is routed into them, so the microphone is selectable.
     #[serde(default)]
     pub input_device: String,
+    /// Multiplier for the voice-activity threshold. 1.0 is the default; higher
+    /// values treat quieter speech as speech, which helps a quiet microphone.
+    #[serde(default = "default_vad_sensitivity")]
+    pub vad_sensitivity: f32,
     /// Swap the tray icon's left and middle mouse actions.
     #[serde(default)]
     pub swap_mouse_buttons: bool,
@@ -61,6 +65,9 @@ pub struct Config {
     pub sound_volume: f32,
     #[serde(default = "default_true")]
     pub play_start_sound: bool,
+    /// Crash cue: played when the daemon died and its recording is recovered.
+    #[serde(default = "default_true")]
+    pub play_error_sound: bool,
     #[serde(default = "default_true")]
     pub play_end_sound: bool,
     /// Global start/stop shortcut, e.g. "Ctrl+Alt+R". Empty (the default)
@@ -101,6 +108,10 @@ fn default_sound_volume() -> f32 {
     0.5
 }
 
+fn default_vad_sensitivity() -> f32 {
+    1.0
+}
+
 fn default_true() -> bool {
     true
 }
@@ -120,8 +131,10 @@ impl Default for Config {
             autostart: true,
             silent_start: true,
             play_start_sound: true,
+            play_error_sound: true,
             play_end_sound: true,
             sound_volume: 0.5,
+            vad_sensitivity: 1.0,
             hotkey: String::new(),
             append_hotkey: String::new(),
             paste_hotkey: String::new(),

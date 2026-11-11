@@ -353,6 +353,8 @@ fn status_json(shared: &Shared) -> serde_json::Value {
         state::Status::Idle => "idle",
         state::Status::Recording => "recording",
         state::Status::Transcribing => "transcribing",
+        state::Status::Recovering => "recovering",
+        state::Status::File => "file",
         state::Status::NoModel => "nomodel",
     };
     let session = data.session.as_ref();

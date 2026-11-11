@@ -10,10 +10,12 @@ pub fn set_enabled(silent: bool, enabled: bool) -> anyhow::Result<()> {
     let key = hkcu.open_subkey_with_flags(RUN_KEY, KEY_SET_VALUE)?;
     if enabled {
         let exe = current_exe()?;
+        // The guard owns the daemon: it restarts it after a crash and records
+        // the exit code, which no handler inside the dying process can do.
         let command = if silent {
-            format!("\"{}\" /silent", exe.display())
+            format!("\"{}\" --guard /silent", exe.display())
         } else {
-            format!("\"{}\"", exe.display())
+            format!("\"{}\" --guard", exe.display())
         };
         key.set_value(APP_NAME, &command)?;
     } else {

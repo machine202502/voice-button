@@ -75,6 +75,24 @@ pub fn icon_transcribing() -> Icon {
     tinted([1.0, 0.65, 0.25])
 }
 
+/// Blue icon: a recording interrupted by a crash is being transcribed, and the
+/// microphone stays blocked until it is done.
+pub fn icon_recovering() -> Icon {
+    tinted([0.35, 0.55, 1.0])
+}
+
+/// Dim blue: the second frame of the blink, so the tray draws attention to the
+/// recovery instead of showing a static icon.
+pub fn icon_recovering_dim() -> Icon {
+    tinted([0.18, 0.28, 0.55])
+}
+
+/// Green: an imported file is being transcribed. Steady, unlike the blinking
+/// blue of a crash recovery.
+pub fn icon_file() -> Icon {
+    tinted([0.35, 1.0, 0.45])
+}
+
 /// Grayed-out icon, used when no usable model is selected so recording is
 /// unavailable.
 pub fn icon_disabled() -> Icon {

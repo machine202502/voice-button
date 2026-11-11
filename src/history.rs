@@ -21,6 +21,25 @@ pub enum Source {
     User,
     /// Started by the local API server.
     Server,
+    /// An audio file imported by the user.
+    File,
+}
+
+/// Whether the recording behind an entry was transcribed completely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum EntryState {
+    #[default]
+    Complete,
+    /// Recovered after a crash, or one segment could not be transcribed: the
+    /// text is in the history but may be missing a part.
+    Partial,
+}
+
+impl EntryState {
+    pub fn is_partial(self) -> bool {
+        self == EntryState::Partial
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,6 +55,13 @@ pub struct HistoryEntry {
     /// read back as the user).
     #[serde(default)]
     pub source: Source,
+    /// Complete unless the recording was recovered after a crash.
+    #[serde(default)]
+    pub state: EntryState,
+    /// Audio kept for the user because the transcription is not guaranteed.
+    /// An absolute path to the file that belongs to this entry.
+    #[serde(default)]
+    pub audio: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -47,6 +73,8 @@ pub struct HistoryRow {
     len: usize,
     pieces: usize,
     source: Source,
+    state: EntryState,
+    audio: Option<String>,
     inline_entry: Option<HistoryEntry>,
 }
 
@@ -69,6 +97,8 @@ impl HistoryRow {
             len,
             pieces: entry.parts.len(),
             source: entry.source,
+            state: entry.state,
+            audio: entry.audio.clone(),
             inline_entry: None,
         }
     }
@@ -82,6 +112,8 @@ impl HistoryRow {
             len: 0,
             pieces: entry.parts.len(),
             source: entry.source,
+            state: entry.state,
+            audio: entry.audio.clone(),
             inline_entry: Some(entry),
         }
     }
@@ -110,6 +142,16 @@ impl HistoryRow {
     /// Who started the recording behind this entry.
     pub fn source(&self) -> Source {
         self.source
+    }
+
+    /// Complete, or recovered/partial after a crash.
+    pub fn state(&self) -> EntryState {
+        self.state
+    }
+
+    /// Audio the user may open because the text is not guaranteed.
+    pub fn audio(&self) -> Option<&str> {
+        self.audio.as_deref()
     }
 }
 
@@ -339,6 +381,8 @@ mod tests {
             model: format!("model-{index}"),
             parts: Vec::new(),
             source: super::Source::User,
+            state: super::EntryState::Complete,
+            audio: None,
         }
     }
 

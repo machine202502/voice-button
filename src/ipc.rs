@@ -242,6 +242,8 @@ pub fn write_status(root: &Path, status: crate::state::Status) {
         crate::state::Status::Idle => "idle",
         crate::state::Status::Recording => "recording",
         crate::state::Status::Transcribing => "transcribing",
+        crate::state::Status::Recovering => "recovering",
+        crate::state::Status::File => "file",
         crate::state::Status::NoModel => "nomodel",
     };
     atomic_write(status_path(root), text.as_bytes());
@@ -252,6 +254,8 @@ pub fn read_status(root: &Path) -> Option<crate::state::Status> {
     Some(match text.trim() {
         "recording" => crate::state::Status::Recording,
         "transcribing" => crate::state::Status::Transcribing,
+        "recovering" => crate::state::Status::Recovering,
+        "file" => crate::state::Status::File,
         "nomodel" => crate::state::Status::NoModel,
         _ => crate::state::Status::Idle,
     })
@@ -285,6 +289,73 @@ pub fn read_live(root: &Path) -> Option<LiveView> {
 
 pub fn clear_live(root: &Path) {
     let _ = std::fs::remove_file(live_path(root));
+}
+
+// ---------------------------------------------------------------------------
+// Imported file transcription (UI → daemon → UI).
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct FileSnapshot {
+    pub path: String,
+    pub name: String,
+    pub done_seconds: f64,
+    pub total_seconds: f64,
+    pub text: String,
+    pub error: Option<String>,
+    pub running: bool,
+    pub cancelled: bool,
+}
+
+pub fn file_request_path(root: &Path) -> PathBuf {
+    root.join("file.request")
+}
+
+pub fn write_file_request(root: &Path, path: &str) {
+    atomic_write(file_request_path(root), path.as_bytes());
+}
+
+/// Returns the requested file path and consumes the request.
+pub fn take_file_request(root: &Path) -> Option<String> {
+    let path = file_request_path(root);
+    let content = std::fs::read_to_string(&path).ok()?;
+    let _ = std::fs::remove_file(&path);
+    let content = content.trim().to_string();
+    (!content.is_empty()).then_some(content)
+}
+
+pub fn file_cancel_path(root: &Path) -> PathBuf {
+    root.join("file.cancel")
+}
+
+pub fn request_file_cancel(root: &Path) {
+    let _ = std::fs::File::create(file_cancel_path(root));
+}
+
+pub fn file_cancel_requested(root: &Path) -> bool {
+    file_cancel_path(root).exists()
+}
+
+pub fn clear_file_cancel(root: &Path) {
+    let _ = std::fs::remove_file(file_cancel_path(root));
+}
+
+pub fn file_state_path(root: &Path) -> PathBuf {
+    root.join("file.state.json")
+}
+
+pub fn write_file_state(root: &Path, snapshot: &FileSnapshot) {
+    if let Ok(text) = serde_json::to_string(snapshot) {
+        atomic_write(file_state_path(root), text.as_bytes());
+    }
+}
+
+pub fn read_file_state(root: &Path) -> Option<FileSnapshot> {
+    let text = std::fs::read_to_string(file_state_path(root)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+pub fn remove_file_state(root: &Path) {
+    let _ = std::fs::remove_file(file_state_path(root));
 }
 
 // ---------------------------------------------------------------------------

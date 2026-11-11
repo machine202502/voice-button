@@ -24,6 +24,21 @@ Site: https://machine202502.github.io/voice-button/
 - Recording is unavailable until a usable model is downloaded. During an active
   download the tray click opens Settings instead of starting recording.
 
+Long dictation is the normal case, not an exception. While it records, the
+daemon writes the microphone to `recordings/<session>/audio.wav`, cuts the stream
+into segments at pauses (and, if speech never pauses, at its quietest point near
+25 s) and transcribes each segment as soon as it ends — without waiting for the
+recording to stop. Silence never reaches the model. Text therefore grows while
+you speak, and every minute of speech costs the same to transcribe as a short
+note instead of the quadratic growth of re-reading the whole buffer.
+
+The recognizer runs in a child process (`voice-button.exe --asr-worker`), so a
+failing model costs one segment: the worker is replaced and the segment retried
+while the recording continues. If the daemon itself dies, `--guard` restarts it,
+plays the system error sound, turns the tray microphone blue and transcribes the
+interrupted recording from disk into the history with an "incomplete" mark;
+recording stays blocked until that finishes.
+
 ### Global hotkeys
 
 Both shortcuts start unbound; set them in **Settings → Global hotkey**.
@@ -49,7 +64,12 @@ small **Copy** on a piece to copy just that piece.
 The application has two executables that must stay beside each other:
 
 - `voice-button.exe` — tray daemon, recording, transcription, downloads, history.
+  It also runs two hidden roles: `--asr-worker` (the recognizer process) and
+  `--guard` (the supervisor that restarts a crashed daemon).
 - `voice-button-ui.exe` — the window, started only while it is visible.
+
+Autostart and the shortcuts start `voice-button.exe --guard`, so the app comes
+back after a crash instead of staying down until the next sign-in.
 
 All application assets and Windows resources are embedded at build time.
 Models are not bundled.
@@ -124,7 +144,11 @@ Data lives in `%APPDATA%\voice-button`:
 - `config.json` — applied settings.
 - `history.jsonl` — persistent history, one JSON entry per line.
 - `models/` — downloaded models.
-- `log.txt` and rotated copies — application activity.
+- `recordings/` — audio of the recording in progress; removed once its text is
+  saved, kept when the transcription failed.
+- `crash.txt` — crashes reported by the guard (exit code and time).
+- `log.txt` and rotated copies — application activity; the previous run is kept
+  as `log.txt.1`, so a crash is not erased by the restart.
 
 History indexes only timestamps, previews, and byte offsets. Full text is read
 on demand for expansion or copying, and the scrolling list renders only visible
@@ -139,6 +163,16 @@ The ONNX Runtime dependency obtains its native binaries during the build.
 cargo build --release --bins
 cargo test --release
 ```
+
+End-to-end checks decode the eight-minute recording in `tests/assets` and need a
+downloaded model plus the app binary next to the test executable. They are
+ignored by default:
+
+```powershell
+cargo test --release --test e2e -- --ignored --nocapture
+```
+
+`VB_E2E_MODEL` (default `Onnx/gigaam-v3-rnnt-punct`) selects the model.
 
 To refresh the UI snapshots in `Tests/`:
 

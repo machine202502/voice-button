@@ -293,6 +293,31 @@ pub const QWEN3_ASR_06B: RemoteModel = RemoteModel {
 };
 /// Multilingual entries first, then Russian-focused ones. Whisper models come
 /// first in the multilingual block because they can detect the spoken language.
+/// Per-model override of the longest audio a single decode may take.
+///
+/// Every engine the app ships works on short utterances, so the default (25 s)
+/// covers all of them: whisper.cpp splits audio into 30 s windows itself,
+/// SenseVoice and GigaAM are trained on short phrases, Qwen3-ASR is limited by
+/// tokens. A model that accepts less only needs a line here.
+pub fn max_seconds_override(id: &str) -> Option<f32> {
+    match id {
+        // Whisper processes 30 s windows, so 25 s is the natural unit.
+        "large-v3-turbo" | "large-v3" | "medium" | "small" | "large-v3-turbo-q5_0"
+        | "medium-q5_0" | "small-q5_1" | "whisper-base-onnx" => Some(25.0),
+        // GigaAM is trained on short utterances and its encoder mask covers
+        // 200 s; 25 s keeps the decoding well inside both.
+        "gigaam-v3-sherpa-int8" | "gigaam-v3-ctc-punct" | "gigaam-v3-rnnt"
+        | "gigaam-v3-rnnt-punct" | "gigaam-v2-ctc" => Some(25.0),
+        // SenseVoice expects short clips as well.
+        "sense-voice" => Some(25.0),
+        // Qwen3-ASR is bounded by its 256-token decoder budget; the margin is
+        // deliberately conservative.
+        "qwen3-asr-0.6b" => Some(20.0),
+        // Custom or unknown model: the default in `transcribe` applies.
+        _ => None,
+    }
+}
+
 pub const MODELS: &[&RemoteModel] = &[
     &LARGE_V3_TURBO_Q5_0,
     &LARGE_V3_TURBO,

@@ -29,6 +29,8 @@ pub enum TrayAction {
 
 pub enum TrayCommand {
     SetStatus(Status),
+    /// Replace the tray tooltip with a one-off message.
+    Notify(String),
     /// Apply a new global shortcut; `None` disables it.
     SetHotkey(Option<Hotkey>),
     /// Apply a new append shortcut; `None` disables it.
@@ -234,6 +236,11 @@ fn run(
     let mut registered: Option<Hotkey> = None;
     let mut append_registered: Option<Hotkey> = None;
     let mut paste_registered: Option<Hotkey> = None;
+    // Blinking blue icon while a crash-interrupted recording is transcribed:
+    // a static icon is easy to miss.
+    let mut current_status = Status::Idle;
+    let mut blink_at = std::time::Instant::now();
+    let mut blink_bright = true;
     apply_hotkey(hotkey_window, HOTKEY_ID, &mut registered, hotkey, "record");
     apply_hotkey(
         hotkey_window,
@@ -251,6 +258,18 @@ fn run(
     );
     loop {
         pump_messages();
+        if current_status == Status::Recovering
+            && blink_at.elapsed() >= std::time::Duration::from_millis(450)
+        {
+            blink_at = std::time::Instant::now();
+            blink_bright = !blink_bright;
+            let icon = if blink_bright {
+                icons::icon_recovering()
+            } else {
+                icons::icon_recovering_dim()
+            };
+            let _ = tray.set_icon(Some(icon));
+        }
         if HOTKEY_FIRED.swap(false, std::sync::atomic::Ordering::SeqCst) {
             crate::log::log("hotkey pressed");
             let _ = to_app.send(TrayAction::RecordToggle);
@@ -266,13 +285,27 @@ fn run(
         while let Ok(command) = rx_cmd.try_recv() {
             match command {
                 TrayCommand::SetStatus(status) => {
+                    current_status = status;
+                    blink_at = std::time::Instant::now();
+                    blink_bright = true;
                     let icon = match status {
                         Status::Idle => icons::icon_idle(),
                         Status::Recording => icons::icon_recording(),
                         Status::Transcribing => icons::icon_transcribing(),
+                        Status::Recovering => icons::icon_recovering(),
+                        Status::File => icons::icon_file(),
                         Status::NoModel => icons::icon_disabled(),
                     };
                     let _ = tray.set_icon(Some(icon));
+                    let hint = match status {
+                        Status::Recovering => tr("Voice Button - recovering a recording"),
+                        Status::File => tr("Voice Button - transcribing a file"),
+                        _ => tooltip(swap_mouse_buttons),
+                    };
+                    let _ = tray.set_tooltip(Some(hint));
+                }
+                TrayCommand::Notify(text) => {
+                    let _ = tray.set_tooltip(Some(text));
                 }
                 TrayCommand::SetHotkey(next) => {
                     apply_hotkey(hotkey_window, HOTKEY_ID, &mut registered, next, "record")

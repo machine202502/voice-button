@@ -3,11 +3,6 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, Stream, StreamConfig};
 use std::sync::{Arc, Mutex};
 
-pub struct Recording {
-    pub samples: Vec<f32>,
-    pub sample_rate: u32,
-}
-
 /// Fold interleaved device frames into one mono channel.
 ///
 /// The default input device often delivers stereo (or more), and appending
@@ -139,16 +134,14 @@ impl Recorder {
         self.channels
     }
 
-    pub fn stop(&mut self) -> Result<Recording> {
+    /// Stop capturing. The audio itself is taken by the session through
+    /// [`Recorder::buffer_handle`], so nothing is returned here.
+    pub fn stop(&mut self) -> Result<()> {
         if self.stream.is_none() {
             bail!("not recording");
         }
         self.stream = None;
-        let samples = std::mem::take(&mut *self.buffer.lock().unwrap());
-        Ok(Recording {
-            samples,
-            sample_rate: self.sample_rate,
-        })
+        Ok(())
     }
 }
 

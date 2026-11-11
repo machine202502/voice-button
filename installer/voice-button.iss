@@ -58,12 +58,12 @@ Source: "..\locales\*.json"; DestDir: "{app}\locales"; Flags: ignoreversion
 Source: "{#ThirdParty}"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{autoprograms}\Voice Button"; Filename: "{app}\voice-button.exe"
-Name: "{autodesktop}\Voice Button"; Filename: "{app}\voice-button.exe"; Tasks: desktopicon
+Name: "{autoprograms}\Voice Button"; Filename: "{app}\voice-button.exe"; Parameters: "--guard"
+Name: "{autodesktop}\Voice Button"; Filename: "{app}\voice-button.exe"; Parameters: "--guard"; Tasks: desktopicon
 
 [Run]
 Filename: "{tmp}\vc_redist.x64.exe"; Parameters: "/install /quiet /norestart"; StatusMsg: "Installing Microsoft Visual C++ Runtime..."; Flags: waituntilterminated; Check: NeedsVCRedist
-Filename: "{app}\voice-button.exe"; Description: "Launch Voice Button"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\voice-button.exe"; Parameters: "--guard"; Description: "Launch Voice Button"; Flags: nowait postinstall skipifsilent
 
 [Code]
 function NeedsVCRedist: Boolean;

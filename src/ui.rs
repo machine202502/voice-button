@@ -15,6 +15,7 @@ pub const WINDOW_TITLE: &str = "Voice Button";
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Capture,
+    File,
     Settings,
     Api,
 }
@@ -25,6 +26,7 @@ enum HistoryFilter {
     All,
     User,
     Server,
+    File,
 }
 
 impl HistoryFilter {
@@ -33,6 +35,7 @@ impl HistoryFilter {
             HistoryFilter::All => true,
             HistoryFilter::User => source == state::Source::User,
             HistoryFilter::Server => source == state::Source::Server,
+            HistoryFilter::File => source == state::Source::File,
         }
     }
 }
@@ -83,6 +86,8 @@ pub fn run_from_args() {
                     },
                 ],
                 source: state::Source::User,
+                state: crate::history::EntryState::Complete,
+                audio: None,
             },
             state::HistoryEntry {
                 at: "2026-11-05 11:02:17".to_string(),
@@ -90,6 +95,8 @@ pub fn run_from_args() {
                 model: "v3_e2e_ctc".to_string(),
                 parts: Vec::new(),
                 source: state::Source::User,
+                state: crate::history::EntryState::Complete,
+                audio: None,
             },
             state::HistoryEntry {
                 at: "2026-11-04 18:45:03".to_string(),
@@ -97,6 +104,8 @@ pub fn run_from_args() {
                 model: "large-v3-turbo-q5_0".to_string(),
                 parts: Vec::new(),
                 source: state::Source::User,
+                state: crate::history::EntryState::Complete,
+                audio: None,
             },
             state::HistoryEntry {
                 at: "2026-11-04 15:20:44".to_string(),
@@ -104,6 +113,8 @@ pub fn run_from_args() {
                 model: "multi-gigaam-ctc".to_string(),
                 parts: Vec::new(),
                 source: state::Source::User,
+                state: crate::history::EntryState::Complete,
+                audio: None,
             },
         ]);
         // Simulate a UI process opened while the daemon is already recording.
@@ -166,6 +177,8 @@ fn run_ui(config: config::Config, history: state::History, dirs: AppDirs, tab: S
         Tab::Settings
     } else if tab == "api" {
         Tab::Api
+    } else if tab == "file" {
+        Tab::File
     } else {
         Tab::Capture
     };
@@ -395,6 +408,7 @@ impl eframe::App for MainWindow {
             show_download_banner(ui, &mut data, &self.dirs);
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.tab, Tab::Capture, tr("Capture"));
+                ui.selectable_value(&mut self.tab, Tab::File, tr("File"));
                 ui.selectable_value(&mut self.tab, Tab::Settings, tr("Settings"));
                 ui.selectable_value(&mut self.tab, Tab::Api, tr("API"));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -420,6 +434,7 @@ impl eframe::App for MainWindow {
                         .auto_shrink([false, false])
                         .show(ui, |ui| settings_body(ui, &mut data, &self.dirs));
                 }
+                Tab::File => file_body(ui, &mut data, &self.dirs),
                 Tab::Api => api_body(ui, &mut data, &self.dirs, ctx, &mut self.api_copied_at),
             }
         });
@@ -844,6 +859,18 @@ fn settings_body(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs) {
         }
         ui.label(RichText::new(tr("Preview the end cue at the volume above.")).weak());
     });
+    sounds_changed |= ui
+        .checkbox(
+            &mut data.config.play_error_sound,
+            tr("Play sound when the app recovers from a crash"),
+        )
+        .changed();
+    ui.horizontal(|ui| {
+        if ui.small_button(tr("Play")).clicked() {
+            crate::sound::play_error(data.config.sound_volume);
+        }
+        ui.label(RichText::new(tr("Preview the crash cue at the volume above.")).weak());
+    });
     if sounds_changed {
         apply_settings(data, dirs);
     }
@@ -919,6 +946,24 @@ fn settings_body(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs) {
             .weak(),
         );
     }
+    let mut sensitivity_changed = false;
+    sensitivity_changed |= ui
+        .add(
+            egui::Slider::new(&mut data.config.vad_sensitivity, 0.5..=2.0)
+                .text(tr("Microphone sensitivity"))
+                .custom_formatter(|value, _| format!("{:.0}%", value * 100.0)),
+        )
+        .changed();
+    if sensitivity_changed {
+        data.config.vad_sensitivity = data.config.vad_sensitivity.clamp(0.5, 2.0);
+        apply_settings(data, dirs);
+    }
+    ui.label(
+        RichText::new(tr(
+            "Raise it if quiet phrases are dropped, lower it in a noisy room.",
+        ))
+        .weak(),
+    );
     ui.separator();
     ui.heading(tr("Mouse"));
     if ui
@@ -1545,6 +1590,110 @@ fn onnx_section(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs, locked: bool
     }
 }
 
+/// Open a file with its default application (explorer <file> does exactly
+/// that without pulling in another Win32 dependency).
+fn open_path(path: &str) {
+    if let Err(e) = std::process::Command::new("explorer").arg(path).spawn() {
+        crate::log::log(&format!("cannot open {path}: {e}"));
+    }
+}
+
+/// Open the folder that contains the file and select it.
+fn show_in_folder(path: &str) {
+    if let Err(e) = std::process::Command::new("explorer")
+        .arg(format!("/select,{path}"))
+        .spawn()
+    {
+        crate::log::log(&format!("cannot reveal {path}: {e}"));
+    }
+}
+
+/// Tab "File": pick an audio file and watch its transcription. The file is read
+/// where it is; the daemon never copies it.
+fn file_body(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs) {
+    let refresh = data
+        .file_seen
+        .map(|at| at.elapsed() >= Duration::from_millis(250))
+        .unwrap_or(true);
+    if refresh {
+        data.file = crate::ipc::read_file_state(&dirs.root);
+        data.file_seen = Some(std::time::Instant::now());
+    }
+    ui.heading(tr("Transcribe a file"));
+    ui.label(
+        RichText::new(tr(
+            "Audio files (WAV, MP3, FLAC, OGG, M4A) and videos (MP4, MOV, MKV) — the audio track is taken from a video. The file stays where it is: nothing is copied into the application, and the text goes to the history.",
+        ))
+        .weak(),
+    );
+    let running = data.status == crate::state::Status::File;
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(!running, egui::Button::new(tr("Choose file…")))
+            .clicked()
+        {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter(
+                    tr("Audio and video"),
+                    &[
+                        "wav", "mp3", "flac", "ogg", "oga", "m4a", "aac", "opus", "mp4", "m4v",
+                        "mov", "mkv", "webm",
+                    ],
+                )
+                .pick_file()
+            {
+                crate::ipc::write_file_request(&dirs.root, &path.to_string_lossy());
+            }
+        }
+        if running && ui.button(tr("Cancel")).clicked() {
+            crate::ipc::request_file_cancel(&dirs.root);
+        }
+    });
+    ui.separator();
+    let Some(file) = data.file.clone() else {
+        ui.label(RichText::new(tr("No file chosen yet.")).weak());
+        return;
+    };
+    ui.label(RichText::new(&file.name).strong());
+    if file.total_seconds > 0.0 {
+        let progress = (file.done_seconds / file.total_seconds).clamp(0.0, 1.0) as f32;
+        ui.add(
+            egui::ProgressBar::new(progress).text(trf(
+                "{done} / {total} s",
+                &[
+                    ("done", &format!("{:.0}", file.done_seconds)),
+                    ("total", &format!("{:.0}", file.total_seconds)),
+                ],
+            )),
+        );
+    } else if file.running {
+        ui.add(egui::ProgressBar::new(0.0).text(trf(
+            "{done} s",
+            &[("done", &format!("{:.0}", file.done_seconds))],
+        )));
+    }
+    if let Some(error) = &file.error {
+        ui.label(RichText::new(error).color(egui::Color32::from_rgb(200, 70, 70)));
+    }
+    if file.cancelled {
+        ui.label(RichText::new(tr("Cancelled")).weak());
+    }
+    if !file.text.is_empty() {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .id_source("file_transcript")
+                .max_height(220.0)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.add(egui::Label::new(file.text.clone()).wrap(true));
+                });
+        });
+        if ui.button(tr("Copy")).clicked() {
+            copy_to_clipboard(&file.text);
+        }
+    }
+}
+
 fn capture_body(
     ui: &mut egui::Ui,
     data: &mut Data,
@@ -1620,13 +1769,40 @@ fn capture_body(
         crate::state::Status::Transcribing => {
             ui.label(RichText::new(tr("Transcribing…")).color(egui::Color32::from_rgb(230, 150, 40)));
         }
+        crate::state::Status::File => {
+            ui.label(
+                RichText::new(tr("Transcribing a file…"))
+                    .color(egui::Color32::from_rgb(70, 190, 90)),
+            );
+            ui.label(
+                RichText::new(tr(
+                    "The microphone stays unavailable until the file is done. Progress is on the File tab.",
+                ))
+                .weak(),
+            );
+        }
+        crate::state::Status::Recovering => {
+            ui.label(
+                RichText::new(tr("Recovering a recording…"))
+                    .color(egui::Color32::from_rgb(70, 130, 240)),
+            );
+            ui.label(
+                RichText::new(tr(
+                    "The previous recording was interrupted by a crash. It is being transcribed into the history; recording stays unavailable until it is done.",
+                ))
+                .weak(),
+            );
+        }
         _ => {
             let download_busy = data
                 .download
                 .as_ref()
                 .map(|d| !d.done && d.error.is_none())
                 .unwrap_or(false);
-            let can_record = status != crate::state::Status::NoModel && !download_busy;
+            let can_record = status != crate::state::Status::NoModel
+                && status != crate::state::Status::Recovering
+                && status != crate::state::Status::File
+                && !download_busy;
             if !can_record {
                 ui.label(RichText::new(tr("Recording is unavailable until a model is ready.")).weak());
             }
@@ -1644,11 +1820,45 @@ fn capture_body(
 
 /// Take the visible rows of `indices` (newest first) and their heights. Only
 /// matching entries are laid out, so filtering keeps the virtualized list exact.
+/// Height of a "day" separator in the history list.
+const DAY_HEADER_HEIGHT: f32 = 30.0;
+
+/// "Today", "Yesterday" or "Tuesday · 04.11" for a history timestamp.
+fn day_header(at: &str) -> String {
+    let date = at.get(0..10).unwrap_or("");
+    let today = chrono::Local::now().date_naive();
+    let parsed = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok();
+    match parsed {
+        Some(day) if day == today => tr("Today"),
+        Some(day) if Some(day) == today.pred_opt() => tr("Yesterday"),
+        Some(day) => format!(
+            "{} · {}",
+            tr(weekday_name(chrono::Datelike::weekday(&day))),
+            day.format("%d.%m")
+        ),
+        None => date.to_string(),
+    }
+}
+
+fn weekday_name(day: chrono::Weekday) -> &'static str {
+    use chrono::Weekday;
+    match day {
+        Weekday::Mon => "Monday",
+        Weekday::Tue => "Tuesday",
+        Weekday::Wed => "Wednesday",
+        Weekday::Thu => "Thursday",
+        Weekday::Fri => "Friday",
+        Weekday::Sat => "Saturday",
+        Weekday::Sun => "Sunday",
+    }
+}
+
 fn history_row_offsets(
     ui: &mut egui::Ui,
     history: &state::History,
     indices: &[usize],
     expanded: Option<usize>,
+    starts_day: &[bool],
 ) -> Vec<f32> {
     let spacing = ui.spacing().item_spacing.y;
     let base_height = ui.spacing().interact_size.y + 2.0 * spacing + 2.0;
@@ -1659,6 +1869,9 @@ fn history_row_offsets(
     offsets.push(0.0);
     for (position, &index) in indices.iter().enumerate() {
         let mut height = base_height;
+        if starts_day.get(position).copied().unwrap_or(false) {
+            height += DAY_HEADER_HEIGHT;
+        }
         if expanded == Some(index) {
             if let Ok(entry) = history.entry(index) {
                 let text_height = ui.fonts(|f| {
@@ -1721,6 +1934,7 @@ fn history_body(
         ui.selectable_value(&mut next, HistoryFilter::All, tr("All"));
         ui.selectable_value(&mut next, HistoryFilter::User, tr("User"));
         ui.selectable_value(&mut next, HistoryFilter::Server, tr("Server"));
+        ui.selectable_value(&mut next, HistoryFilter::File, tr("File"));
         *filter = next;
     });
     ui.separator();
@@ -1737,13 +1951,31 @@ fn history_body(
             HistoryFilter::All => "No transcriptions yet.",
             HistoryFilter::User => "No transcriptions dictated by the user yet.",
             HistoryFilter::Server => "No transcriptions started by the API server yet.",
+            HistoryFilter::File => "No imported files yet.",
         });
         return;
     }
 
     let mut copied: Option<String> = None;
     let mut toggle: Option<usize> = None;
-    let offsets = history_row_offsets(ui, &data.history, &indices, *expanded);
+    // Day separators, like a gallery: the newest day first, one header per day.
+    let dates: Vec<String> = indices
+        .iter()
+        .map(|&index| {
+            data.history
+                .row(index)
+                .map(|row| row.at().to_string())
+                .unwrap_or_default()
+        })
+        .collect();
+    let starts_day: Vec<bool> = dates
+        .iter()
+        .enumerate()
+        .map(|(position, date)| {
+            position == 0 || dates[position - 1].get(0..10) != date.get(0..10)
+        })
+        .collect();
+    let offsets = history_row_offsets(ui, &data.history, &indices, *expanded, &starts_day);
     let total_height = offsets.last().copied().unwrap_or(0.0);
     ScrollArea::vertical()
         .id_source("history_rows")
@@ -1770,6 +2002,15 @@ fn history_body(
                     let width = ui.available_width();
                     ui.push_id(index, |ui| {
                         ui.allocate_ui(egui::vec2(width, height), |ui| {
+                            if starts_day.get(position).copied().unwrap_or(false) {
+                                ui.separator();
+                                ui.label(
+                                    RichText::new(day_header(&dates[position]))
+                                        .small()
+                                        .strong()
+                                        .color(ui.visuals().weak_text_color()),
+                                );
+                            }
                             ui.horizontal(|ui| {
                                 if ui.small_button(tr("Copy")).clicked() {
                                     match data.history.entry(index) {
@@ -1798,11 +2039,43 @@ fn history_body(
                                             .color(egui::Color32::from_rgb(230, 170, 60)),
                                     );
                                 }
+                                if row.source() == state::Source::File {
+                                    ui.label(
+                                        RichText::new(tr("file"))
+                                            .small()
+                                            .color(egui::Color32::from_rgb(70, 190, 90)),
+                                    );
+                                }
+                                if row.state().is_partial() {
+                                    ui.label(
+                                        RichText::new(tr("incomplete"))
+                                            .small()
+                                            .color(egui::Color32::from_rgb(90, 150, 250)),
+                                    );
+                                }
                                 if ui.selectable_label(is_open, row.preview()).clicked() {
                                     toggle = Some(index);
                                 }
                             });
                             if let Some(entry) = full_entry {
+                                if let Some(audio) = entry.audio.as_deref() {
+                                    let exists = std::path::Path::new(audio).exists();
+                                    ui.horizontal(|ui| {
+                                        if ui
+                                            .add_enabled(exists, egui::Button::new(tr("Open recording")))
+                                            .on_hover_text(audio)
+                                            .clicked()
+                                        {
+                                            open_path(audio);
+                                        }
+                                        if ui
+                                            .add_enabled(exists, egui::Button::new(tr("Show in folder")))
+                                            .clicked()
+                                        {
+                                            show_in_folder(audio);
+                                        }
+                                    });
+                                }
                                 ui.add(egui::Label::new(entry.text).wrap(true));
                                 ui.add_space(4.0);
                                 // Pieces appended with the append hotkey are
