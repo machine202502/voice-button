@@ -25,6 +25,7 @@ import json
 import os
 import shutil
 import socket
+import sqlite3
 import ssl
 import struct
 import subprocess
@@ -170,13 +171,48 @@ def outbox_state(browser):
         return {"raw": raw}
 
 
-def site_state(daemon):
-    """What the daemon published about the phone server."""
+def sqlite_path(root):
+    return os.path.join(root, "voice-button.sqlite3")
+
+
+def read_kv(root, key):
     try:
-        with open(os.path.join(daemon.root, "site.state.json"), encoding="utf-8") as handle:
-            return json.load(handle)
-    except (OSError, ValueError):
+        conn = sqlite3.connect(sqlite_path(root), timeout=5)
+        row = conn.execute("SELECT value FROM kv WHERE key = ?", (key,)).fetchone()
+        conn.close()
+    except (OSError, sqlite3.Error):
         return None
+    return row[0] if row else None
+
+
+def write_kv(root, key, value):
+    conn = sqlite3.connect(sqlite_path(root), timeout=5)
+    conn.execute(
+        "INSERT INTO kv(key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, value),
+    )
+    conn.commit()
+    conn.close()
+
+
+def site_state(daemon):
+    """What the daemon published about the phone server (SQLite kv)."""
+    text = read_kv(daemon.root, "runtime.site")
+    if not text:
+        return None
+    snapshot = {}
+    for line in text.splitlines():
+        if "\t" not in line:
+            continue
+        key, value = line.split("\t", 1)
+        snapshot[key] = value
+    return {
+        "running": snapshot.get("running") == "1",
+        "port": int(snapshot.get("port") or 0),
+        "url": snapshot.get("url", ""),
+        "paired": snapshot.get("paired") == "1",
+    }
 
 
 def summarise_outbox(state):
@@ -243,10 +279,32 @@ def log_tail(daemon, count=40):
 
 
 def daemon_db(daemon):
+    """The typed phone tables, shaped like the old JSON for the assertions."""
     try:
-        with open(os.path.join(daemon.root, "site", "db.json"), encoding="utf-8") as handle:
-            return json.load(handle)
-    except (OSError, ValueError) as error:
+        conn = sqlite3.connect(sqlite_path(daemon.root), timeout=5)
+        conn.row_factory = sqlite3.Row
+        client = conn.execute("SELECT * FROM site_client WHERE id = 1").fetchone()
+        monologues = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT id, name, archived, created FROM monologs ORDER BY id"
+            )
+        ]
+        messages = []
+        for row in conn.execute(
+            "SELECT id, monolog_id, recorded, received, stage, text, original, edited, "
+            "deleted, duration, segments_done, history_at, closed FROM site_messages ORDER BY id"
+        ):
+            item = dict(row)
+            item["monolog"] = item.pop("monolog_id")
+            messages.append(item)
+        conn.close()
+        return {
+            "client": dict(client) if client else {},
+            "monologues": monologues,
+            "messages": messages,
+        }
+    except (OSError, sqlite3.Error) as error:
         return {"error": str(error)}
 
 
@@ -353,23 +411,23 @@ class Daemon:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-        state = os.path.join(self.root, "site.state.json")
-        # A terminated daemon cannot write "stopped": its old snapshot would
-        # make the wait below return before the new process is listening.
-        try:
-            os.remove(state)
-        except OSError:
-            pass
+        # A terminated daemon leaves the last "running" snapshot in SQLite;
+        # delete it so the wait below cannot pass before the new process
+        # listens. The database itself stays: it holds the paired token.
+        if os.path.exists(sqlite_path(self.root)):
+            try:
+                conn = sqlite3.connect(sqlite_path(self.root), timeout=5)
+                conn.execute("DELETE FROM kv WHERE key = 'runtime.site'")
+                conn.commit()
+                conn.close()
+            except sqlite3.Error:
+                pass
         environment = dict(os.environ, VB_DATA_DIR=self.root)
         self.process = subprocess.Popen([EXE], env=environment)
 
         def running():
-            try:
-                with open(state, encoding="utf-8") as handle:
-                    snapshot = json.load(handle)
-                return snapshot if snapshot.get("running") else None
-            except (OSError, ValueError):
-                return None
+            snapshot = site_state(self)
+            return snapshot if snapshot and snapshot.get("running") else None
 
         if self.site:
             wait_for(running, timeout=60, what="the phone server")
@@ -388,15 +446,16 @@ class Daemon:
 
         def token():
             try:
-                with open(os.path.join(self.root, "site", "db.json"), encoding="utf-8") as handle:
-                    found = json.load(handle).get("client", {}).get("token")
-                return found or None
-            except (OSError, ValueError):
+                conn = sqlite3.connect(sqlite_path(self.root), timeout=3)
+                row = conn.execute("SELECT token FROM site_client WHERE id = 1").fetchone()
+                conn.close()
+                return row[0] if row and row[0] else None
+            except (OSError, sqlite3.Error):
                 return None
 
         if pair:
             # Ask the app for a pairing link, then read the token it stored.
-            open(os.path.join(self.root, "site.pair.request"), "w").write("1")
+            write_kv(self.root, "request.site_pair", "1")
             self.token = wait_for(token, timeout=20, what="a pairing token")
         else:
             # The token lives in the data directory: a restart must not pair
@@ -1380,10 +1439,14 @@ def main():
         )
 
         print("history is append-only")
-        history = os.path.join(daemon.root, "history.jsonl")
-        check(os.path.exists(history), "the history file exists")
-        with open(history, encoding="utf-8") as handle:
-            entries = [json.loads(line) for line in handle if line.strip()]
+        conn = sqlite3.connect(sqlite_path(daemon.root), timeout=5)
+        conn.row_factory = sqlite3.Row
+        entries = [
+            {key: row[key] for key in row.keys()}
+            for row in conn.execute("SELECT at, text, model, source FROM history ORDER BY id")
+        ]
+        conn.close()
+        check(len(entries) > 0, "the history table has entries")
         check(
             any(entry.get("source") == "site" for entry in entries),
             "the transcription is in the history with the phone source",
@@ -1686,7 +1749,7 @@ def main():
                 what="the monolog list before the computer goes away",
             )
             cached = browser.evaluate(
-                "window.app.cache.serverMonologs(false).then((list) => list.length)",
+                "window.app.cache.monologPage(false, 0, 100).then((page) => page.monologs.length)",
                 await_promise=True,
             )
             check(cached == 1, f"the phone cached the monolog list ({cached})")

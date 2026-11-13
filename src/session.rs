@@ -85,8 +85,12 @@ pub fn recordings_dir(root: &Path) -> PathBuf {
     root.join("recordings")
 }
 
-pub fn state_path(dir: &Path) -> PathBuf {
-    dir.join("state.json")
+fn state_root(dir: &Path) -> Option<&Path> {
+    dir.parent()?.parent()
+}
+
+fn recording_name(dir: &Path) -> Option<String> {
+    Some(dir.file_name()?.to_string_lossy().to_string())
 }
 
 pub fn audio_path(dir: &Path) -> PathBuf {
@@ -94,14 +98,67 @@ pub fn audio_path(dir: &Path) -> PathBuf {
 }
 
 fn write_state(dir: &Path, state: &PersistedState) {
-    if let Ok(text) = serde_json::to_string(state) {
-        ipc::atomic_write(state_path(dir), text.as_bytes());
-    }
+    let (Some(root), Some(name)) = (state_root(dir), recording_name(dir)) else {
+        return;
+    };
+    let Ok(store) = crate::store::Store::open(root) else {
+        return;
+    };
+    let _ = store.conn().execute(
+        "INSERT INTO recordings(name, id, started, interactor, model, seconds, done,
+            failed_segments, failed, kept)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         ON CONFLICT(name) DO UPDATE SET id = excluded.id, started = excluded.started,
+            interactor = excluded.interactor, model = excluded.model, seconds = excluded.seconds,
+            done = excluded.done, failed_segments = excluded.failed_segments,
+            failed = excluded.failed, kept = excluded.kept",
+        rusqlite::params![
+            name,
+            state.id as i64,
+            state.started,
+            state.interactor.label(),
+            state.model,
+            state.seconds,
+            state.done as i64,
+            state.failed_segments as i64,
+            state.failed as i64,
+            state.kept as i64
+        ],
+    );
 }
 
 pub fn read_state(dir: &Path) -> Option<PersistedState> {
-    let text = std::fs::read_to_string(state_path(dir)).ok()?;
-    serde_json::from_str(&text).ok()
+    let (root, name) = (state_root(dir)?, recording_name(dir)?);
+    let store = crate::store::Store::open(root).ok()?;
+    let conn = store.conn();
+    conn.query_row(
+        "SELECT id, started, interactor, model, seconds, done, failed_segments, failed, kept
+         FROM recordings WHERE name = ?1",
+        [name],
+        |row| {
+            Ok(PersistedState {
+                id: row.get::<_, i64>(0)? as u64,
+                started: row.get(1)?,
+                interactor: crate::state::InteractorKind::from_label(&row.get::<_, String>(2)?),
+                model: row.get(3)?,
+                seconds: row.get(4)?,
+                done: row.get::<_, i64>(5)? != 0,
+                failed_segments: row.get::<_, i64>(6)? as usize,
+                failed: row.get::<_, i64>(7)? != 0,
+                kept: row.get::<_, i64>(8)? != 0,
+            })
+        },
+    )
+    .ok()
+}
+
+fn delete_state(dir: &Path) {
+    let (Some(root), Some(name)) = (state_root(dir), recording_name(dir)) else {
+        return;
+    };
+    if let Ok(store) = crate::store::Store::open(root) {
+        let _ = store.conn().execute("DELETE FROM recordings WHERE name = ?1", [name]);
+    }
 }
 
 /// Recording directories that were never finished: the daemon died mid-recording.
@@ -144,6 +201,7 @@ pub fn clean_finished(root: &Path) {
         };
         if trash {
             let _ = std::fs::remove_dir_all(&dir);
+            delete_state(&dir);
         }
     }
 }
@@ -211,7 +269,10 @@ fn run(
         Ok(wav) => wav,
         Err(e) => {
             log::log(&format!("session {}: cannot write audio: {e:#}", start.id));
-            let _ = events.send(AppEvent::Failed(format!("cannot write the recording: {e:#}")));
+            let _ = events.send(AppEvent::Failed(crate::i18n::trf(
+                "Could not write the recording: {error}",
+                &[("error", &format!("{e:#}"))],
+            )));
             return;
         }
     };
@@ -611,10 +672,14 @@ fn run_file(
         return;
     }
     if let Err(e) = result {
+        let message = crate::i18n::trf(
+            "Could not read the file: {error}",
+            &[("error", &format!("{e:#}"))],
+        );
         snapshot.running = false;
-        snapshot.error = Some(format!("{e:#}"));
+        snapshot.error = Some(message.clone());
         ipc::write_file_state(&dirs.root, &snapshot);
-        let _ = events.send(AppEvent::Failed(format!("{e:#}")));
+        let _ = events.send(AppEvent::Failed(message));
         return;
     }
     if let Some(tail) = segmenter.flush() {

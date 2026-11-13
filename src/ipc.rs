@@ -1,13 +1,120 @@
-//! File-based IPC between the daemon and the UI process. Everything lives in
-//! the app data directory so both processes already know the paths, and all
-//! writes are atomic (temp file + rename) so readers never see torn content.
+//! Cross-process runtime state, kept in SQLite next to the data rather than in
+//! JSON files.
+//!
+//! The daemon publishes what it is doing (status, download progress, the open
+//! session, live text), the window publishes requests, and both sides read the
+//! same `kv` table. Values are a short line-based encoding, not JSON; the
+//! settings file is the only JSON the app keeps.
 
-use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-/// Serializable mirror of `crate::state::DownloadProgress` (the in-process
-/// version carries a cancellation flag that cannot cross process borders).
-#[derive(Serialize, Deserialize, Default, Clone, Debug)]
+use crate::store::Store;
+
+/// One value line: `key<TAB>value`, with control characters escaped so a text
+/// field may contain line breaks.
+fn escape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+fn unescape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('\\') => out.push('\\'),
+            Some(other) => out.push(other),
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+fn encode(fields: &[(&str, String)]) -> String {
+    let mut out = String::new();
+    for (index, (key, value)) in fields.iter().enumerate() {
+        if index > 0 {
+            out.push('\n');
+        }
+        out.push_str(key);
+        out.push('\t');
+        out.push_str(&escape(value));
+    }
+    out
+}
+
+fn decode(text: &str) -> std::collections::BTreeMap<String, String> {
+    let mut map = std::collections::BTreeMap::new();
+    for line in text.lines() {
+        if let Some((key, value)) = line.split_once('\t') {
+            map.insert(key.to_string(), unescape(value));
+        }
+    }
+    map
+}
+
+fn field(map: &std::collections::BTreeMap<String, String>, key: &str) -> String {
+    map.get(key).cloned().unwrap_or_default()
+}
+
+fn number<T: std::str::FromStr>(map: &std::collections::BTreeMap<String, String>, key: &str) -> T
+where
+    T: Default,
+{
+    field(map, key).parse().unwrap_or_default()
+}
+
+fn open(root: &Path) -> Option<Store> {
+    match Store::open(root) {
+        Ok(store) => Some(store),
+        Err(error) => {
+            crate::log::log(&format!("runtime state database: {error:#}"));
+            None
+        }
+    }
+}
+
+fn write_value(root: &Path, key: &str, value: &str) {
+    if let Some(store) = open(root) {
+        let _ = store.kv_put(key, value);
+    }
+}
+
+fn read_value(root: &Path, key: &str) -> Option<String> {
+    open(root)?.kv_get(key).ok().flatten().filter(|value| !value.is_empty())
+}
+
+/// Write via a temp file + rename so concurrent readers never see a partial
+/// file. Only the settings file and the network script's plain-text result use
+/// this now.
+pub fn atomic_write(path: impl AsRef<Path>, bytes: &[u8]) {
+    let path = path.as_ref();
+    let tmp = path.with_extension("tmp");
+    if std::fs::write(&tmp, bytes).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Model download progress (daemon → UI).
+
+#[derive(Default, Clone, Debug, PartialEq)]
 pub struct DownloadSnapshot {
     pub model: String,
     pub file: usize,
@@ -20,63 +127,71 @@ pub struct DownloadSnapshot {
     pub error: Option<String>,
 }
 
-pub fn download_request_path(root: &Path) -> PathBuf {
-    root.join("download.request")
-}
-
-pub fn download_cancel_path(root: &Path) -> PathBuf {
-    root.join("download.cancel")
-}
-
-pub fn download_state_path(root: &Path) -> PathBuf {
-    root.join("download.state.json")
-}
-
 pub fn write_download_request(root: &Path, model_id: &str) {
-    atomic_write(download_request_path(root), model_id.as_bytes());
+    write_value(root, "request.download", model_id);
 }
 
-/// Returns the requested model id and consumes the request file.
+/// Returns the requested model id and consumes the request.
 pub fn take_download_request(root: &Path) -> Option<String> {
-    let path = download_request_path(root);
-    let content = std::fs::read_to_string(&path).ok()?;
-    let _ = std::fs::remove_file(&path);
-    let id = content.trim().to_string();
+    let store = open(root)?;
+    let id = store.kv_take("request.download")?.trim().to_string();
     (!id.is_empty()).then_some(id)
 }
 
 pub fn request_cancel(root: &Path) {
-    let _ = std::fs::File::create(download_cancel_path(root));
+    write_value(root, "request.download_cancel", "1");
 }
 
 pub fn cancel_requested(root: &Path) -> bool {
-    download_cancel_path(root).exists()
+    read_value(root, "request.download_cancel").is_some()
 }
 
 pub fn clear_cancel(root: &Path) {
-    let _ = std::fs::remove_file(download_cancel_path(root));
-}
-
-pub fn write_download_state(root: &Path, snap: &DownloadSnapshot) {
-    if let Ok(text) = serde_json::to_string(snap) {
-        atomic_write(download_state_path(root), text.as_bytes());
+    if let Some(store) = open(root) {
+        let _ = store.kv_delete("request.download_cancel");
     }
 }
 
+pub fn write_download_state(root: &Path, snap: &DownloadSnapshot) {
+    let text = encode(&[
+        ("model", snap.model.clone()),
+        ("file", snap.file.to_string()),
+        ("files", snap.files.to_string()),
+        ("downloaded", snap.downloaded.to_string()),
+        ("total", snap.total.map(|value| value.to_string()).unwrap_or_default()),
+        ("done_bytes", snap.done_bytes.to_string()),
+        ("done_total", snap.done_total.to_string()),
+        ("done", (snap.done as u8).to_string()),
+        ("error", snap.error.clone().unwrap_or_default()),
+    ]);
+    write_value(root, "runtime.download", &text);
+}
+
 pub fn read_download_state(root: &Path) -> Option<DownloadSnapshot> {
-    let text = std::fs::read_to_string(download_state_path(root)).ok()?;
-    serde_json::from_str(&text).ok()
+    let map = decode(&read_value(root, "runtime.download")?);
+    Some(DownloadSnapshot {
+        model: field(&map, "model"),
+        file: number(&map, "file"),
+        files: number(&map, "files"),
+        downloaded: number(&map, "downloaded"),
+        total: field(&map, "total").parse().ok(),
+        done_bytes: number(&map, "done_bytes"),
+        done_total: number(&map, "done_total"),
+        done: field(&map, "done") == "1",
+        error: Some(field(&map, "error")).filter(|value| !value.is_empty()),
+    })
 }
 
 pub fn remove_download_state(root: &Path) {
-    let _ = std::fs::remove_file(download_state_path(root));
+    if let Some(store) = open(root) {
+        let _ = store.kv_delete("runtime.download");
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Voice Button API server status (daemon → UI), so the API tab can show
-// running/stopped and the address that is actually bound.
+// Voice Button API server status (daemon → UI).
 
-#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq, Eq)]
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
 pub struct ApiSnapshot {
     pub running: bool,
     pub host: String,
@@ -95,26 +210,30 @@ impl From<ApiSnapshot> for crate::state::ApiStatus {
     }
 }
 
-pub fn api_state_path(root: &Path) -> PathBuf {
-    root.join("api.state.json")
-}
-
 pub fn write_api_state(root: &Path, snap: &ApiSnapshot) {
-    if let Ok(text) = serde_json::to_string(snap) {
-        atomic_write(api_state_path(root), text.as_bytes());
-    }
+    let text = encode(&[
+        ("running", (snap.running as u8).to_string()),
+        ("host", snap.host.clone()),
+        ("port", snap.port.to_string()),
+        ("error", snap.error.clone().unwrap_or_default()),
+    ]);
+    write_value(root, "runtime.api", &text);
 }
 
 pub fn read_api_state(root: &Path) -> Option<ApiSnapshot> {
-    let text = std::fs::read_to_string(api_state_path(root)).ok()?;
-    serde_json::from_str(&text).ok()
+    let map = decode(&read_value(root, "runtime.api")?);
+    Some(ApiSnapshot {
+        running: field(&map, "running") == "1",
+        host: field(&map, "host"),
+        port: number(&map, "port"),
+        error: Some(field(&map, "error")).filter(|value| !value.is_empty()),
+    })
 }
 
 // ---------------------------------------------------------------------------
-// The phone server (daemon → UI): whether it listens, on which port, where the
-// QR points, and whether the one paired phone is connected.
+// The phone server (daemon → UI).
 
-#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq, Eq)]
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
 pub struct SiteSnapshot {
     pub running: bool,
     pub port: u16,
@@ -123,153 +242,137 @@ pub struct SiteSnapshot {
     pub paired: bool,
 }
 
-pub fn site_state_path(root: &Path) -> PathBuf {
-    root.join("site.state.json")
-}
-
 pub fn write_site_state(root: &Path, snap: &SiteSnapshot) {
-    if let Ok(text) = serde_json::to_string(snap) {
-        atomic_write(site_state_path(root), text.as_bytes());
-    }
+    let text = encode(&[
+        ("running", (snap.running as u8).to_string()),
+        ("port", snap.port.to_string()),
+        ("url", snap.url.clone()),
+        ("paired", (snap.paired as u8).to_string()),
+    ]);
+    write_value(root, "runtime.site", &text);
 }
 
 pub fn read_site_state(root: &Path) -> Option<SiteSnapshot> {
-    let text = std::fs::read_to_string(site_state_path(root)).ok()?;
-    serde_json::from_str(&text).ok()
+    let map = decode(&read_value(root, "runtime.site")?);
+    Some(SiteSnapshot {
+        running: field(&map, "running") == "1",
+        port: number(&map, "port"),
+        url: field(&map, "url"),
+        paired: field(&map, "paired") == "1",
+    })
 }
 
 /// Ask the daemon for a fresh pairing token (the "Connect phone" button).
 pub fn request_site_pair(root: &Path) {
-    atomic_write(root.join("site.pair.request"), b"1");
+    write_value(root, "request.site_pair", "1");
 }
 
 pub fn take_site_pair_request(root: &Path) -> bool {
-    let path = root.join("site.pair.request");
-    if path.exists() {
-        let _ = std::fs::remove_file(path);
-        true
-    } else {
-        false
-    }
+    open(root)
+        .and_then(|store| store.kv_take("request.site_pair"))
+        .is_some()
 }
 
 /// Ask the daemon to disconnect the phone (the "Disconnect" button).
 pub fn request_site_revoke(root: &Path) {
-    atomic_write(root.join("site.revoke.request"), b"1");
+    write_value(root, "request.site_revoke", "1");
 }
 
 pub fn take_site_revoke_request(root: &Path) -> bool {
-    let path = root.join("site.revoke.request");
-    if path.exists() {
-        let _ = std::fs::remove_file(path);
-        true
-    } else {
-        false
-    }
+    open(root)
+        .and_then(|store| store.kv_take("request.site_revoke"))
+        .is_some()
 }
 
 /// Store or replace the Telegram bot token without writing it to config.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TelegramTokenRequest {
     pub token: String,
-    #[serde(default)]
     pub proxy: String,
 }
 
 pub fn request_telegram_token(root: &Path, token: &str, proxy: &str) {
-    let request = TelegramTokenRequest {
-        token: token.to_string(),
-        proxy: proxy.to_string(),
-    };
-    if let Ok(text) = serde_json::to_string(&request) {
-        atomic_write(root.join("telegram.token.request"), text.as_bytes());
-    }
+    let text = encode(&[
+        ("token", token.to_string()),
+        ("proxy", proxy.to_string()),
+    ]);
+    write_value(root, "request.telegram_token", &text);
 }
 
 pub fn take_telegram_token_request(root: &Path) -> Option<TelegramTokenRequest> {
-    let path = root.join("telegram.token.request");
-    let text = std::fs::read_to_string(&path).ok()?;
-    let _ = std::fs::remove_file(&path);
-    serde_json::from_str(&text).ok()
+    let store = open(root)?;
+    let map = decode(&store.kv_take("request.telegram_token")?);
+    Some(TelegramTokenRequest {
+        token: field(&map, "token"),
+        proxy: field(&map, "proxy"),
+    })
 }
 
 pub fn request_telegram_reset(root: &Path) {
-    atomic_write(root.join("telegram.reset.request"), b"1");
+    write_value(root, "request.telegram_reset", "1");
 }
 
 pub fn take_telegram_reset(root: &Path) -> bool {
-    let path = root.join("telegram.reset.request");
-    if path.exists() {
-        let _ = std::fs::remove_file(&path);
-        true
-    } else {
-        false
-    }
+    open(root)
+        .and_then(|store| store.kv_take("request.telegram_reset"))
+        .is_some()
 }
 
-/// Ask the daemon to archive or unarchive one monolog. The window never writes
-/// `site/db.json`: it leaves the request and the daemon applies it.
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+/// Ask the daemon to archive or unarchive one monolog.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SiteArchiveRequest {
     pub monolog: u64,
     pub archived: bool,
 }
 
 pub fn request_site_archive(root: &Path, monolog: u64, archived: bool) {
-    let request = SiteArchiveRequest { monolog, archived };
-    if let Ok(text) = serde_json::to_string(&request) {
-        atomic_write(root.join("site.archive.request"), text.as_bytes());
-    }
+    let text = encode(&[
+        ("monolog", monolog.to_string()),
+        ("archived", (archived as u8).to_string()),
+    ]);
+    write_value(root, "request.site_archive", &text);
 }
 
 pub fn take_site_archive_request(root: &Path) -> Option<SiteArchiveRequest> {
-    let path = root.join("site.archive.request");
-    let text = std::fs::read_to_string(&path).ok()?;
-    let _ = std::fs::remove_file(&path);
-    serde_json::from_str(&text).ok()
+    let store = open(root)?;
+    let map = decode(&store.kv_take("request.site_archive")?);
+    Some(SiteArchiveRequest {
+        monolog: number(&map, "monolog"),
+        archived: field(&map, "archived") == "1",
+    })
 }
 
-/// Ask the daemon to open or close the internet access for the phone. The
-/// script needs an elevated PowerShell, so the request is a file and the daemon
-/// runs it on its own thread.
+/// Ask the daemon to open or close the internet access for the phone.
 pub fn request_site_network(root: &Path, enable: bool) {
-    let name = if enable {
-        "site.net.enable"
-    } else {
-        "site.net.disable"
-    };
-    atomic_write(root.join(name), b"1");
+    write_value(
+        root,
+        "request.site_network",
+        if enable { "enable" } else { "disable" },
+    );
 }
 
 pub fn take_site_network(root: &Path) -> Option<bool> {
-    let enable = root.join("site.net.enable");
-    if enable.exists() {
-        let _ = std::fs::remove_file(enable);
-        let _ = std::fs::remove_file(root.join("site.net.disable"));
-        return Some(true);
-    }
-    let disable = root.join("site.net.disable");
-    if disable.exists() {
-        let _ = std::fs::remove_file(disable);
-        return Some(false);
-    }
-    None
+    let value = open(root)?.kv_take("request.site_network")?;
+    Some(value == "enable")
 }
 
 /// The internet-access script is running right now (UAC prompt or UPnP).
 pub fn set_site_network_busy(root: &Path, busy: bool) {
-    set_flag_file(root.join("site.network.busy"), busy);
+    if busy {
+        write_value(root, "runtime.site_network_busy", "1");
+    } else if let Some(store) = open(root) {
+        let _ = store.kv_delete("runtime.site_network_busy");
+    }
 }
 
 pub fn site_network_busy(root: &Path) -> bool {
-    root.join("site.network.busy").exists()
+    read_value(root, "runtime.site_network_busy").is_some()
 }
 
 // ---------------------------------------------------------------------------
-// The recording session (daemon → UI), so the window can show that a recording
-// was started by the API server. Removed when the session ends.
+// The recording session (daemon → UI).
 
-#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq, Eq)]
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
 pub struct SessionSnapshot {
     pub id: u64,
     pub owner: crate::state::InteractorKind,
@@ -296,102 +399,42 @@ impl From<SessionSnapshot> for crate::state::SessionView {
     }
 }
 
-pub fn session_path(root: &Path) -> PathBuf {
-    root.join("session.json")
-}
-
-/// Publish the open session, or remove the file when it is over.
+/// Publish the open session, or clear it when it is over.
 pub fn write_session(root: &Path, session: Option<&crate::state::Session>) {
     match session {
         Some(session) => {
-            if let Ok(text) = serde_json::to_string(&SessionSnapshot::from(session)) {
-                atomic_write(session_path(root), text.as_bytes());
-            }
+            let snapshot = SessionSnapshot::from(session);
+            let text = encode(&[
+                ("id", snapshot.id.to_string()),
+                ("owner", format!("{:?}", snapshot.owner)),
+                ("model", snapshot.model.clone().unwrap_or_default()),
+            ]);
+            write_value(root, "runtime.session", &text);
         }
         None => {
-            let _ = std::fs::remove_file(session_path(root));
+            if let Some(store) = open(root) {
+                let _ = store.kv_delete("runtime.session");
+            }
         }
     }
 }
 
 pub fn read_session(root: &Path) -> Option<SessionSnapshot> {
-    let text = std::fs::read_to_string(session_path(root)).ok()?;
-    serde_json::from_str(&text).ok()
+    let map = decode(&read_value(root, "runtime.session")?);
+    let owner = match field(&map, "owner").as_str() {
+        "Server" => crate::state::InteractorKind::Server,
+        _ => crate::state::InteractorKind::User,
+    };
+    Some(SessionSnapshot {
+        id: number(&map, "id"),
+        owner,
+        model: Some(field(&map, "model")).filter(|value| !value.is_empty()),
+    })
 }
 
 // ---------------------------------------------------------------------------
-// Recording status (daemon → UI), so the UI can lock model/backend switching
-// while recording or transcribing.
+// Recording status (daemon → UI).
 
-pub fn status_path(root: &Path) -> PathBuf {
-    root.join("status.txt")
-}
-
-/// While the Settings window captures a shortcut, the daemon releases its own
-/// global hotkey so the very combination being typed is not swallowed by it.
-pub fn hotkey_capture_path(root: &Path) -> PathBuf {
-    root.join("hotkey.capture")
-}
-
-/// Same as the above but for the append-to-last-message shortcut.
-pub fn append_hotkey_capture_path(root: &Path) -> PathBuf {
-    root.join("hotkey2.capture")
-}
-
-/// Same as the above but for the record-and-paste shortcut.
-pub fn paste_hotkey_capture_path(root: &Path) -> PathBuf {
-    root.join("hotkey3.capture")
-}
-
-pub fn set_hotkey_capture(root: &Path, active: bool) {
-    set_flag_file(hotkey_capture_path(root), active);
-}
-
-pub fn hotkey_capture_active(root: &Path) -> bool {
-    hotkey_capture_path(root).exists()
-}
-
-pub fn set_append_hotkey_capture(root: &Path, active: bool) {
-    set_flag_file(append_hotkey_capture_path(root), active);
-}
-
-pub fn append_hotkey_capture_active(root: &Path) -> bool {
-    append_hotkey_capture_path(root).exists()
-}
-
-pub fn set_paste_hotkey_capture(root: &Path, active: bool) {
-    set_flag_file(paste_hotkey_capture_path(root), active);
-}
-
-pub fn paste_hotkey_capture_active(root: &Path) -> bool {
-    paste_hotkey_capture_path(root).exists()
-}
-
-fn set_flag_file(path: PathBuf, active: bool) {
-    if active {
-        let _ = std::fs::File::create(path);
-    } else {
-        let _ = std::fs::remove_file(path);
-    }
-}
-
-/// The daemon watches the physical keyboard while the Settings window captures a
-/// shortcut and writes the result here; the window may not hold keyboard focus.
-pub fn hotkey_result_path(root: &Path) -> PathBuf {
-    root.join("hotkey.result")
-}
-
-pub fn write_hotkey_result(root: &Path, text: &str) {
-    atomic_write(hotkey_result_path(root), text.as_bytes());
-}
-
-pub fn take_hotkey_result(root: &Path) -> Option<String> {
-    let path = hotkey_result_path(root);
-    let text = std::fs::read_to_string(&path).ok()?;
-    let _ = std::fs::remove_file(&path);
-    let text = text.trim().to_string();
-    (!text.is_empty()).then_some(text)
-}
 pub fn write_status(root: &Path, status: crate::state::Status) {
     let text = match status {
         crate::state::Status::Idle => "idle",
@@ -401,12 +444,11 @@ pub fn write_status(root: &Path, status: crate::state::Status) {
         crate::state::Status::File => "file",
         crate::state::Status::NoModel => "nomodel",
     };
-    atomic_write(status_path(root), text.as_bytes());
+    write_value(root, "runtime.status", text);
 }
 
 pub fn read_status(root: &Path) -> Option<crate::state::Status> {
-    let text = std::fs::read_to_string(status_path(root)).ok()?;
-    Some(match text.trim() {
+    Some(match read_value(root, "runtime.status")?.trim() {
         "recording" => crate::state::Status::Recording,
         "transcribing" => crate::state::Status::Transcribing,
         "recovering" => crate::state::Status::Recovering,
@@ -417,39 +459,97 @@ pub fn read_status(root: &Path) -> Option<crate::state::Status> {
 }
 
 // ---------------------------------------------------------------------------
-// Live (streaming) transcription, published by the daemon while recording so
-// the UI can show words as they are spoken.
+// Shortcut capture flags (UI → daemon).
 
-#[derive(Serialize, Deserialize, Default, Clone, Debug)]
+fn set_flag(root: &Path, key: &str, active: bool) {
+    if active {
+        write_value(root, key, "1");
+    } else if let Some(store) = open(root) {
+        let _ = store.kv_delete(key);
+    }
+}
+
+fn flag(root: &Path, key: &str) -> bool {
+    read_value(root, key).is_some()
+}
+
+pub fn set_hotkey_capture(root: &Path, active: bool) {
+    set_flag(root, "runtime.capture.record", active);
+}
+
+pub fn hotkey_capture_active(root: &Path) -> bool {
+    flag(root, "runtime.capture.record")
+}
+
+pub fn set_append_hotkey_capture(root: &Path, active: bool) {
+    set_flag(root, "runtime.capture.append", active);
+}
+
+pub fn append_hotkey_capture_active(root: &Path) -> bool {
+    flag(root, "runtime.capture.append")
+}
+
+pub fn set_paste_hotkey_capture(root: &Path, active: bool) {
+    set_flag(root, "runtime.capture.paste", active);
+}
+
+pub fn paste_hotkey_capture_active(root: &Path) -> bool {
+    flag(root, "runtime.capture.paste")
+}
+
+/// The daemon watches the physical keyboard while the Settings window captures a
+/// shortcut and writes the result here; the window may not hold keyboard focus.
+pub fn write_hotkey_result(root: &Path, text: &str) {
+    write_value(root, "runtime.hotkey_result", text);
+}
+
+pub fn take_hotkey_result(root: &Path) -> Option<String> {
+    let text = open(root)?.kv_take("runtime.hotkey_result")?.trim().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
+pub fn clear_hotkey_result(root: &Path) {
+    if let Some(store) = open(root) {
+        let _ = store.kv_delete("runtime.hotkey_result");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Live (streaming) transcription, published while recording.
+
+#[derive(Default, Clone, Debug)]
 pub struct LiveView {
     pub text: String,
     /// Recording start, milliseconds since UNIX epoch (for elapsed time).
     pub started: i64,
 }
 
-pub fn live_path(root: &Path) -> PathBuf {
-    root.join("live.json")
-}
-
 pub fn write_live(root: &Path, view: &LiveView) {
-    if let Ok(text) = serde_json::to_string(view) {
-        atomic_write(live_path(root), text.as_bytes());
-    }
+    let text = encode(&[
+        ("text", view.text.clone()),
+        ("started", view.started.to_string()),
+    ]);
+    write_value(root, "runtime.live", &text);
 }
 
 pub fn read_live(root: &Path) -> Option<LiveView> {
-    let text = std::fs::read_to_string(live_path(root)).ok()?;
-    serde_json::from_str(&text).ok()
+    let map = decode(&read_value(root, "runtime.live")?);
+    Some(LiveView {
+        text: field(&map, "text"),
+        started: number(&map, "started"),
+    })
 }
 
 pub fn clear_live(root: &Path) {
-    let _ = std::fs::remove_file(live_path(root));
+    if let Some(store) = open(root) {
+        let _ = store.kv_delete("runtime.live");
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Imported file transcription (UI → daemon → UI).
 
-#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct FileSnapshot {
     pub path: String,
     pub name: String,
@@ -461,86 +561,77 @@ pub struct FileSnapshot {
     pub cancelled: bool,
 }
 
-pub fn file_request_path(root: &Path) -> PathBuf {
-    root.join("file.request")
-}
-
 pub fn write_file_request(root: &Path, path: &str) {
-    atomic_write(file_request_path(root), path.as_bytes());
+    write_value(root, "request.file", path);
 }
 
 /// Returns the requested file path and consumes the request.
 pub fn take_file_request(root: &Path) -> Option<String> {
-    let path = file_request_path(root);
-    let content = std::fs::read_to_string(&path).ok()?;
-    let _ = std::fs::remove_file(&path);
-    let content = content.trim().to_string();
-    (!content.is_empty()).then_some(content)
-}
-
-pub fn file_cancel_path(root: &Path) -> PathBuf {
-    root.join("file.cancel")
+    let store = open(root)?;
+    let path = store.kv_take("request.file")?.trim().to_string();
+    (!path.is_empty()).then_some(path)
 }
 
 pub fn request_file_cancel(root: &Path) {
-    let _ = std::fs::File::create(file_cancel_path(root));
+    write_value(root, "request.file_cancel", "1");
 }
 
 pub fn file_cancel_requested(root: &Path) -> bool {
-    file_cancel_path(root).exists()
+    read_value(root, "request.file_cancel").is_some()
 }
 
 pub fn clear_file_cancel(root: &Path) {
-    let _ = std::fs::remove_file(file_cancel_path(root));
-}
-
-pub fn file_state_path(root: &Path) -> PathBuf {
-    root.join("file.state.json")
+    if let Some(store) = open(root) {
+        let _ = store.kv_delete("request.file_cancel");
+    }
 }
 
 pub fn write_file_state(root: &Path, snapshot: &FileSnapshot) {
-    if let Ok(text) = serde_json::to_string(snapshot) {
-        atomic_write(file_state_path(root), text.as_bytes());
-    }
+    let text = encode(&[
+        ("path", snapshot.path.clone()),
+        ("name", snapshot.name.clone()),
+        ("done_seconds", snapshot.done_seconds.to_string()),
+        ("total_seconds", snapshot.total_seconds.to_string()),
+        ("text", snapshot.text.clone()),
+        ("error", snapshot.error.clone().unwrap_or_default()),
+        ("running", (snapshot.running as u8).to_string()),
+        ("cancelled", (snapshot.cancelled as u8).to_string()),
+    ]);
+    write_value(root, "runtime.file", &text);
 }
 
 pub fn read_file_state(root: &Path) -> Option<FileSnapshot> {
-    let text = std::fs::read_to_string(file_state_path(root)).ok()?;
-    serde_json::from_str(&text).ok()
+    let map = decode(&read_value(root, "runtime.file")?);
+    Some(FileSnapshot {
+        path: field(&map, "path"),
+        name: field(&map, "name"),
+        done_seconds: number(&map, "done_seconds"),
+        total_seconds: number(&map, "total_seconds"),
+        text: field(&map, "text"),
+        error: Some(field(&map, "error")).filter(|value| !value.is_empty()),
+        running: field(&map, "running") == "1",
+        cancelled: field(&map, "cancelled") == "1",
+    })
 }
 
 pub fn remove_file_state(root: &Path) {
-    let _ = std::fs::remove_file(file_state_path(root));
+    if let Some(store) = open(root) {
+        let _ = store.kv_delete("runtime.file");
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Recording toggle requests from the UI or from the API server.
-
-pub fn record_request_path(root: &Path) -> PathBuf {
-    root.join("record.request")
-}
+// Recording toggle requests.
 
 /// Written by the UI (human interactor) or by the API server (API interactor).
-/// The content is either an interactor JSON object or legacy plain text.
-pub fn write_record_request(root: &Path, interactor_json: &str) {
-    atomic_write(record_request_path(root), interactor_json.as_bytes());
+/// The value is the interactor kind, `user` or `server`.
+pub fn write_record_request(root: &Path, interactor: &str) {
+    write_value(root, "request.record", interactor);
 }
 
-/// Returns the pending interactor (or legacy content) and consumes the request.
+/// Returns the pending interactor and consumes the request.
 pub fn take_record_request(root: &Path) -> Option<String> {
-    let path = record_request_path(root);
-    let content = std::fs::read_to_string(&path).ok()?;
-    let _ = std::fs::remove_file(&path);
-    let content = content.trim().to_string();
-    (!content.is_empty()).then_some(content)
-}
-
-/// Write via a temp file + rename so concurrent readers never see a partial
-/// file.
-pub fn atomic_write(path: impl AsRef<Path>, bytes: &[u8]) {
-    let path = path.as_ref();
-    let tmp = path.with_extension("tmp");
-    if std::fs::write(&tmp, bytes).is_ok() {
-        let _ = std::fs::rename(&tmp, path);
-    }
+    let store = open(root)?;
+    let value = store.kv_take("request.record")?.trim().to_string();
+    (!value.is_empty()).then_some(value)
 }

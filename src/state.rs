@@ -76,6 +76,13 @@ impl InteractorKind {
             InteractorKind::Server => "server",
         }
     }
+
+    pub fn from_label(value: &str) -> Self {
+        match value {
+            "server" => InteractorKind::Server,
+            _ => InteractorKind::User,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -270,7 +277,7 @@ pub struct Data {
     /// The recording session that is currently open (daemon-side, authoritative);
     /// it stays set while the recording is being transcribed.
     pub session: Option<Session>,
-    /// Same session, mirrored into the UI process through `session.json`.
+    /// Same session, mirrored into the UI process through SQLite.
     pub session_view: Option<SessionView>,
     /// A crash-interrupted recording is being transcribed: the microphone is
     /// blocked until it is done.
@@ -280,24 +287,21 @@ pub struct Data {
     pub stream: Option<StreamSession>,
     /// Last result produced for an API session.
     pub api_result: Option<ApiResult>,
-    /// Progress of an imported file, mirrored from `file.state.json`.
+    /// Progress of an imported file, mirrored from SQLite.
     pub file: Option<crate::ipc::FileSnapshot>,
     /// When the file state was read last, so the tab polls at a sane rate.
     pub file_seen: Option<std::time::Instant>,
-    /// Runtime state of the phone server, mirrored from `site.state.json`.
+    /// Runtime state of the phone server, mirrored from SQLite.
     pub site: Option<crate::ipc::SiteSnapshot>,
     /// Tasks running behind the person's back right now. The tray icon turns
     /// violet and no sound is played for any of them; the phone is one, and
     /// more will come, so this is a set and not a flag.
     pub background: std::collections::BTreeSet<BackgroundJob>,
     /// A pairing link the window can show as a QR code, read from
-    /// `site/db.json` (the daemon owns that file; the window only mirrors the
+    /// the phone database (the daemon owns it; the window only mirrors the
     /// client record).
     pub site_pairing: Option<SitePairing>,
-    /// The monologs and their messages, mirrored from the same `site/db.json`.
-    pub site_monologs: Option<SiteMonologs>,
-    /// What the internet-access script did last time, read from
-    /// `site/network.json`.
+    /// What the internet-access script did last time, read from SQLite.
     pub site_network: Option<crate::site::network::State>,
     /// The script is running right now.
     pub site_network_busy: bool,
@@ -351,69 +355,6 @@ impl SitePairing {
     }
 }
 
-/// One spoken take of a monolog, as the window shows it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SiteMessage {
-    pub id: u64,
-    /// The phone's clock when the take started.
-    pub recorded: String,
-    pub stage: crate::site::monolog::Stage,
-    pub text: String,
-}
-
-/// A named thread of dictations with its messages, mirrored from `site/db.json`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SiteMonolog {
-    pub id: u64,
-    pub name: String,
-    pub archived: bool,
-    pub created: String,
-    /// Messages that are not deleted, oldest first.
-    pub messages: Vec<SiteMessage>,
-}
-
-impl SiteMonolog {
-    pub fn count(&self) -> usize {
-        self.messages.len()
-    }
-}
-
-/// The window's copy of everything the phone dictated. The daemon owns the
-/// file; this type is only read from it, never written back.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct SiteMonologs {
-    pub monologs: Vec<SiteMonolog>,
-}
-
-impl SiteMonologs {
-    /// Copy the daemon's database into the window-side type. Deleted messages
-    /// and the client record stay out: the window shows what the person can
-    /// still read.
-    pub fn from_db(db: &crate::site::db::Db) -> Self {
-        let monologs = db
-            .monologs(true)
-            .into_iter()
-            .map(|monolog| SiteMonolog {
-                messages: db
-                    .messages(Some(monolog.id))
-                    .into_iter()
-                    .map(|message| SiteMessage {
-                        id: message.id,
-                        recorded: message.recorded.clone(),
-                        stage: message.stage,
-                        text: message.text.clone(),
-                    })
-                    .collect(),
-                id: monolog.id,
-                name: monolog.name,
-                archived: monolog.archived,
-                created: monolog.created,
-            })
-            .collect();
-        Self { monologs }
-    }
-}
-
 pub struct Shared {
     data: Mutex<Data>,
 }
@@ -451,7 +392,6 @@ impl Shared {
                 site: None,
                 background: std::collections::BTreeSet::new(),
                 site_pairing: None,
-                site_monologs: None,
                 site_network: None,
                 site_network_busy: false,
                 stream: None,
@@ -526,13 +466,14 @@ pub fn load_history(root: &std::path::Path) -> History {
 
 #[cfg(test)]
 mod tests {
-    use super::{Interactor, ModelChoice, Session, SiteMonologs};
+    use super::{Interactor, ModelChoice, Session};
     use crate::config::{Backend, Config};
-    use crate::site::db::Db;
+    use crate::site::db::{message_count, message_page, monolog_count, monolog_page, Db};
     use crate::site::monolog::Stage;
+    use crate::store::Store;
 
     #[test]
-    fn the_window_mirror_reads_saved_monologs_and_messages() {
+    fn the_window_reads_saved_monologs_and_messages_by_page() {
         let root = std::env::temp_dir().join(format!("vb-state-mirror-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
@@ -559,16 +500,16 @@ mod tests {
             db.save().unwrap();
         }
         // The window opens the file the daemon left, never its own copy.
-        let reopened = Db::open(&root).unwrap();
-        let mirror = SiteMonologs::from_db(&reopened);
-        assert_eq!(mirror.monologs.len(), 1);
-        let monolog = &mirror.monologs[0];
+        let store = Store::open(&root).unwrap();
+        assert_eq!(monolog_count(&store, true, ""), 1);
+        let monolog = &monolog_page(&store, true, "", 0, 10)[0];
         assert_eq!(monolog.name, "Работа");
         assert!(monolog.archived, "an archived monolog is still listed");
-        assert_eq!(monolog.count(), 1, "a deleted message is not counted");
-        assert_eq!(monolog.messages.len(), 1);
-        assert_eq!(monolog.messages[0].text, "первый текст");
-        assert_eq!(monolog.messages[0].stage, Stage::Done);
+        assert_eq!(monolog.count, 1, "a deleted message is not counted");
+        assert_eq!(message_count(&store, monolog.id), 1);
+        let message = &message_page(&store, monolog.id, 0, 10)[0];
+        assert_eq!(message.text, "первый текст");
+        assert_eq!(message.stage, Stage::Done);
         let _ = std::fs::remove_dir_all(root);
     }
 

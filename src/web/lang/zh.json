@@ -73,5 +73,8 @@
   "archive_read_only": "归档中的独白不能修改或录音，请先移出归档。",
   "update_app": "更新",
   "back": "返回",
-  "record": "录音"
+  "record": "录音",
+  "site_version": "站点版本",
+  "card_working": "电脑正在处理这个独白",
+  "card_unsent": "这里有一条消息尚未发送到电脑"
 }

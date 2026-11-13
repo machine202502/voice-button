@@ -1,12 +1,15 @@
 // What the phone knows without the computer.
 //
-// The page is local-first: the last monologs and messages it saw are kept in
-// IndexedDB, and a monolog the user makes while the computer is away waits in
-// the same place with a negative id. Nothing here talks to the network; the
-// sync loop writes what the computer confirmed, the page draws what is stored.
+// The page is local-first: the monologs and the message pages it saw are kept
+// in IndexedDB, and a monolog the user makes while the computer is away waits
+// in the same place with a negative id. Nothing here talks to the network; the
+// sync loop writes what the computer confirmed, the page reads pages and draws
+// the visible window.
 //
-// The decisions are pure functions, so the cases that matter (merge, negative
-// ids, the boot decision) are tested without a browser.
+// Messages are never read as one array: `messagePage` is the only read, and it
+// goes through the IndexedDB key range `['monolog', 'recorded', 'id']`. The
+// decisions that matter (merge, negative ids, paging) are pure functions testable
+// without a browser.
 
 /** Next free local id: negative, one less than the lowest one already used. */
 export function nextLocalId(keys = []) {
@@ -72,26 +75,48 @@ export function bootOutcome({ hasToken = false } = {}) {
 }
 
 /**
- * The cache itself, over two key/value bags from storage.mjs:
- * `monologs` keyed by id (negative for local) and `messages` keyed by monolog
- * id. Records are plain data so IndexedDB can clone them.
+ * The cache itself, over the `monologs` key/value bag and the paged `messages`
+ * store from storage.mjs. Records are plain data so IndexedDB can clone them.
  */
 export function createCache({ monologs, messages, now = () => new Date().toISOString() }) {
   const keys = async () => (await monologs.keys()).map(Number).filter(Number.isFinite);
 
+  /** Numeric server ids of one view, sorted by the server's own order. */
+  async function serverRecords(archived = false) {
+    const found = [];
+    for (const key of await monologs.keys()) {
+      const id = Number(key);
+      if (!Number.isFinite(id) || id < 0) continue;
+      const record = await monologs.get(key);
+      if (!record || Boolean(record.archived) !== Boolean(archived)) continue;
+      found.push({ ...record, id, local: false });
+    }
+    return found;
+  }
+
   return {
-    /** Monologs the computer confirmed, for the open list or the archive. */
-    async serverMonologs(archived = false) {
-      const found = [];
-      for (const key of await monologs.keys()) {
-        const id = Number(key);
-        if (!Number.isFinite(id) || id < 0) continue;
-        const record = await monologs.get(key);
-        if (!record || Boolean(record.archived) !== Boolean(archived)) continue;
-        found.push({ ...record, id, local: false });
-      }
-      found.sort((left, right) => right.id - left.id);
-      return found;
+    /**
+     * One page of the monolog list, merged with the unsent local ones.
+     *
+     * The monolog list is small enough to keep the whole index in memory while
+     * sorting (the messages are the big table). Only `limit` records are handed
+     * to the page.
+     */
+    async monologPage(archived = false, offset = 0, limit = 100) {
+      const size = Math.max(1, Math.min(500, Number(limit) || 100));
+      const start = Math.max(0, Number(offset) || 0);
+      const local = archived ? [] : await this.localMonologs();
+      const merged = mergeMonologs(await serverRecords(archived), local);
+      return {
+        monologs: merged.slice(start, start + size),
+        total: merged.length,
+        hasMore: start + size < merged.length,
+      };
+    },
+
+    /** How many server monologs of this view are on disk. */
+    async serverMonologCount(archived = false) {
+      return (await serverRecords(archived)).length;
     },
 
     /** Monologs made on the phone that still need the computer. */
@@ -202,23 +227,27 @@ export function createCache({ monologs, messages, now = () => new Date().toISOSt
     },
 
     /**
-     * Replace one view of the server list. Records of the other view stay, so
-     * opening the archive does not throw away the open list, and an archived
-     * monolog disappears from the open view when the computer stops listing it.
+     * Store one server page. Pages are upserts: a page never deletes records it
+     * did not contain. `complete` is for the one case the answer really is the
+     * whole view (the first page when the computer says `has_more` is false):
+     * then records of that view the computer no longer lists are dropped.
+     * Local monologs (negative ids) are never touched.
      */
-    async putServerMonologs(list = [], archived = false) {
+    async putServerMonologs(list = [], archived = false, { complete = false } = {}) {
       const incoming = new Map();
       for (const monolog of list) {
         const id = Number(monolog.id);
         if (!Number.isFinite(id) || id < 0) continue;
         incoming.set(id, monolog);
       }
-      for (const key of await monologs.keys()) {
-        const id = Number(key);
-        if (!Number.isFinite(id) || id < 0 || incoming.has(id)) continue;
-        const record = await monologs.get(key);
-        if (!record) continue;
-        if (Boolean(record.archived) === Boolean(archived)) await monologs.remove(key);
+      if (complete) {
+        for (const key of await monologs.keys()) {
+          const id = Number(key);
+          if (!Number.isFinite(id) || id < 0 || incoming.has(id)) continue;
+          const record = await monologs.get(key);
+          if (!record) continue;
+          if (Boolean(record.archived) === Boolean(archived)) await monologs.remove(key);
+        }
       }
       for (const [id, monolog] of incoming) {
         const previous = await this.find(id);
@@ -235,20 +264,55 @@ export function createCache({ monologs, messages, now = () => new Date().toISOSt
       }
     },
 
-    /** The last messages of one monolog the computer listed. */
-    async messages(monologId) {
-      const stored = await messages.get(Number(monologId));
-      return Array.isArray(stored) ? stored : [];
+    /**
+     * One page of the feed, oldest-first: `before` for older messages, `after`
+     * for newer, neither for the newest page. This is the only message read.
+     */
+    async messagePage(monologId, { before = null, after = null, limit = 50 } = {}) {
+      const monolog = Number(monologId);
+      if (!Number.isFinite(monolog)) {
+        return { messages: [], hasMore: false };
+      }
+      const page = await messages.page(monolog, { before, after, limit });
+      return {
+        messages: page.messages.map((message) => ({
+          ...message,
+          id: Number(message.id),
+          monolog,
+        })),
+        hasMore: page.hasMore === true,
+      };
     },
 
-    async putMessages(monologId, list) {
-      await messages.put(Number(monologId), Array.isArray(list) ? list : []);
+    /** Store one page of messages; merging is by the store's key, so no copy. */
+    async putMessages(monologId, list = []) {
+      const monolog = Number(monologId);
+      if (!Number.isFinite(monolog) || !Array.isArray(list) || list.length === 0) return 0;
+      return messages.put(
+        list.map((message) => ({
+          ...message,
+          id: Number(message.id),
+          monolog,
+          recorded: String(message.recorded ?? ''),
+        })),
+      );
+    },
+
+    /** How many messages one monolog has on this phone. */
+    async messageCount(monologId) {
+      return messages.count(Number(monologId));
+    },
+
+    /** Remove one message the computer no longer has. */
+    async deleteMessage(monologId, message) {
+      if (!message || typeof message !== 'object') return;
+      await messages.remove(Number(monologId), message.recorded, message.id);
     },
 
     /** Is there anything readable on this phone at all? */
     async hasData() {
       if ((await keys()).length > 0) return true;
-      return (await messages.keys()).length > 0;
+      return messages.any();
     },
   };
 }

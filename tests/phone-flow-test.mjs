@@ -107,7 +107,7 @@ console.log('a take recorded offline goes out when the connection returns');
   const store = bag();
   const chunks = bag();
   const outbox = createOutbox({ store, chunks, now: () => '2026-11-12T15:00:00+05:00' });
-  let drawn = [];
+  let drawn = null;
 
   // The phone records while the computer is unreachable.
   computer.online = false;
@@ -120,8 +120,8 @@ console.log('a take recorded offline goes out when the connection returns');
   const sync = createSync({
     api: (method, path, body) => computer.call(method, path, body),
     outbox,
-    render: async (messages) => {
-      drawn = messages;
+    render: async (page) => {
+      drawn = page;
     },
     log: () => {},
   });
@@ -136,7 +136,10 @@ console.log('a take recorded offline goes out when the connection returns');
   await new Promise((resolve) => setTimeout(resolve, 5));
   check(store.map.size === 1, 'the take is still there after a failed attempt');
   check(clock.lastDelay > FLOOR_MS, 'and the loop slowed down: ' + clock.lastDelay);
-  check(drawn.length === 0, 'nothing was drawn from a dead connection');
+  check(
+    drawn === null || drawn.messages.length === 0,
+    'nothing but the empty page was drawn from a dead connection',
+  );
 
   // The connection comes back and the loop tries again.
   computer.online = true;
@@ -147,7 +150,10 @@ console.log('a take recorded offline goes out when the connection returns');
     computer.calls.includes('POST /messages/500/finish'),
     'the take was closed: ' + computer.calls.join('|'),
   );
-  check(drawn.length === 1, 'the page was drawn with what the computer has');
+  check(
+    drawn && drawn.messages.length === 1,
+    'the page was drawn with what the computer has',
+  );
   check(clock.lastDelay === FLOOR_MS, 'and the pace is back to normal');
   loop.stop();
 }

@@ -33,7 +33,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
 if (-not $StatePath) {
-    $StatePath = Join-Path $PSScriptRoot 'network.json'
+    $StatePath = Join-Path $PSScriptRoot 'network.state'
 }
 $LogPath = [System.IO.Path]::ChangeExtension($StatePath, '.log')
 
@@ -48,18 +48,56 @@ function Test-Admin {
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+# The app keeps the result in SQLite; this file is only the hand-off. One
+# `key=value` line per field, no JSON.
 function Read-State {
-    if (Test-Path $StatePath) {
-        try { return Get-Content -Path $StatePath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { }
+    if (-not (Test-Path $StatePath)) { return $null }
+    $map = @{}
+    try {
+        foreach ($line in Get-Content -Path $StatePath -Encoding UTF8) {
+            $at = $line.IndexOf('=')
+            if ($at -lt 1) { continue }
+            $map[$line.Substring(0, $at)] = $line.Substring($at + 1)
+        }
+    } catch { return $null }
+    if ($map.Count -eq 0) { return $null }
+    $state = [ordered]@{
+        port             = [int]$map['port']
+        enabled          = ($map['enabled'] -eq 'true')
+        firewall_rule    = $map['firewall_rule']
+        firewall_created = $map['firewall_created']
+        upnp             = $null
+        error            = $map['error']
+        updated          = $map['updated']
     }
-    return $null
+    if ($map['upnp_router']) {
+        $state.upnp = @{
+            router        = $map['upnp_router']
+            external_port = [int]$map['upnp_external_port']
+            internal_ip   = $map['upnp_internal_ip']
+            added         = ($map['upnp_added'] -eq 'true')
+        }
+    }
+    return $state
 }
 
 function Write-State($state) {
-    $json = $state | ConvertTo-Json -Depth 5
+    $upnp = $state.upnp
+    $lines = @(
+        'port=' + $state.port
+        'enabled=' + $(if ($state.enabled) { 'true' } else { 'false' })
+        'firewall_rule=' + $state.firewall_rule
+        'firewall_created=' + $state.firewall_created
+        'upnp_router=' + $(if ($upnp) { $upnp.router } else { '' })
+        'upnp_external_port=' + $(if ($upnp) { $upnp.external_port } else { '' })
+        'upnp_internal_ip=' + $(if ($upnp) { $upnp.internal_ip } else { '' })
+        'upnp_added=' + $(if ($upnp -and $upnp.added) { 'true' } else { 'false' })
+        'error=' + $state.error
+        'updated=' + $state.updated
+    )
     $dir = Split-Path -Parent $StatePath
     if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
-    [System.IO.File]::WriteAllText($StatePath, $json, (New-Object System.Text.UTF8Encoding($false)))
+    [System.IO.File]::WriteAllText($StatePath, ($lines -join "`n"), (New-Object System.Text.UTF8Encoding($false)))
 }
 
 function Get-LocalIp {
@@ -175,7 +213,11 @@ function Remove-PortMapping([int]$port, $state) {
 
 function Invoke-Status {
     $state = Read-State
-    if ($state) { $state | ConvertTo-Json -Depth 5 } else { '{}' }
+    if ($state) {
+        $state.upnp | Out-Null
+        Write-State $state
+        Get-Content -Path $StatePath -Encoding UTF8
+    } else { '' }
 }
 
 function Invoke-Enable {
@@ -231,7 +273,6 @@ function Invoke-Enable {
     }
 
     Write-State $state
-    $state | ConvertTo-Json -Depth 5
 }
 
 function Invoke-Disable {

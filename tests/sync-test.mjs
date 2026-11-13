@@ -6,7 +6,7 @@
 // written down here: a flush that fails, a flush that is asked for while one is
 // running, a take that was never closed, an acknowledged chunk.
 
-import { createSync } from '../src/web/js/sync.mjs';
+import { createSync, messageCursor } from '../src/web/js/sync.mjs';
 import { createCache } from '../src/web/js/cache.mjs';
 
 let failures = 0;
@@ -57,7 +57,12 @@ function fakeApi({ fail = false, messages = [] } = {}) {
       if (fail) throw new Error('offline');
       calls.push(method + ' ' + path);
       if (method === 'POST' && path === '/messages') return { id: nextId++ };
-      if (method === 'GET') return { messages };
+      if (method === 'GET' && path.startsWith('/monologues?')) {
+        return { monologs: [], total: 0, has_more: false };
+      }
+      if (method === 'GET' && path.startsWith('/monologues/')) {
+        return { messages, total: messages.length, has_more: false };
+      }
       return { ok: true };
     },
   };
@@ -89,10 +94,54 @@ function bag() {
   };
 }
 
+function compareMessages(left, right) {
+  if (left.recorded < right.recorded) return -1;
+  if (left.recorded > right.recorded) return 1;
+  return left.id - right.id;
+}
+
+/** The paged message store, with the same contract storage.mjs implements. */
+function messageStore() {
+  const rows = new Map();
+  const key = (message) => message.monolog + '|' + message.recorded + '|' + message.id;
+  return {
+    rows,
+    async put(list) {
+      for (const message of list) rows.set(key(message), { ...message });
+      return list.length;
+    },
+    async page(monolog, { before = null, after = null, limit = 50 } = {}) {
+      const all = [...rows.values()]
+        .filter((message) => message.monolog === monolog)
+        .sort(compareMessages);
+      if (before) {
+        const older = all.filter((message) => compareMessages(message, before) < 0);
+        const chunk = older.slice(-(limit + 1));
+        return { messages: chunk.slice(-limit), hasMore: chunk.length > limit };
+      }
+      if (after) {
+        const newer = all.filter((message) => compareMessages(message, after) > 0);
+        return { messages: newer.slice(0, limit), hasMore: newer.length > limit };
+      }
+      const chunk = all.slice(-(limit + 1));
+      return { messages: chunk.slice(-limit), hasMore: chunk.length > limit };
+    },
+    async count(monolog) {
+      return [...rows.values()].filter((message) => message.monolog === monolog).length;
+    },
+    async remove(monolog, recorded, id) {
+      rows.delete(monolog + '|' + recorded + '|' + id);
+    },
+    async any() {
+      return rows.size > 0;
+    },
+  };
+}
+
 function fakeCache() {
   return createCache({
     monologs: bag(),
-    messages: bag(),
+    messages: messageStore(),
     now: () => '2026-11-12T15:00:00+05:00',
   });
 }
@@ -112,10 +161,16 @@ function monologApi({ failMonolog = false, failAll = false } = {}) {
       }
       calls.push(method + ' ' + path);
       if (method === 'POST' && path === '/messages') return { id: nextMessage++ };
-      if (method === 'GET' && path === '/monologues') {
-        return { monologs: [{ id: 77, name: 'Новый', count: 1 }] };
+      if (method === 'GET' && path.startsWith('/monologues?')) {
+        return {
+          monologs: [{ id: 77, name: 'Новый', count: 1 }],
+          total: 1,
+          has_more: false,
+        };
       }
-      if (method === 'GET' && path.startsWith('/monologues/')) return { messages: [] };
+      if (method === 'GET' && path.startsWith('/monologues/')) {
+        return { messages: [], total: 0, has_more: false };
+      }
       return { ok: true };
     },
   };
@@ -141,8 +196,8 @@ async function testHappyPath() {
   const sync = createSync({
     api: (method, path, body) => api.call(method, path, body),
     outbox,
-    render: async (messages) => {
-      drawn = messages;
+    render: async (page) => {
+      drawn = page;
     },
     log: silent,
   });
@@ -151,11 +206,11 @@ async function testHappyPath() {
   check(result.sent === 1, 'one take was sent');
   check(
     api.calls.join('|') ===
-      'POST /messages/7/audio?seq=0|POST /messages/7/audio?seq=1|POST /messages/7/finish|GET /monologues/1/messages',
-    'audio, then finish, then the fetch: ' + api.calls.join('|'),
+      'POST /messages/7/audio?seq=0|POST /messages/7/audio?seq=1|POST /messages/7/finish|GET /monologues/1/messages?limit=50',
+    'audio, then finish, then the newest page: ' + api.calls.join('|'),
   );
   check(outbox.state.size === 0, 'the take left the outbox only after the computer agreed');
-  check(Array.isArray(drawn), 'the page was drawn once');
+  check(drawn && Array.isArray(drawn.messages), 'the page was drawn once with a page');
 }
 
 async function testOpenTakeStays() {
@@ -237,8 +292,8 @@ async function testFailedFlushStillShowsTheTake() {
   const sync = createSync({
     api: (m, p, b) => broken.call(m, p, b),
     outbox,
-    render: async (messages, pending) => {
-      drawn = { messages, pending };
+    render: async (page, pending) => {
+      drawn = { page, pending };
     },
     log: silent,
   });
@@ -249,6 +304,10 @@ async function testFailedFlushStillShowsTheTake() {
   check(
     drawn && drawn.pending.length === 1 && drawn.pending[0].localId === 'e',
     'the waiting take is on the screen, not only in the outbox',
+  );
+  check(
+    drawn && Array.isArray(drawn.page.messages),
+    'the page carries a page, not a whole feed',
   );
 }
 
@@ -278,21 +337,24 @@ async function testSwitchingMonologsForgetsTheOldList() {
   const sync = createSync({
     api: (m, p, b) => api.call(m, p, b),
     outbox,
-    render: async (messages) => {
-      drawn = messages;
+    render: async (page) => {
+      drawn = page;
     },
     log: silent,
   });
   sync.show(1);
   await sync.tick();
-  check(drawn && drawn.length === 1, 'the first monolog is drawn');
+  check(drawn && drawn.messages.length === 1, 'the first monolog is drawn');
   // The recorder is still going: another chunk waits, and now the link is gone.
   outbox.state.get('g').chunks.push({ seq: 1, bytes: new Uint8Array([2, 0]) });
   online = false;
   sync.show(2);
   const result = await sync.tick();
   check(result.failed === true, 'the computer is away');
-  check(Array.isArray(drawn) && drawn.length === 0, 'the new one is empty, not the old list');
+  check(
+    drawn && drawn.messages.length === 0,
+    'the new one is empty, not the old page',
+  );
 }
 
 async function testNoOverlap() {
@@ -357,8 +419,8 @@ async function testLocalMonologIsCreatedBeforeItsTake() {
     outbox,
     cache,
     mapped: (localId, serverId) => mapped.push([localId, serverId]),
-    render: async (messages) => {
-      drawn.push(messages);
+    render: async (page) => {
+      drawn.push(page);
     },
     renderList: async () => {},
     log: silent,
@@ -389,15 +451,15 @@ async function testLocalMonologIsCreatedBeforeItsTake() {
     'the open page is told its monolog got a server id',
   );
   check(
-    Array.isArray(drawn[drawn.length - 1]) && drawn[drawn.length - 1].length === 0,
+    drawn.length > 0 && drawn[drawn.length - 1].messages.length === 0,
     'the messages of the mapped server monolog are fetched, not of -1',
   );
   check(
-    api.calls.includes('GET /monologues'),
+    api.calls.includes('GET /monologues?archived=0&limit=100&offset=0'),
     'the list is refreshed even while the monolog page is open',
   );
   check(
-    (await cache.serverMonologs(false)).length === 1,
+    (await cache.monologPage(false, 0, 100)).total === 1,
     'and the refreshed list is cached',
   );
 
@@ -428,8 +490,8 @@ async function testMappingFailureKeepsTheTake() {
     api: (m, p, b) => api.call(m, p, b),
     outbox,
     cache,
-    render: async (messages, pending) => {
-      drawn = { messages, pending };
+    render: async (page, pending) => {
+      drawn = { page, pending };
     },
     log: silent,
   });
@@ -465,8 +527,8 @@ async function testOfflineDrawsTheCachedMessages() {
     api: (m, p, b) => offline.call(m, p, b),
     outbox,
     cache,
-    render: async (messages, pending) => {
-      drawn = { messages, pending };
+    render: async (page, pending) => {
+      drawn = { page, pending };
     },
     log: silent,
   });
@@ -474,7 +536,9 @@ async function testOfflineDrawsTheCachedMessages() {
   const result = await sync.tick();
   check(result.failed === true, 'the dead connection is reported');
   check(
-    drawn && drawn.messages.length === 1 && drawn.messages[0].text === 'старое',
+    drawn &&
+      drawn.page.messages.length === 1 &&
+      drawn.page.messages[0].text === 'старое',
     'the cached messages are drawn',
   );
   check(drawn && drawn.pending.length === 1, 'together with the waiting take');
@@ -491,15 +555,18 @@ async function testListIsFetchedAndCached() {
     outbox,
     cache,
     render: async () => {},
-    renderList: async (list) => {
-      drawn = list;
+    renderList: async (page) => {
+      drawn = page;
     },
     log: silent,
   });
   const result = await sync.tick();
   check(result.monologs === 1, 'the list came back');
-  check(drawn && drawn.length === 1 && drawn[0].name === 'Новый', 'the list is drawn');
-  check((await cache.serverMonologs(false)).length === 1, 'and stored in the cache');
+  check(
+    drawn && drawn.monologs.length === 1 && drawn.monologs[0].name === 'Новый',
+    'the first page is drawn',
+  );
+  check((await cache.monologPage(false, 0, 100)).total === 1, 'and stored in the cache');
 }
 
 async function testARefusedTakeContinuesInANewMessage() {
@@ -590,7 +657,8 @@ async function testPendingRenameIsSentOnce() {
   );
   check((await cache.dirtyRenames()).length === 0, 'and the queue is empty again');
   check(
-    (await cache.serverMonologs(false))[0].name === 'Новое',
+    (await cache.monologPage(false, 0, 100)).monologs.find((item) => item.id === 4).name ===
+      'Новое',
     'the new name survives the list refresh',
   );
 }
@@ -605,7 +673,7 @@ async function testListCarriesTheViewItWasFetchedFor() {
     outbox,
     cache,
     render: async () => {},
-    renderList: async (list, archivedView) => {
+    renderList: async (page, archivedView) => {
       seen = archivedView;
     },
     log: silent,
@@ -643,8 +711,115 @@ async function testStoredMappingReachesAnOldTake() {
   );
   check(outbox.state.size === 0, 'the take is sent under the stored mapping');
   check(
-    api.calls.includes('GET /monologues/77/messages'),
-    'and the messages are fetched from the server monolog',
+    api.calls.includes('GET /monologues/77/messages?limit=50'),
+    'and the newest page is fetched from the server monolog',
+  );
+}
+
+async function testPageUsesCacheBeforeTheNetwork() {
+  console.log('a scroll page comes from IndexedDB before the network');
+  const cache = fakeCache();
+  await cache.putMessages(1, [
+    { id: 1, recorded: '2026-11-12T10:00:00+05:00', text: 'one' },
+    { id: 2, recorded: '2026-11-12T11:00:00+05:00', text: 'two' },
+  ]);
+  const api = fakeApi();
+  const sync = createSync({
+    api: (m, p, b) => api.call(m, p, b),
+    outbox: fakeOutbox(),
+    cache,
+    render: async () => {},
+    log: silent,
+  });
+  const older = await sync.page(1, {
+    before: { recorded: '2026-11-12T11:00:00+05:00', id: 2 },
+    limit: 1,
+  });
+  check(
+    older.messages.length === 1 && older.messages[0].id === 1,
+    'the older page is read from the store',
+  );
+  check(api.calls.length === 0, 'and the computer is not asked');
+  const newer = await sync.page(1, {
+    after: { recorded: '2026-11-12T10:00:00+05:00', id: 1 },
+    limit: 1,
+  });
+  check(
+    newer.messages.length === 1 && newer.messages[0].id === 2,
+    'the newer page is read from the store too',
+  );
+  check(api.calls.length === 0, 'still no network');
+}
+
+async function testPageFallsBackToTheNetwork() {
+  console.log('a short stored page asks the computer for the rest');
+  const cache = fakeCache();
+  await cache.putMessages(1, [
+    { id: 1, recorded: '2026-11-12T10:00:00+05:00', text: 'one' },
+  ]);
+  const api = fakeApi({
+    messages: [
+      { id: 0, recorded: '2026-11-01T10:00:00+05:00', text: 'older' },
+      { id: 1, recorded: '2026-11-12T10:00:00+05:00', text: 'one' },
+    ],
+  });
+  const sync = createSync({
+    api: (m, p, b) => api.call(m, p, b),
+    outbox: fakeOutbox(),
+    cache,
+    render: async () => {},
+    log: silent,
+  });
+  const page = await sync.page(1, {
+    before: { recorded: '2026-11-12T10:00:00+05:00', id: 1 },
+    limit: 2,
+  });
+  check(page.messages.length === 2, 'the network page fills the short stored page');
+  check(
+    api.calls.some((call) => call.includes('before=')),
+    'with the same cursor: ' + api.calls.join('|'),
+  );
+  check(
+    (await cache.messagePage(1, { limit: 10 })).messages.length === 2,
+    'and the fetched page is stored',
+  );
+}
+
+async function testListPagesAreFetchedOneByOne() {
+  console.log('a list page is fetched with its own offset');
+  const cache = fakeCache();
+  const calls = [];
+  const api = async (method, path) => {
+    calls.push(method + ' ' + path);
+    return {
+      monologs: [{ id: 8, name: 'Второй', count: 0 }],
+      total: 201,
+      has_more: true,
+    };
+  };
+  const sync = createSync({
+    api,
+    outbox: fakeOutbox(),
+    cache,
+    render: async () => {},
+    log: silent,
+  });
+  const page = await sync.fetchMonologPage(false, 100, 100);
+  check(
+    calls[0] === 'GET /monologues?archived=0&limit=100&offset=100',
+    'the offset is sent: ' + calls[0],
+  );
+  check(page.total === 201 && page.hasMore === true, 'the page keeps the total and has_more');
+  check(sync.monologTotal(false) === 201, 'and the total is remembered');
+  check((await cache.serverMonologCount(false)) === 1, 'the page is stored');
+}
+
+async function testCursorIsTheApiFormat() {
+  console.log('a cursor is recorded|id');
+  check(
+    messageCursor({ recorded: '2026-11-12T10:00:00+05:00', id: 7 }) ===
+      '2026-11-12T10:00:00+05:00|7',
+    'the same cursor the server reads',
   );
 }
 
@@ -662,6 +837,10 @@ const suites = [
   testMappingFailureKeepsTheTake,
   testOfflineDrawsTheCachedMessages,
   testListIsFetchedAndCached,
+  testPageUsesCacheBeforeTheNetwork,
+  testPageFallsBackToTheNetwork,
+  testListPagesAreFetchedOneByOne,
+  testCursorIsTheApiFormat,
   testListCarriesTheViewItWasFetchedFor,
   testPendingRenameIsSentOnce,
   testARefusedTakeContinuesInANewMessage,

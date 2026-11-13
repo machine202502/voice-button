@@ -1,10 +1,13 @@
 use anyhow::{Context, Result};
+use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use crate::store::Store;
 
 /// One appended piece inside a message that was built with the append
-/// shortcut. The full merged text stays in `HistoryEntry::text`; `parts` only
+/// shortcut. The full merged text stays in `history.text`; `parts` only
 /// records when each additional piece was added.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryChunk {
@@ -30,6 +33,28 @@ pub enum Source {
     Telegram,
 }
 
+impl Source {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Source::User => "user",
+            Source::Server => "server",
+            Source::File => "file",
+            Source::Site => "site",
+            Source::Telegram => "telegram",
+        }
+    }
+
+    fn from_str(value: &str) -> Self {
+        match value {
+            "server" => Source::Server,
+            "file" => Source::File,
+            "site" => Source::Site,
+            "telegram" => Source::Telegram,
+            _ => Source::User,
+        }
+    }
+}
+
 /// Whether the recording behind an entry was transcribed completely.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -44,6 +69,20 @@ pub enum EntryState {
 impl EntryState {
     pub fn is_partial(self) -> bool {
         self == EntryState::Partial
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            EntryState::Complete => "complete",
+            EntryState::Partial => "partial",
+        }
+    }
+
+    fn from_str(value: &str) -> Self {
+        match value {
+            "partial" => EntryState::Partial,
+            _ => EntryState::Complete,
+        }
     }
 }
 
@@ -77,17 +116,15 @@ pub struct HistoryEntry {
 
 #[derive(Debug, Clone)]
 pub struct HistoryRow {
+    id: i64,
     at: String,
     preview: String,
     model: String,
-    offset: u64,
-    len: usize,
     pieces: usize,
     source: Source,
     state: EntryState,
     audio: Option<String>,
     group: Option<String>,
-    inline_entry: Option<HistoryEntry>,
 }
 
 impl HistoryRow {
@@ -106,36 +143,36 @@ impl HistoryRow {
             .unwrap_or_else(|_| at.to_string())
     }
 
-    fn new(entry: &HistoryEntry, offset: u64, len: usize) -> Self {
+    fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            at: Self::display_at(&row.get::<_, String>(1)?),
+            preview: Self::preview_of(&row.get::<_, String>(2)?),
+            model: row.get(3)?,
+            pieces: row.get::<_, i64>(4)? as usize,
+            source: Source::from_str(&row.get::<_, String>(5)?),
+            state: EntryState::from_str(&row.get::<_, String>(6)?),
+            audio: row.get(7)?,
+            group: row.get(8)?,
+        })
+    }
+
+    fn new(entry: &HistoryEntry, id: i64) -> Self {
         Self {
+            id,
             at: Self::display_at(&entry.at),
             preview: Self::preview_of(&entry.text),
             model: entry.model.clone(),
-            offset,
-            len,
             pieces: entry.parts.len(),
             source: entry.source,
             state: entry.state,
             audio: entry.audio.clone(),
             group: entry.group.clone(),
-            inline_entry: None,
         }
     }
 
-    fn inline(entry: HistoryEntry) -> Self {
-        Self {
-            preview: Self::preview_of(&entry.text),
-            at: Self::display_at(&entry.at),
-            model: entry.model.clone(),
-            offset: 0,
-            len: 0,
-            pieces: entry.parts.len(),
-            source: entry.source,
-            state: entry.state,
-            audio: entry.audio.clone(),
-            group: entry.group.clone(),
-            inline_entry: Some(entry),
-        }
+    pub fn id(&self) -> i64 {
+        self.id
     }
 
     pub fn at(&self) -> &str {
@@ -180,151 +217,282 @@ impl HistoryRow {
     }
 }
 
-/// Newest-first index of a JSONL file. Full texts stay on disk and are read
-/// individually by byte offset; only timestamps and short previews are kept.
+/// Handle to the history table. Rows are read by page, so a window never holds
+/// the whole table; a plain vector is kept only for tests and the snapshot.
 pub struct History {
-    root: Option<PathBuf>,
-    rows: Vec<HistoryRow>,
-    #[cfg(test)]
-    disk_reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    store: Option<Arc<Store>>,
+    inline: Vec<HistoryEntry>,
+    len: usize,
 }
 
 impl History {
     pub fn load(root: &Path) -> Self {
-        if let Err(e) = migrate_legacy(root) {
-            crate::log::log(&format!("history migration failed: {e:#}"));
-        }
-        match Self::index(root) {
+        match Self::open(root) {
             Ok(history) => history,
             Err(e) => {
-                crate::log::log(&format!("history indexing failed: {e:#}"));
-                Self::empty(Some(root.to_path_buf()))
+                crate::log::log(&format!("history database failed: {e:#}"));
+                Self::empty()
             }
         }
+    }
+
+    fn open(root: &Path) -> Result<Self> {
+        let store = Arc::new(Store::open(root)?);
+        let len: i64 = store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM history", [], |row| row.get(0))?;
+        Ok(Self {
+            store: Some(store),
+            inline: Vec::new(),
+            len: len as usize,
+        })
     }
 
     pub fn from_entries(entries: Vec<HistoryEntry>) -> Self {
-        let mut history = Self::empty(None);
-        history.rows = entries.into_iter().map(HistoryRow::inline).collect();
-        history
-    }
-
-    fn empty(root: Option<PathBuf>) -> Self {
         Self {
-            root,
-            rows: Vec::new(),
-            #[cfg(test)]
-            disk_reads: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            store: None,
+            len: entries.len(),
+            inline: entries,
         }
     }
 
-    fn index(root: &Path) -> Result<Self> {
-        let path = history_path(root);
-        if !path.exists() {
-            return Ok(Self::empty(Some(root.to_path_buf())));
+    fn empty() -> Self {
+        Self {
+            store: None,
+            inline: Vec::new(),
+            len: 0,
         }
-        let file = std::fs::File::open(&path)
-            .with_context(|| format!("failed to open {}", path.display()))?;
-        let mut reader = BufReader::new(file);
-        let mut rows = Vec::new();
-        let mut offset = 0u64;
-        loop {
-            let mut line = String::new();
-            let bytes = reader.read_line(&mut line)?;
-            if bytes == 0 {
-                break;
-            }
-            let line_len = line.trim_end_matches(['\r', '\n']).len();
-            let line_offset = offset;
-            offset += bytes as u64;
-            if line_len == 0 {
-                continue;
-            }
-            match serde_json::from_str::<HistoryEntry>(line.trim_end_matches(['\r', '\n'])) {
-                Ok(entry) => rows.push(HistoryRow::new(&entry, line_offset, line_len)),
-                Err(e) => crate::log::log(&format!(
-                    "skipping invalid history line at byte {line_offset}: {e}"
-                )),
-            }
-        }
-        rows.reverse();
-        let mut history = Self::empty(Some(root.to_path_buf()));
-        history.rows = rows;
-        Ok(history)
     }
 
     pub fn len(&self) -> usize {
-        self.rows.len()
+        self.len
     }
 
     pub fn is_empty(&self) -> bool {
-        self.rows.is_empty()
+        self.len == 0
     }
 
-    pub fn row(&self, index: usize) -> Option<&HistoryRow> {
-        self.rows.get(index)
-    }
-
+    /// A full entry by its page index (newest first). Only the row that is
+    /// actually opened is read.
     pub fn entry(&self, index: usize) -> Result<HistoryEntry> {
-        let row = self
-            .rows
+        if let Some(store) = &self.store {
+            let id: i64 = store
+                .conn()
+                .query_row(
+                    "SELECT id FROM history ORDER BY at DESC, id DESC LIMIT 1 OFFSET ?1",
+                    [index as i64],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .context("history row is out of range")?;
+            return self.entry_by_id(id);
+        }
+        self.inline
             .get(index)
-            .context("history row is out of range")?;
-        if let Some(entry) = &row.inline_entry {
-            return Ok(entry.clone());
-        }
-        let root = self.root.as_ref().context("history has no backing file")?;
-        let path = history_path(root);
-        let mut file = std::fs::File::open(&path)
-            .with_context(|| format!("failed to open {}", path.display()))?;
-        file.seek(SeekFrom::Start(row.offset))?;
-        let mut bytes = vec![0; row.len];
-        file.read_exact(&mut bytes)?;
-        #[cfg(test)]
-        self.disk_reads
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        serde_json::from_slice(&bytes).context("failed to decode history entry")
+            .cloned()
+            .context("history row is out of range")
     }
 
-    pub fn push_row(&mut self, row: HistoryRow) {
-        self.rows.insert(0, row);
+    pub fn entry_by_id(&self, id: i64) -> Result<HistoryEntry> {
+        let store = self.store.as_ref().context("history has no backing database")?;
+        read_entry(&store.conn(), id)?.context("history row disappeared from the database")
     }
 
-    /// Rewrite the newest entry in place. The replaced line is the last line
-    /// of the file, so truncating at its start offset and rewriting keeps every
-    /// earlier entry's byte offset intact. Used to append a piece to a message.
-    pub fn update_last(&mut self, root: &Path, entry: &HistoryEntry) -> Result<HistoryRow> {
-        let row = self.rows.first().context("history is empty")?;
-        if row.inline_entry.is_some() {
-            // In-memory rows (UI snapshot mode) have no position on disk.
-            anyhow::bail!("history row has no backing file");
+    pub fn row(&self, index: usize) -> Option<HistoryRow> {
+        if let Some(store) = &self.store {
+            let conn = store.conn();
+            return conn
+                .query_row(
+                    &format!("{ROW_SELECT} ORDER BY h.at DESC, h.id DESC LIMIT 1 OFFSET ?1"),
+                    [index as i64],
+                    HistoryRow::from_row,
+                )
+                .optional()
+                .ok()
+                .flatten();
         }
-        let offset = row.offset;
-        let path = history_path(root);
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .with_context(|| format!("failed to open {}", path.display()))?;
-        let mut line = serde_json::to_vec(entry)?;
-        let len = line.len();
-        line.push(b'\n');
-        file.seek(SeekFrom::Start(offset))?;
-        file.set_len(offset)?;
-        file.write_all(&line)?;
-        file.flush()?;
-        let new_row = HistoryRow::new(entry, offset, len);
-        self.rows[0] = new_row.clone();
-        Ok(new_row)
+        self.inline
+            .get(index)
+            .map(|entry| HistoryRow::new(entry, 0))
+    }
+
+    /// One page of index rows, newest first. `sources` empty means all.
+    pub fn page(
+        &self,
+        sources: &[Source],
+        needle: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Vec<HistoryRow> {
+        if let Some(store) = &self.store {
+            let conn = store.conn();
+            let (filter, params) = source_filter(sources, needle);
+            let sql = format!("{ROW_SELECT}{filter} ORDER BY h.at DESC, h.id DESC LIMIT ? OFFSET ?");
+            let mut statement = match conn.prepare(&sql) {
+                Ok(statement) => statement,
+                Err(_) => return Vec::new(),
+            };
+            let mut values: Vec<Box<dyn rusqlite::ToSql>> = params
+                .iter()
+                .map(|value| Box::new(value.clone()) as Box<dyn rusqlite::ToSql>)
+                .collect();
+            values.push(Box::new(limit as i64));
+            values.push(Box::new(offset as i64));
+            let refs: Vec<&dyn rusqlite::ToSql> = values.iter().map(|value| value.as_ref()).collect();
+            return statement
+                .query_map(refs.as_slice(), HistoryRow::from_row)
+                .map(|rows| rows.flatten().collect())
+                .unwrap_or_default();
+        }
+        let needle = needle.to_lowercase();
+        self.inline
+            .iter()
+            .filter(|entry| sources.is_empty() || sources.contains(&entry.source))
+            .filter(|entry| needle.is_empty() || entry.text.to_lowercase().contains(&needle))
+            .skip(offset)
+            .take(limit)
+            .map(|entry| HistoryRow::new(entry, 0))
+            .collect()
+    }
+
+    pub fn count(&self, sources: &[Source], needle: &str) -> usize {
+        if self.store.is_none() {
+            let needle = needle.to_lowercase();
+            return self
+                .inline
+                .iter()
+                .filter(|entry| sources.is_empty() || sources.contains(&entry.source))
+                .filter(|entry| needle.is_empty() || entry.text.to_lowercase().contains(&needle))
+                .count();
+        }
+        let store = self.store.as_ref().unwrap();
+        let conn = store.conn();
+        let (filter, params) = source_filter(sources, needle);
+        let sql = format!("SELECT COUNT(*) FROM history h{filter}");
+        let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|value| value as &dyn rusqlite::ToSql).collect();
+        conn.query_row(&sql, refs.as_slice(), |row| row.get::<_, i64>(0))
+            .map(|count| count as usize)
+            .unwrap_or(0)
+    }
+
+    pub fn push_row(&mut self, _row: HistoryRow) {
+        self.len += 1;
+    }
+
+    /// Rewrite the newest entry in place. Used to append a piece to a message.
+    pub fn update_last(&mut self, _root: &Path, entry: &HistoryEntry) -> Result<HistoryRow> {
+        let store = self.store.as_ref().context("history has no backing database")?;
+        let mut conn = store.conn();
+        let id: i64 = conn
+            .query_row("SELECT id FROM history ORDER BY id DESC LIMIT 1", [], |row| row.get(0))
+            .optional()?
+            .context("history is empty")?;
+        let transaction = conn.transaction()?;
+        transaction.execute(
+            "UPDATE history SET at = ?1, text = ?2, model = ?3, source = ?4, state = ?5,
+                audio = ?6, group_name = ?7, message_id = ?8 WHERE id = ?9",
+            params![
+                entry.at,
+                entry.text,
+                entry.model,
+                entry.source.as_str(),
+                entry.state.as_str(),
+                entry.audio,
+                entry.group,
+                entry.message.map(|value| value as i64),
+                id
+            ],
+        )?;
+        transaction.execute("DELETE FROM history_parts WHERE history_id = ?1", [id])?;
+        for (position, part) in entry.parts.iter().enumerate() {
+            transaction.execute(
+                "INSERT INTO history_parts(history_id, position, at, text)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![id, position as i64, part.at, part.text],
+            )?;
+        }
+        transaction.commit()?;
+        let _ = conn.execute(
+            "INSERT INTO kv(key, value) VALUES ('rev.history', '1')
+             ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1",
+            [],
+        );
+        Ok(HistoryRow::new(entry, id))
     }
 
     pub fn clear_local(&mut self) {
-        self.rows.clear();
+        self.inline.clear();
+        self.len = 0;
     }
+}
 
-    #[cfg(test)]
-    fn disk_reads(&self) -> usize {
-        self.disk_reads.load(std::sync::atomic::Ordering::SeqCst)
+const ROW_SELECT: &str = "SELECT h.id, h.at, substr(h.text, 1, 240), h.model,
+    (SELECT COUNT(*) FROM history_parts p WHERE p.history_id = h.id),
+    h.source, h.state, h.audio, h.group_name FROM history h";
+
+fn source_filter(sources: &[Source], needle: &str) -> (String, Vec<String>) {
+    let mut clauses: Vec<String> = Vec::new();
+    let mut params: Vec<String> = Vec::new();
+    if !sources.is_empty() {
+        let marks: Vec<&str> = sources.iter().map(|_| "?").collect();
+        clauses.push(format!("h.source IN ({})", marks.join(",")));
+        params.extend(sources.iter().map(|source| source.as_str().to_string()));
     }
+    if !needle.trim().is_empty() {
+        clauses.push("vb_lower(h.text) LIKE vb_lower(?) ESCAPE '\\'".to_string());
+        params.push(format!(
+            "%{}%",
+            needle
+                .trim()
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_")
+        ));
+    }
+    let filter = if clauses.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", clauses.join(" AND "))
+    };
+    (filter, params)
+}
+
+fn read_entry(conn: &Connection, id: i64) -> Result<Option<HistoryEntry>> {
+    let mut entry = conn
+        .query_row(
+            "SELECT id, at, text, model, source, state, audio, group_name, message_id
+             FROM history WHERE id = ?1",
+            [id],
+            |row| {
+                Ok(HistoryEntry {
+                    at: row.get(1)?,
+                    text: row.get(2)?,
+                    model: row.get(3)?,
+                    parts: Vec::new(),
+                    source: Source::from_str(&row.get::<_, String>(4)?),
+                    state: EntryState::from_str(&row.get::<_, String>(5)?),
+                    audio: row.get(6)?,
+                    group: row.get(7)?,
+                    message: row.get::<_, Option<i64>>(8)?.map(|value| value as u64),
+                })
+            },
+        )
+        .optional()?;
+    let Some(entry) = entry.as_mut() else {
+        return Ok(None);
+    };
+    let mut statement = conn.prepare(
+        "SELECT at, text FROM history_parts WHERE history_id = ?1 ORDER BY position",
+    )?;
+    entry.parts = statement
+        .query_map([id], |row| {
+            Ok(HistoryChunk {
+                at: row.get(0)?,
+                text: row.get(1)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(Some(entry.clone()))
 }
 
 impl From<Vec<HistoryEntry>> for History {
@@ -334,51 +502,55 @@ impl From<Vec<HistoryEntry>> for History {
 }
 
 pub fn history_path(root: &Path) -> PathBuf {
-    root.join("history.jsonl")
-}
-
-fn legacy_history_path(root: &Path) -> PathBuf {
-    root.join("history.json")
-}
-
-fn migrate_legacy(root: &Path) -> Result<()> {
-    let target = history_path(root);
-    let legacy = legacy_history_path(root);
-    if target.exists() || !legacy.exists() {
-        return Ok(());
-    }
-    let text = std::fs::read_to_string(&legacy)
-        .with_context(|| format!("failed to read {}", legacy.display()))?;
-    let entries: Vec<HistoryEntry> = serde_json::from_str(&text)
-        .with_context(|| format!("failed to parse {}", legacy.display()))?;
-    let mut jsonl = String::new();
-    for entry in entries.iter().rev() {
-        jsonl.push_str(&serde_json::to_string(entry)?);
-        jsonl.push('\n');
-    }
-    crate::ipc::atomic_write(target, jsonl.as_bytes());
-    Ok(())
+    root.join("voice-button.sqlite3")
 }
 
 pub fn append(root: &Path, entry: &HistoryEntry) -> Result<HistoryRow> {
-    std::fs::create_dir_all(root)?;
-    let path = history_path(root);
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .with_context(|| format!("failed to open {}", path.display()))?;
-    let offset = file.metadata()?.len();
-    let mut line = serde_json::to_vec(entry)?;
-    let len = line.len();
-    line.push(b'\n');
-    file.write_all(&line)?;
-    file.flush()?;
-    Ok(HistoryRow::new(entry, offset, len))
+    let store = Store::open(root)?;
+    let mut conn = store.conn();
+    let transaction = conn.transaction()?;
+    transaction.execute(
+        "INSERT INTO history(at, text, model, source, state, audio, group_name, message_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            entry.at,
+            entry.text,
+            entry.model,
+            entry.source.as_str(),
+            entry.state.as_str(),
+            entry.audio,
+            entry.group,
+            entry.message.map(|value| value as i64)
+        ],
+    )?;
+    let id = transaction.last_insert_rowid();
+    for (position, part) in entry.parts.iter().enumerate() {
+        transaction.execute(
+            "INSERT INTO history_parts(history_id, position, at, text)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![id, position as i64, part.at, part.text],
+        )?;
+    }
+    transaction.commit()?;
+    let _ = conn.execute(
+        "INSERT INTO kv(key, value) VALUES ('rev.history', '1')
+         ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1",
+        [],
+    );
+    Ok(HistoryRow::new(entry, id))
 }
 
 pub fn clear(root: &Path) {
-    crate::ipc::atomic_write(history_path(root), &[]);
+    if let Ok(store) = Store::open(root) {
+        let conn = store.conn();
+        let _ = conn.execute("DELETE FROM history_parts", []);
+        let _ = conn.execute("DELETE FROM history", []);
+        let _ = conn.execute(
+            "INSERT INTO kv(key, value) VALUES ('rev.history', '1')
+             ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1",
+            [],
+        );
+    }
 }
 
 #[cfg(test)]
@@ -392,9 +564,6 @@ mod tests {
         assert!(shown.starts_with("2026-11-13 "));
         assert!(!shown.contains('T'));
     }
-
-    use super::{append, clear, history_path, History, HistoryEntry};
-    use std::path::PathBuf;
 
     fn test_root(name: &str) -> PathBuf {
         let unique = std::time::SystemTime::now()
@@ -415,8 +584,8 @@ mod tests {
             text: format!("Сообщение номер {index}, которое должно сохраниться полностью"),
             model: format!("model-{index}"),
             parts: Vec::new(),
-            source: super::Source::User,
-            state: super::EntryState::Complete,
+            source: Source::User,
+            state: EntryState::Complete,
             audio: None,
             group: None,
             message: None,
@@ -427,13 +596,13 @@ mod tests {
     fn a_phone_message_keeps_its_group_and_original_text() {
         let root = test_root("history-phone");
         let mut site = entry(1);
-        site.source = super::Source::Site;
+        site.source = Source::Site;
         site.group = Some("Работа".to_string());
         site.message = Some(7);
         append(&root, &site).unwrap();
         let loaded = History::load(&root);
         let row = loaded.row(0).expect("one row");
-        assert_eq!(row.source(), super::Source::Site);
+        assert_eq!(row.source(), Source::Site);
         assert_eq!(row.group(), Some("Работа"));
         let stored = loaded.entry(0).unwrap();
         assert_eq!(stored.message, Some(7));
@@ -442,21 +611,7 @@ mod tests {
     }
 
     #[test]
-    fn entries_without_the_phone_fields_still_load() {
-        let root = test_root("history-legacy");
-        // A line written by 0.5.0: no source override, no group, no message id.
-        let line = r#"{"at":"2026-11-06 00:00:0001","text":"Старая запись","model":"model-1","parts":[],"state":"complete","audio":null}"#;
-        std::fs::write(super::history_path(&root), format!("{line}\n")).unwrap();
-        let loaded = History::load(&root);
-        let row = loaded.row(0).expect("one row");
-        assert_eq!(row.source(), super::Source::User);
-        assert_eq!(row.group(), None);
-        assert_eq!(loaded.entry(0).unwrap().message, None);
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn jsonl_round_trip_preserves_every_entry() {
+    fn sqlite_round_trip_preserves_every_entry() {
         let root = test_root("history-roundtrip");
         for index in 0..1000 {
             append(&root, &entry(index)).unwrap();
@@ -469,19 +624,18 @@ mod tests {
     }
 
     #[test]
-    fn update_last_merges_into_the_newest_line_only() {
+    fn update_last_merges_into_the_newest_row_only() {
         let root = test_root("history-append");
         append(&root, &entry(1)).unwrap();
         append(&root, &entry(2)).unwrap();
         let mut history = History::load(&root);
         let mut merged = history.entry(0).unwrap();
         merged.text = format!("{} Продолжение мысли", merged.text);
-        merged.parts.push(super::HistoryChunk {
+        merged.parts.push(HistoryChunk {
             at: "2026-11-06 00:01:00".to_string(),
             text: "Продолжение мысли".to_string(),
         });
         history.update_last(&root, &merged).unwrap();
-        // Both entries survive, the newest one carries the merged text.
         let loaded = History::load(&root);
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded.entry(1).unwrap().text, entry(1).text);
@@ -489,11 +643,10 @@ mod tests {
         assert_eq!(newest.text, format!("{} Продолжение мысли", entry(2).text));
         assert_eq!(newest.parts.len(), 1);
         assert_eq!(newest.parts[0].text, "Продолжение мысли");
-        // A second append keeps working (offsets stay valid).
         let mut loaded = History::load(&root);
         let mut again = loaded.entry(0).unwrap();
         again.text.push_str(" И ещё кусочек");
-        again.parts.push(super::HistoryChunk {
+        again.parts.push(HistoryChunk {
             at: "2026-11-06 00:02:00".to_string(),
             text: "И ещё кусочек".to_string(),
         });
@@ -510,7 +663,7 @@ mod tests {
         let root = test_root("history-parts");
         let mut big = entry(1);
         big.text = "Первый кусочек. Второй кусочек.".to_string();
-        big.parts.push(super::HistoryChunk {
+        big.parts.push(HistoryChunk {
             at: "2026-11-06 00:03:00".to_string(),
             text: "Второй кусочек.".to_string(),
         });
@@ -521,39 +674,53 @@ mod tests {
     }
 
     #[test]
-    fn indexing_does_not_read_full_entry_text() {
+    fn pages_do_not_read_full_entry_text() {
         let root = test_root("history-lazy");
         for index in 0..20 {
             append(&root, &entry(index)).unwrap();
         }
         let loaded = History::load(&root);
         assert_eq!(loaded.len(), 20);
-        assert_eq!(loaded.disk_reads(), 0);
         assert_eq!(loaded.row(0).unwrap().preview(), entry(19).text);
+        assert_eq!(loaded.page(&[], "", 0, 5).len(), 5);
         loaded.entry(10).unwrap();
-        assert_eq!(loaded.disk_reads(), 1);
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
-    fn legacy_json_is_migrated_without_reordering() {
-        let root = test_root("history-migration");
-        let entries = vec![entry(2), entry(1), entry(0)];
-        std::fs::write(
-            root.join("history.json"),
-            serde_json::to_string_pretty(&entries).unwrap(),
-        )
-        .unwrap();
+    fn search_and_source_filters_run_over_the_whole_table() {
+        let root = test_root("history-search");
+        let mut server = entry(1);
+        server.source = Source::Server;
+        append(&root, &server).unwrap();
+        append(&root, &entry(2)).unwrap();
+        append(&root, &entry(3)).unwrap();
         let loaded = History::load(&root);
-        assert!(history_path(&root).exists());
-        assert_eq!(loaded.len(), 3);
-        assert_eq!(loaded.entry(0).unwrap().text, entry(2).text);
-        assert_eq!(loaded.entry(2).unwrap().text, entry(0).text);
+        assert_eq!(loaded.count(&[Source::Server], ""), 1);
+        assert_eq!(loaded.count(&[], "номер 2"), 1);
+        assert_eq!(loaded.count(&[Source::User], "номер 2"), 1);
+        assert_eq!(loaded.page(&[], "номер 2", 0, 10)[0].preview(), entry(2).text);
+        assert_eq!(loaded.page(&[Source::Server], "", 0, 10)[0].source(), Source::Server);
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
-    fn clear_empties_the_jsonl_history() {
+    fn entries_read_in_recording_time_order() {
+        let root = test_root("history-order");
+        let mut late = entry(1);
+        late.at = "2026-11-06 12:00:00".to_string();
+        append(&root, &late).unwrap();
+        let mut early = entry(2);
+        early.at = "2026-11-06 09:00:00".to_string();
+        append(&root, &early).unwrap();
+        let loaded = History::load(&root);
+        assert_eq!(loaded.entry(0).unwrap().at, "2026-11-06 12:00:00");
+        assert_eq!(loaded.entry(1).unwrap().at, "2026-11-06 09:00:00");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn clear_empties_the_history() {
         let root = test_root("history-clear");
         append(&root, &entry(1)).unwrap();
         clear(&root);
@@ -562,31 +729,16 @@ mod tests {
     }
 
     #[test]
-    fn entries_without_model_remain_readable() {
-        let root = test_root("history-no-model");
-        std::fs::write(
-            history_path(&root),
-            "{\"at\":\"2026-11-06 00:00:00\",\"text\":\"Старая запись\"}\n",
-        )
-        .unwrap();
-        let history = History::load(&root);
-        assert_eq!(history.row(0).unwrap().model(), "unknown model");
-        assert_eq!(history.row(0).unwrap().source(), super::Source::User);
-        assert_eq!(history.entry(0).unwrap().text, "Старая запись");
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
     fn server_entries_keep_their_source_through_the_index() {
         let root = test_root("history-source");
         let mut recorded = entry(1);
-        recorded.source = super::Source::Server;
+        recorded.source = Source::Server;
         append(&root, &recorded).unwrap();
         append(&root, &entry(2)).unwrap();
         let history = History::load(&root);
-        assert_eq!(history.row(0).unwrap().source(), super::Source::User);
-        assert_eq!(history.row(1).unwrap().source(), super::Source::Server);
-        assert_eq!(history.entry(1).unwrap().source, super::Source::Server);
+        assert_eq!(history.row(0).unwrap().source(), Source::User);
+        assert_eq!(history.row(1).unwrap().source(), Source::Server);
+        assert_eq!(history.entry(1).unwrap().source, Source::Server);
         let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -11,6 +11,8 @@ import ctypes
 import importlib.util
 import json
 import os
+import sqlite3
+import re
 import sys
 import threading
 import time
@@ -41,7 +43,7 @@ class Blob(ctypes.Structure):
 
 
 def write_secure(path, token, proxy):
-    payload = json.dumps({"token": token, "proxy": proxy}).encode("utf-8")
+    payload = (token + "\n" + proxy).encode("utf-8")
     buffer = ctypes.create_string_buffer(payload)
     data_in = Blob(len(payload), buffer)
     data_out = Blob()
@@ -131,7 +133,8 @@ def voice_update(update_id, owner, media):
         "message": {
             "message_id": update_id,
             "chat": {"id": owner, "type": "private"},
-            "from": {"id": owner, "is_bot": False},
+            "from": {"id": owner, "is_bot": False, "first_name": "Owner", "username": "owner"},
+            "date": int(time.time()),
             "voice": {
                 "file_id": "voice-%d" % update_id,
                 "file_size": len(media),
@@ -142,18 +145,71 @@ def voice_update(update_id, owner, media):
     }
 
 
-def read_json(path, attempts=40):
-    """The daemon replaces the file atomically; a reader can catch the gap."""
+def read_state(root, attempts=40):
+    """Read the bot state from SQLite (the daemon owns the connection)."""
     last = None
     for _ in range(attempts):
         try:
-            with open(path, encoding="utf-8") as handle:
-                return json.load(handle)
-        except (PermissionError, FileNotFoundError, json.JSONDecodeError) as error:
+            conn = sqlite3.connect(os.path.join(root, "voice-button.sqlite3"), timeout=5)
+            conn.row_factory = sqlite3.Row
+            kv = {row["key"]: row["value"] for row in conn.execute("SELECT key, value FROM kv")}
+            current = None
+            row = conn.execute("SELECT * FROM telegram_current WHERE id = 1").fetchone()
+            if row:
+                current = {key: row[key] for key in row.keys() if key != "id"}
+            columns = (
+                "update_id, chat_id, message_id, file_id, file_name, kind, size, seconds, "
+                "done_seconds, stage, progress, text, error, sender, original_at, "
+                "received_at, started_at"
+            )
+            queue = [
+                {key: row[key] for key in row.keys()}
+                for row in conn.execute(
+                    f"SELECT {columns} FROM telegram_queue ORDER BY position"
+                )
+            ]
+            chat = [
+                {key: row[key] for key in row.keys()}
+                for row in conn.execute(
+                    "SELECT chat_id, message_id, at, sender, kind, file_name, seconds, "
+                    "text, error FROM telegram_chat ORDER BY id"
+                )
+            ]
+            conn.close()
+            return {
+                "owner": int(kv["telegram.owner"]) if kv.get("telegram.owner") else None,
+                "current": current,
+                "queue": queue,
+                "chat": chat,
+            }
+        except (sqlite3.Error, OSError, ValueError, KeyError) as error:
             last = error
             time.sleep(0.1)
     raise last
 
+
+def read_history(root, attempts=40):
+    last = None
+    for _ in range(attempts):
+        try:
+            conn = sqlite3.connect(os.path.join(root, "voice-button.sqlite3"), timeout=5)
+            conn.row_factory = sqlite3.Row
+            rows = []
+            for row in conn.execute(
+                "SELECT at, text, model, source, state, audio, group_name, message_id "
+                "FROM history ORDER BY id"
+            ):
+                entry = {key: row[key] for key in row.keys()}
+                entry["group"] = entry.pop("group_name")
+                entry["message"] = entry.pop("message_id")
+                entry["parts"] = []
+                rows.append(entry)
+            conn.close()
+            return rows
+        except (sqlite3.Error, OSError, ValueError) as error:
+            last = error
+            time.sleep(0.1)
+    raise last
 
 def main():
     server = ThreadingHTTPServer(("127.0.0.1", 0), FakeBot)
@@ -188,7 +244,8 @@ def main():
                 "message": {
                     "message_id": 11,
                     "chat": {"id": owner, "type": "private"},
-                    "from": {"id": owner, "is_bot": False},
+                    "from": {"id": owner, "is_bot": False, "first_name": "Owner", "username": "owner"},
+            "date": int(time.time()),
                     "text": "/start",
                 },
             },
@@ -197,7 +254,8 @@ def main():
                 "message": {
                     "message_id": 12,
                     "chat": {"id": owner, "type": "private"},
-                    "from": {"id": owner, "is_bot": False},
+                    "from": {"id": owner, "is_bot": False, "first_name": "Owner", "username": "owner"},
+            "date": int(time.time()),
                     "voice": {
                         "file_id": "voice-1",
                         "file_size": len(server.media),
@@ -218,6 +276,11 @@ def main():
             "Не удалось" not in reply.get("text", ""),
             "the reply is a transcript, not an error",
         )
+        print("  reply text:", reply.get("text", ""))
+        check(
+            bool(re.match(r"^\[\d{2}\.\d{2}\.\d{2} \d{2}:\d{2} UTC[+-]\d{2}:\d{2}\] Owner \(@owner\): ", reply.get("text", ""))),
+            "the reply names the sender and the original date",
+        )
         check(
             any(
                 reaction.get("message_id") == 12
@@ -234,16 +297,13 @@ def main():
             ),
             "the bot finishes with ✅",
         )
-        state_path = os.path.join(root, "telegram.state.json")
-        state = read_json(state_path)
+        state = read_state(root)
         check(state.get("owner") == owner, "the owner was stored")
         check(
             any(entry.get("message_id") == 12 and entry.get("text") for entry in state.get("chat", [])),
             "the desktop chat got the entry",
         )
-        history = os.path.join(root, "history.jsonl")
-        with open(history, encoding="utf-8") as handle:
-            entries = [json.loads(line) for line in handle if line.strip()]
+        entries = read_history(root)
         check(
             any(entry.get("source") == "telegram" for entry in entries),
             "the result is in History with the telegram source",
@@ -263,7 +323,8 @@ def main():
                 "message": {
                     "message_id": 30,
                     "chat": {"id": owner, "type": "private"},
-                    "from": {"id": owner, "is_bot": False},
+                    "from": {"id": owner, "is_bot": False, "first_name": "Owner", "username": "owner"},
+            "date": int(time.time()),
                     "text": "/status",
                 },
             }
@@ -317,7 +378,7 @@ def main():
         check(session is not None, "the computer took the engine")
         server.updates = [voice_update(40, owner, server.media)]
         e2e.wait_for(
-            lambda: (read_json(state_path).get("current") or {}).get("stage")
+            lambda: (read_state(root).get("current") or {}).get("stage")
             in ("engine busy", "движок занят"),
             timeout=30,
             what="Telegram to report the paused engine",
@@ -358,6 +419,15 @@ def main():
             what="both album files to be answered",
         )
         check(True, "an album becomes one job and one reply per file")
+        media_dir = os.path.join(root, "telegram")
+        leftovers = os.listdir(media_dir) if os.path.isdir(media_dir) else []
+        check(not leftovers, f"downloaded audio is deleted after processing (left {leftovers})")
+        state_files = [
+            name
+            for name in os.listdir(root)
+            if name.endswith(".state.json") or name in ("session.json", "live.json")
+        ]
+        check(not state_files, f"no runtime JSON files in the data directory (got {state_files})")
     finally:
         daemon.stop()
         server.shutdown()

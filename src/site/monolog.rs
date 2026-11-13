@@ -89,6 +89,38 @@ impl Stage {
             Cancelled => "cancelled",
         }
     }
+
+    /// The value stored in the `stage` column. Lowercase with underscores,
+    /// stable across releases because no old database is ever read.
+    pub fn as_storage(self) -> &'static str {
+        use Stage::*;
+        match self {
+            Draft => "draft",
+            Uploading => "uploading",
+            Queued => "queued",
+            Transcribing => "transcribing",
+            Done => "done",
+            Silent => "silent",
+            NoModel => "no_model",
+            Failed => "failed",
+            Cancelled => "cancelled",
+        }
+    }
+
+    pub fn from_storage(value: &str) -> Self {
+        use Stage::*;
+        match value {
+            "uploading" => Uploading,
+            "queued" => Queued,
+            "transcribing" => Transcribing,
+            "done" => Done,
+            "silent" => Silent,
+            "no_model" => NoModel,
+            "failed" => Failed,
+            "cancelled" => Cancelled,
+            _ => Draft,
+        }
+    }
 }
 
 /// A named thread of dictations.

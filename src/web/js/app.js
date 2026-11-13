@@ -24,15 +24,33 @@ import { describe } from './stage.mjs';
 import { applyInstallEntry, installEntry } from './install.mjs';
 import { backTarget, viewState } from './back.mjs';
 import { buildFeed, dayKey, messageExpanded, recordingMessage, swipeDirection } from './chat.mjs';
-import { atBottom, nextScroll } from './scroll.mjs';
+import { atBottom } from './scroll.mjs';
 import { SITE_VERSION } from './version.mjs';
 import { Offline } from './offline.mjs';
-import { bootOutcome, createCache, mergeMonologs } from './cache.mjs';
+import { bootOutcome, createCache } from './cache.mjs';
 
 const API = '/site/api';
 const RATE = 16000;
 const CHUNK_SECONDS = 0.5;
 const CHUNK_SAMPLES = Math.round(RATE * CHUNK_SECONDS);
+
+// The page reads the feed and the list one page at a time, then keeps only the
+// visible rows in the DOM. Heights are measured once a row has been on screen;
+// the estimates below are only used for rows that have never been measured.
+const LIST_PAGE = 100;
+const FEED_PAGE = 50;
+const EST_MONOLOG = 128;
+const EST_MESSAGE = 104;
+const EST_DAY = 40;
+const EST_UNSENT = 104;
+const EST_EMPTY = 80;
+const EST_NEW_MONOLOG = 60;
+const LOAD_MORE_PX = 700;
+const OVERSCAN_MIN = 300;
+// Messages kept in JS. Older pages are dropped from the far end while the
+// reader moves up, newer ones while the reader moves down; the store keeps them
+// all, so scrolling back reads the page again.
+const FEED_WINDOW = 320;
 
 // The token may arrive in the fragment when the page is moved between the
 // public and the local address: fragments never reach the server.
@@ -50,16 +68,17 @@ const app = {
   sync: null,
   loop: null,
   cache: null,
-  monologs: [],
+  screen: 'list',
   monolog: null,
-  messages: [],
+  lists: new Map(),
+  listState: null,
+  feed: null,
   archived: false,
   recording: null,
   installPrompt: null,
   installed: false,
   sheets: [],
   sheetId: 0,
-  chatFirst: false,
   expandedMessage: null,
   swiping: false,
   recordingMonolog: null,
@@ -142,13 +161,15 @@ async function loadLanguage() {
   labelStatic();
 }
 
-/// Labels that live outside the drawn list: icons, the pair error and the
-/// recording hint. Keeping them here means index.html carries no language.
+/// Labels that live outside the drawn list: icons, the pair error, the version
+/// badge and the recording hint. Keeping them here means index.html carries no
+/// language.
 function labelStatic() {
   el('back').setAttribute('aria-label', t('back'));
   el('archive').setAttribute('aria-label', t('archive'));
   el('menu').setAttribute('aria-label', t('monolog'));
   el('record').setAttribute('aria-label', t('record'));
+  el('version').setAttribute('aria-label', t('site_version'));
   el('reload').textContent = t('reload');
 }
 
@@ -311,36 +332,6 @@ function dayLabel(key) {
 
 // ---------------------------------------------------------------- views
 
-/// Put a rendered fragment on screen.
-///
-/// `mode` is `chat` for a monolog: it opens at the newest message and follows
-/// new ones only while the reader is already at the bottom. A redraw must never
-/// pull someone away from the message they are reading.
-function show(view, mode = 'keep', forcedTop = null) {
-  const page = el('view');
-  const wasAtBottom = atBottom({
-    offset: page.scrollTop,
-    height: page.scrollHeight,
-    viewport: page.clientHeight,
-  });
-  const previous = page.scrollTop;
-  el('app').hidden = false;
-  el('pair-error').hidden = true;
-  page.replaceChildren(view);
-  page.scrollTop =
-    forcedTop !== null
-      ? forcedTop
-      : nextScroll({
-          mode,
-          first: app.chatFirst === true,
-          atBottom: wasAtBottom,
-          height: page.scrollHeight,
-          viewport: page.clientHeight,
-          previous,
-        });
-  if (mode === 'chat') app.chatFirst = false;
-}
-
 function header(title, options = {}) {
   el('title').textContent = title;
   el('back').hidden = !options.back;
@@ -358,6 +349,19 @@ function button(label, className, onClick) {
   return node;
 }
 
+/// A button that the one delegated click handler on #view understands.
+function actionButton(label, className, act, data = {}) {
+  const node = document.createElement('button');
+  node.type = 'button';
+  node.textContent = label;
+  if (className) node.className = className;
+  node.dataset.act = act;
+  for (const [key, value] of Object.entries(data)) {
+    if (value !== undefined && value !== null) node.dataset[key] = String(value);
+  }
+  return node;
+}
+
 function chip(label, kind) {
   const node = document.createElement('span');
   node.className = 'chip ' + (kind || '');
@@ -372,77 +376,484 @@ function empty(text) {
   return node;
 }
 
-/// Draw the list from what is stored. The refresh from the computer is the sync
-/// loop's work, so this never fails on a dead connection.
-function drawMonologs(monologs, pending, top = null) {
-  // The sync loop redraws the list while the finger is still on a card. That
-  // replaced the card under the finger and snapped the swipe back; leave the
-  // list alone until the gesture has finished.
-  if (app.swiping) return;
-  app.monologs = monologs;
-  const view = document.createDocumentFragment();
-  if (monologs.length === 0) {
-    view.append(empty(app.archived ? t('archive_empty') : t('no_monologs')));
-  }
-  for (const monolog of monologs) {
-    const card = document.createElement('div');
-    card.className = 'monolog-card';
-    card.setAttribute('role', 'button');
-    card.tabIndex = 0;
-    card.innerHTML =
-      '<div class="top"><strong></strong><span class="when"></span>' +
-      '<button class="more" type="button" aria-label="⋯">⋯</button></div>' +
-      '<div class="last"></div><div class="count"></div>';
-    card.querySelector('strong').textContent = monolog.name;
-    if (monolog.local) {
-      card.querySelector('.top').append(chip(t('waiting_link'), 'unsent'));
-    }
-    const when = cardDate(monolog.lastAt || monolog.created);
-    card.querySelector('.when').textContent = when;
-    card.querySelector('.last').textContent = monolog.last || '';
-    // Takes that never reached the computer are not in its count yet, so the
-    // card has to add them: an offline monolog used to show "0 messages" right
-    // after the user dictated into it.
-    const waiting = (pending || []).filter(
-      (take) => take.monolog === monolog.id && !take.remote
-    ).length;
-    card.querySelector('.count').textContent = countLabel(
-      monolog.local ? waiting : (monolog.count || 0) + waiting
-    );
-    // A monolog with work in it is visible from the list: recording here, or
-    // the computer still transcribing.
-    if (
-      monolog.busy ||
-      (app.recording && app.recording.take.monolog === monolog.id)
-    ) {
-      card.classList.add('active');
-    }
-    card.querySelector('.more').addEventListener('click', (event) => {
-      event.stopPropagation();
-      monologMenuSheet(monolog);
-    });
-    card.addEventListener('click', (event) => {
-      if (event.target.closest('.more')) return;
-      openMonolog(monolog);
-    });
-    const row = document.createElement('div');
-    row.className = 'swipe-row';
-    const action = document.createElement('div');
-    action.className = 'swipe-action' + (app.archived ? ' out' : '');
-    action.textContent = app.archived ? t('unarchive') : t('archive');
-    row.append(action, card);
-    if (!monolog.local) attachSwipe(row, card, action, monolog);
-    view.append(row);
-  }
-  if (!app.archived) {
-    const create = document.createElement('button');
-    create.className = 'new-monolog';
-    create.textContent = t('new_monolog');
-    create.addEventListener('click', createMonologSheet);
-    view.append(create);
-  }
-  show(view, 'keep', top);
+// ---------------------------------------------------------------- virtual list
+//
+// The feed and the monolog list are one scrolling column in #view. The page
+// keeps an ordered row list (a page of messages, a page of monologs), measured
+// heights for rows it has seen, and renders only rows in the visible window
+// plus one screen of overscan. Two spacers stand in for everything that is not
+// in the DOM, so the scrollbar still describes the real extent.
+
+function padTop() {
+  const value = parseFloat(getComputedStyle(el('view')).paddingTop);
+  return Number.isFinite(value) ? value : 0;
 }
+
+function activeState() {
+  if (app.screen === 'feed' && app.feed) return app.feed;
+  if (app.screen === 'list' && app.listState) return app.listState;
+  return null;
+}
+
+function rowHeight(state, row) {
+  const saved = state.heights.get(row.key);
+  if (saved && saved.sig === row.sig) return saved.height;
+  return row.estimate;
+}
+
+function layoutRows(state) {
+  const rows = state.rows;
+  const offsets = new Array(rows.length);
+  const heights = new Array(rows.length);
+  let total = state.extraTop || 0;
+  for (let index = 0; index < rows.length; index += 1) {
+    offsets[index] = total;
+    heights[index] = rowHeight(state, rows[index]);
+    total += heights[index];
+  }
+  return { offsets, heights, total };
+}
+
+function visibleRows(state, layout, scrollTop, viewport) {
+  const rows = state.rows;
+  if (rows.length === 0) return { start: 0, end: 0 };
+  const overscan = Math.max(OVERSCAN_MIN, viewport);
+  const from = Math.max(0, scrollTop - overscan);
+  const to = scrollTop + viewport + overscan;
+  let start = 0;
+  while (
+    start < rows.length &&
+    layout.offsets[start] + layout.heights[start] < from
+  ) {
+    start += 1;
+  }
+  let end = start;
+  while (end < rows.length && layout.offsets[end] < to) end += 1;
+  if (end === start && start < rows.length) end = start + 1;
+  return { start, end };
+}
+
+function spacer(height) {
+  const node = document.createElement('div');
+  node.className = 'vspacer';
+  node.setAttribute('aria-hidden', 'true');
+  node.style.height = Math.max(0, Math.round(height)) + 'px';
+  return node;
+}
+
+function virtualRow(state, row, index) {
+  const node = document.createElement('div');
+  node.className = 'vrow';
+  node.dataset.index = String(index);
+  node.dataset.key = row.key;
+  node.append(row.build());
+  return node;
+}
+
+/// Where the first visible row sits, so a repaint (or older messages arriving
+/// above it) can keep that row exactly where the reader had it.
+function captureAnchor(state, layout) {
+  if (state.scrollToBottom) return null;
+  const view = el('view');
+  const pad = padTop();
+  const top = Math.max(0, view.scrollTop - pad);
+  for (let index = 0; index < state.rows.length; index += 1) {
+    if (layout.offsets[index] + layout.heights[index] <= top) continue;
+    return { key: state.rows[index].key, distance: layout.offsets[index] - top };
+  }
+  return null;
+}
+
+/// Remember the reader's place before the rows change. Capturing after a page
+/// was prepended would anchor to the new top row and lose the position.
+function rememberAnchor(state) {
+  state.anchor = state.scrollToBottom ? null : captureAnchor(state, layoutRows(state));
+}
+
+function schedulePaint(state = activeState()) {
+  if (!state || state.painting || state.paintQueued) return;
+  state.paintQueued = true;
+  requestAnimationFrame(() => {
+    state.paintQueued = false;
+    if (state === activeState()) paintVirtual(state);
+  });
+}
+
+function paintVirtual(state) {
+  if (!state || state !== activeState() || state.painting) return;
+  if (app.swiping) return;
+  const view = el('view');
+  state.painting = true;
+  let again = false;
+  try {
+    const pad = padTop();
+    const viewport = view.clientHeight || 600;
+    const oldScroll = Math.max(0, view.scrollTop - pad);
+    const oldLayout = layoutRows(state);
+    const anchor =
+      state.anchor !== undefined
+        ? state.anchor
+        : captureAnchor(state, oldLayout);
+    state.anchor = undefined;
+    const scrollToBottom = state.scrollToBottom === true;
+    state.scrollToBottom = false;
+    const maxScroll = Math.max(0, oldLayout.total - viewport);
+    const scrollTop = scrollToBottom ? maxScroll : Math.min(oldScroll, maxScroll);
+    const windowRange = visibleRows(state, oldLayout, scrollTop, viewport);
+
+    const fragment = document.createDocumentFragment();
+    const topHeight = oldLayout.offsets[windowRange.start] || 0;
+    if (topHeight > 0.5) fragment.append(spacer(topHeight));
+    for (let index = windowRange.start; index < windowRange.end; index += 1) {
+      fragment.append(virtualRow(state, state.rows[index], index));
+    }
+    const last = windowRange.end - 1;
+    const bottomHeight =
+      last >= windowRange.start
+        ? oldLayout.total - (oldLayout.offsets[last] + oldLayout.heights[last])
+        : Math.max(0, oldLayout.total - topHeight);
+    if (bottomHeight > 0.5) fragment.append(spacer(bottomHeight));
+
+    const previousScrollTop = view.scrollTop;
+    view.replaceChildren(fragment);
+    view.scrollTop = previousScrollTop;
+
+    // Measure what really landed on screen. Rows above and below keep their
+    // estimate until they are seen; only measured rows contribute an exact
+    // height to the scroll extent.
+    let measured = false;
+    for (const node of view.querySelectorAll('.vrow')) {
+      const index = Number(node.dataset.index);
+      const row = state.rows[index];
+      if (!row) continue;
+      const height = Math.max(0, node.getBoundingClientRect().height);
+      const saved = state.heights.get(row.key);
+      if (!saved || saved.sig !== row.sig || Math.abs(saved.height - height) > 0.5) {
+        state.heights.set(row.key, { height, sig: row.sig });
+        measured = true;
+      }
+    }
+
+    const nextLayout = measured ? layoutRows(state) : oldLayout;
+    if (scrollToBottom) {
+      view.scrollTop = Math.max(0, view.scrollHeight - view.clientHeight);
+    } else if (anchor) {
+      const index = state.rows.findIndex((row) => row.key === anchor.key);
+      view.scrollTop =
+        index >= 0
+          ? Math.max(0, pad + nextLayout.offsets[index] - anchor.distance)
+          : Math.max(0, pad + scrollTop);
+    } else {
+      view.scrollTop = Math.max(0, pad + scrollTop);
+    }
+    state.window = windowRange;
+    state.painted = true;
+    const visible = visibleRows(
+      state,
+      nextLayout,
+      Math.max(0, view.scrollTop - pad),
+      viewport,
+    );
+    again =
+      measured &&
+      (visible.start < windowRange.start || visible.end > windowRange.end);
+  } finally {
+    state.painting = false;
+    if (again) schedulePaint(state);
+  }
+}
+
+function mountScreen() {
+  const view = el('view');
+  el('app').hidden = false;
+  el('pair-error').hidden = true;
+  view.classList.add('virtual');
+  view.replaceChildren();
+  view.scrollTop = 0;
+}
+
+function onViewScroll() {
+  const state = activeState();
+  if (!state || state.painting) return;
+  if (state.kind === 'feed') onFeedScroll(state);
+  else onListScroll(state);
+  schedulePaint(state);
+}
+
+el('view').addEventListener('scroll', onViewScroll, { passive: true });
+window.addEventListener('resize', () => schedulePaint());
+
+// ---------------------------------------------------------------- monolog list
+
+function createListState(archived) {
+  return {
+    kind: 'list',
+    archived: Boolean(archived),
+    records: [],
+    pending: [],
+    total: 0,
+    loading: false,
+    heights: new Map(),
+    rows: [],
+    extraTop: 0,
+    window: { start: 0, end: 0 },
+    painting: false,
+    paintQueued: false,
+    scrollToBottom: false,
+    painted: false,
+  };
+}
+
+function monologSignature(monolog, waiting, recordingHere) {
+  return [
+    monolog.id,
+    monolog.name,
+    monolog.lastAt || monolog.created || '',
+    monolog.last || '',
+    monolog.count || 0,
+    monolog.local ? 1 : 0,
+    monolog.busy ? 1 : 0,
+    waiting,
+    recordingHere ? 1 : 0,
+  ].join('|');
+}
+
+function buildListRows(state) {
+  const rows = state.records.map((monolog) => {
+    const waiting = state.pending.filter(
+      (take) => Number(take.monolog) === Number(monolog.id) && !take.remote,
+    ).length;
+    // A take recorded right now belongs to this card too, and the card has to
+    // be repainted when it starts or stops.
+    const recordingHere = Boolean(
+      app.recording && Number(app.recording.take.monolog) === Number(monolog.id),
+    );
+    return {
+      key: 'monolog:' + monolog.id,
+      sig: monologSignature(monolog, waiting, recordingHere),
+      estimate: EST_MONOLOG,
+      build: () => monologRowNode(monolog, waiting, recordingHere),
+    };
+  });
+  if (state.records.length === 0) {
+    rows.push({
+      key: 'empty',
+      sig: 'empty:' + (state.archived ? 1 : 0),
+      estimate: EST_EMPTY,
+      build: () => empty(state.archived ? t('archive_empty') : t('no_monologs')),
+    });
+  }
+  if (!state.archived && state.records.length >= state.total) {
+    rows.push({
+      key: 'new-monolog',
+      sig: 'new-monolog',
+      estimate: EST_NEW_MONOLOG,
+      build: () => {
+        const create = document.createElement('button');
+        create.className = 'new-monolog';
+        create.textContent = t('new_monolog');
+        create.dataset.act = 'new-monolog';
+        return create;
+      },
+    });
+  }
+  return rows;
+}
+
+function monologRowNode(monolog, waiting, recordingHere = false) {
+  const card = document.createElement('div');
+  card.className = 'monolog-card';
+  card.setAttribute('role', 'button');
+  card.tabIndex = 0;
+  card.dataset.card = 'monolog';
+  card.dataset.id = String(monolog.id);
+  card.innerHTML =
+    '<div class="top"><strong></strong><span class="when"></span>' +
+    '<button class="more" type="button" aria-label="⋯" data-act="monolog-menu"></button></div>' +
+    '<div class="last"></div><div class="count"></div>';
+  card.querySelector('.more').textContent = '⋯';
+  card.querySelector('.more').dataset.id = String(monolog.id);
+  card.querySelector('strong').textContent = monolog.name;
+  if (monolog.local) {
+    card.querySelector('.top').append(chip(t('waiting_link'), 'unsent'));
+  }
+  card.querySelector('.when').textContent = cardDate(monolog.lastAt || monolog.created);
+  card.querySelector('.last').textContent = monolog.last || '';
+  // Takes that never reached the computer are not in its count yet, so the
+  // card has to add them: an offline monolog used to show "0 messages" right
+  // after the user dictated into it.
+  card.querySelector('.count').textContent = countLabel(
+    monolog.local ? waiting : (monolog.count || 0) + waiting,
+  );
+  // Unfinished work is visible from the list, in two different colours, because
+  // the reason matters: the computer is working on it (lime, and this card is
+  // the one being recorded into), or the take is still on the phone waiting for
+  // a connection (amber).
+  const working = monolog.busy || recordingHere;
+  if (working) card.classList.add('active');
+  if (waiting > 0) card.classList.add('unsent');
+  if (working) card.title = t('card_working');
+  else if (waiting > 0) card.title = t('card_unsent');
+  const row = document.createElement('div');
+  row.className = 'swipe-row';
+  const action = document.createElement('div');
+  action.className = 'swipe-action' + (app.archived ? ' out' : '');
+  action.textContent = app.archived ? t('unarchive') : t('archive');
+  row.append(action, card);
+  if (!monolog.local) attachSwipe(row, card, action, monolog);
+  return row;
+}
+
+function appendListRecords(state, list) {
+  const seen = new Set(state.records.map((record) => Number(record.id)));
+  let added = 0;
+  for (const record of list) {
+    const id = Number(record.id);
+    if (seen.has(id)) continue;
+    seen.add(id);
+    state.records.push(record);
+    added += 1;
+  }
+  return added;
+}
+
+async function refreshListState(state) {
+  rememberAnchor(state);
+  const count = Math.max(LIST_PAGE, state.records.length);
+  const page = await app.cache.monologPage(state.archived, 0, count);
+  state.records = page.monologs;
+  const localCount = state.archived ? 0 : (await app.cache.localMonologs()).length;
+  const serverTotal = app.sync ? app.sync.monologTotal(state.archived) : null;
+  state.total = Math.max(
+    page.total,
+    serverTotal == null ? 0 : serverTotal + localCount,
+    state.records.length,
+  );
+  state.rows = buildListRows(state);
+}
+
+async function loadMoreList(state) {
+  if (state.loading || state.records.length >= state.total) return;
+  state.loading = true;
+  rememberAnchor(state);
+  try {
+    let page = await app.cache.monologPage(
+      state.archived,
+      state.records.length,
+      LIST_PAGE,
+    );
+    let added = appendListRecords(state, page.monologs);
+    if (added === 0 && state.records.length < state.total && app.sync) {
+      const cachedServer = await app.cache.serverMonologCount(state.archived);
+      const answer = await app.sync.fetchMonologPage(
+        state.archived,
+        cachedServer,
+        LIST_PAGE,
+      );
+      if (answer) {
+        const localCount = state.archived
+          ? 0
+          : (await app.cache.localMonologs()).length;
+        if (answer.total != null) {
+          state.total = Math.max(state.total, answer.total + localCount);
+        }
+        page = await app.cache.monologPage(
+          state.archived,
+          state.records.length,
+          LIST_PAGE,
+        );
+        added = appendListRecords(state, page.monologs);
+        if (answer.hasMore === false && added === 0) state.total = state.records.length;
+      } else {
+        // Offline: whatever is stored is the whole list there is.
+        state.total = state.records.length;
+      }
+    }
+    if (added === 0 && page.total <= state.records.length) {
+      state.total = state.records.length;
+    }
+    state.rows = buildListRows(state);
+    paintVirtual(state);
+  } finally {
+    state.loading = false;
+  }
+}
+
+function onListScroll(state) {
+  const layout = layoutRows(state);
+  const view = el('view');
+  const pad = padTop();
+  const below = layout.total + pad - (view.scrollTop + view.clientHeight);
+  if (below < LOAD_MORE_PX && state.records.length < state.total && !state.loading) {
+    loadMoreList(state).catch(() => {});
+  }
+}
+
+function findMonolog(id) {
+  const state = app.listState;
+  if (state) {
+    const found = state.records.find((monolog) => Number(monolog.id) === Number(id));
+    if (found) return found;
+  }
+  if (app.monolog && Number(app.monolog.id) === Number(id)) return app.monolog;
+  return null;
+}
+
+/// One listener for every row ever rendered. Virtual rows come and go with the
+/// scroll window, so per-node listeners would be lost on every repaint.
+function onViewClick(event) {
+  const target = event.target && event.target.closest
+    ? event.target
+    : null;
+  if (!target) return;
+  const action = target.closest('[data-act]');
+  if (action) {
+    const act = action.dataset.act;
+    if (act === 'monolog-menu') {
+      const monolog = findMonolog(action.dataset.id);
+      if (monolog) monologMenuSheet(monolog);
+      return;
+    }
+    if (act === 'new-monolog') {
+      createMonologSheet();
+      return;
+    }
+    const feed = app.feed;
+    if (!feed) return;
+    if (act === 'discard') {
+      const take = feed.pending.find(
+        (item) => String(item.localId) === String(action.dataset.local),
+      );
+      if (take) discardTake(take);
+      return;
+    }
+    const message = messageInFeed(action.dataset.id);
+    if (!message) return;
+    if (act === 'expand') {
+      app.expandedMessage =
+        Number(app.expandedMessage) === Number(message.id) ? null : Number(message.id);
+      rememberAnchor(feed);
+      rebuildFeedRows(feed);
+      paintVirtual(feed);
+    } else if (act === 'copy') {
+      copy(message.text);
+    } else if (act === 'edit') {
+      editSheet(message);
+    } else if (act === 'retry') {
+      retryMessage(message);
+    } else if (act === 'delete') {
+      deleteSheet(message);
+    }
+    return;
+  }
+  const card = target.closest('[data-card="monolog"]');
+  if (card) {
+    const monolog = findMonolog(card.dataset.id);
+    if (monolog) openMonolog(monolog);
+  }
+}
+
+el('view').addEventListener('click', onViewClick);
 
 function attachSwipe(row, card, action, monolog) {
   let startX = 0;
@@ -544,18 +955,72 @@ function attachSwipe(row, card, action, monolog) {
   );
 }
 
-async function renderMonologs() {
+/// Draw the list from what is stored. The refresh from the computer is the sync
+/// loop's work, so this never fails on a dead connection.
+async function renderMonologs(top = undefined) {
+  if (app.swiping) return;
+  const wasList =
+    app.screen === 'list' &&
+    app.listState &&
+    app.listState.archived === app.archived;
+  const keep = wasList && top === undefined ? el('view').scrollTop : null;
+  const key = app.archived ? '1' : '0';
   app.monolog = null;
+  app.screen = 'list';
+  app.feed = null;
   app.sync.show(0);
   app.sync.archive(app.archived);
   header(app.archived ? t('archive') : t('monologs'), {
     hideArchive: app.archived,
   });
   updateComposer();
-  const local = app.archived ? [] : await app.cache.localMonologs();
-  const server = await app.cache.serverMonologs(app.archived);
-  const pending = await app.outbox.list();
-  drawMonologs(mergeMonologs(server, local), pending, app.archived ? app.archiveTop : app.listTop);
+  let state = app.lists.get(key);
+  if (!state) {
+    state = createListState(app.archived);
+    app.lists.set(key, state);
+    const page = await app.cache.monologPage(app.archived, 0, LIST_PAGE);
+    state.records = page.monologs;
+    const localCount = app.archived ? 0 : (await app.cache.localMonologs()).length;
+    const serverTotal = app.sync.monologTotal(app.archived);
+    state.total = Math.max(
+      page.total,
+      serverTotal == null ? 0 : serverTotal + localCount,
+      state.records.length,
+    );
+  } else {
+    await refreshListState(state);
+  }
+  state.pending = await app.outbox.list();
+  state.rows = buildListRows(state);
+  app.listState = state;
+  mountScreen();
+  paintVirtual(state);
+  const target =
+    top !== undefined
+      ? top
+      : keep !== null
+        ? keep
+        : app.archived
+          ? app.archiveTop
+          : app.listTop;
+  if (target > 0) {
+    // Coming back into the middle of a long list: page until the saved offset
+    // is inside the list, one page at a time.
+    const view = el('view');
+    let guard = 0;
+    while (
+      guard < 20 &&
+      state.records.length < state.total &&
+      layoutRows(state).total + padTop() < target + view.clientHeight
+    ) {
+      const before = state.records.length;
+      await loadMoreList(state);
+      guard += 1;
+      if (state.records.length === before) break;
+    }
+  }
+  el('view').scrollTop = Math.max(0, Number(target) || 0);
+  schedulePaint(state);
   // The loop is the only timer: ask it to refresh instead of fetching here.
   if (app.loop) app.loop.kick();
 }
@@ -572,15 +1037,28 @@ async function openMonolog(monolog) {
   app.monolog = { id: monolog.id, name: monolog.name, local: !!monolog.local };
   // A freshly opened chat starts at the newest message; after that the reader
   // owns the scroll position.
-  app.chatFirst = true;
+  app.screen = 'feed';
   app.sync.show(monolog.id);
   // An archived monolog can be read and pulled out of the archive, never
   // changed or recorded into.
   header(monolog.name, { back: true, composer: !app.archived, menu: true });
   updateComposer();
-  // Cached messages and the waiting takes are on the screen before the
-  // computer is asked, so opening a monolog offline is never a blank wait.
-  draw(await app.cache.messages(monolog.id), await app.outbox.list());
+  mountScreen();
+  const feed = createFeedState(app.monolog);
+  app.feed = feed;
+  // Cached pages and the waiting takes are on the screen before the computer
+  // is asked, so opening a monolog offline is never a blank wait.
+  feed.pending = (await app.outbox.list()).filter(
+    (take) => Number(take.monolog) === Number(monolog.id) && !take.remote,
+  );
+  const page = await app.cache.messagePage(monolog.id, { limit: FEED_PAGE });
+  feed.loaded = dedupeMessages(page.messages);
+  feed.byId = new Map(feed.loaded.map((message) => [Number(message.id), message]));
+  feed.total = Math.max(feed.loaded.length, await app.cache.messageCount(monolog.id));
+  feed.hasOlder = feed.loaded.length < feed.total || page.hasMore === true;
+  feed.scrollToBottom = true;
+  rebuildFeedRows(feed);
+  paintVirtual(feed);
   try {
     await app.sync.tick();
   } catch (error) {
@@ -589,33 +1067,412 @@ async function openMonolog(monolog) {
   }
 }
 
-/// Draw the list the sync loop fetched. Rendering must never start a fetch or
-/// a timer: the loop is the only thing that does that.
-function draw(messages, pending) {
-  if (!app.monolog) return;
-  app.messages = messages;
-  app.pending = pending || [];
-  const view = document.createDocumentFragment();
-  const rows = buildFeed(messages);
-  const waiting = (pending || []).filter(
-    (take) => !take.remote && take.monolog === app.monolog.id
-  );
-  if (rows.length === 0 && waiting.length === 0) {
-    view.append(empty(t('no_messages')));
+// ---------------------------------------------------------------- feed
+//
+// The feed keeps a contiguous, oldest-first slice of the monolog: the newest
+// page on open, older pages prepended while the reader scrolls up. The rows in
+// between are day separators and message cards; the page adds one height per
+// measured row and a spacer for the older messages that are not loaded yet.
+
+function createFeedState(monolog) {
+  return {
+    kind: 'feed',
+    monolog: { ...monolog },
+    loaded: [],
+    byId: new Map(),
+    pending: [],
+    total: 0,
+    hasOlder: false,
+    atNewest: true,
+    loadingOlder: false,
+    loadingNewer: false,
+    heights: new Map(),
+    rows: [],
+    extraTop: 0,
+    window: { start: 0, end: 0 },
+    painting: false,
+    paintQueued: false,
+    scrollToBottom: false,
+    painted: false,
+  };
+}
+
+function contentSignature(message) {
+  return [
+    message.id,
+    message.recorded || '',
+    message.stage || '',
+    message.text || '',
+    message.edited ? 1 : 0,
+    message.waiting ? 1 : 0,
+  ].join('|');
+}
+
+function rowSignature(message) {
+  return [
+    contentSignature(message),
+    app.expandedMessage === message.id ? 1 : 0,
+    recordingMessage(app.recording, message.id) ? 1 : 0,
+    app.archived ? 1 : 0,
+  ].join('|');
+}
+
+function takeSignature(take) {
+  return [
+    take.localId,
+    take.remote ?? '',
+    take.recorded || '',
+    take.closed ? 1 : 0,
+    take.monolog ?? '',
+  ].join('|');
+}
+
+function compareMessages(left, right) {
+  const a = String(left.recorded || '');
+  const b = String(right.recorded || '');
+  if (a < b) return -1;
+  if (a > b) return 1;
+  return Number(left.id) - Number(right.id);
+}
+
+function dedupeMessages(list) {
+  const seen = new Set();
+  const found = [];
+  for (const message of list || []) {
+    const id = Number(message.id);
+    if (!Number.isFinite(id) || seen.has(id)) continue;
+    seen.add(id);
+    found.push(message);
   }
-  for (const row of rows) {
+  found.sort(compareMessages);
+  return found;
+}
+
+function insertMessage(feed, message) {
+  const index = feed.loaded.findIndex((other) => compareMessages(other, message) > 0);
+  if (index < 0) feed.loaded.push(message);
+  else feed.loaded.splice(index, 0, message);
+}
+
+function messageEstimate(message) {
+  if (!message.text) return 96;
+  if (message.text.length > 320) {
+    const expanded = messageExpanded(app.recording, message.id, app.expandedMessage);
+    return expanded ? 320 : 132;
+  }
+  return EST_MESSAGE;
+}
+
+function rebuildFeedRows(feed) {
+  const rows = [];
+  for (const row of buildFeed(feed.loaded)) {
     if (row.kind === 'day') {
-      const separator = document.createElement('div');
-      separator.className = 'day';
-      separator.textContent = dayLabel(row.key);
-      view.append(separator);
+      rows.push({
+        key: 'day:' + row.key,
+        sig: 'day:' + row.key,
+        estimate: EST_DAY,
+        build: () => {
+          const separator = document.createElement('div');
+          separator.className = 'day';
+          separator.textContent = dayLabel(row.key);
+          return separator;
+        },
+      });
     } else {
-      view.append(messageCard(row.message));
+      const message = row.message;
+      rows.push({
+        key: 'msg:' + message.id,
+        sig: rowSignature(message),
+        estimate: messageEstimate(message),
+        build: () => messageCard(message),
+      });
     }
   }
-  for (const take of waiting) view.append(unsentCard(take));
-  show(view, 'chat');
+  for (const take of feed.pending) {
+    rows.push({
+      key: 'take:' + take.localId,
+      sig: takeSignature(take),
+      estimate: EST_UNSENT,
+      build: () => unsentCard(take),
+    });
+  }
+  if (rows.length === 0) {
+    rows.push({
+      key: 'empty',
+      sig: 'empty',
+      estimate: EST_EMPTY,
+      build: () => empty(t('no_messages')),
+    });
+  }
+  feed.rows = rows;
+  // Only loaded rows contribute to the scroll extent. Older pages are fetched
+  // when the reader reaches the top; the scroll position is anchored to the
+  // first visible row, so prepending a page never moves what is being read.
+  feed.extraTop = 0;
+}
+
+function samePending(left, right) {
+  if (left.length !== right.length) return false;
+  for (let index = 0; index < left.length; index += 1) {
+    if (takeSignature(left[index]) !== takeSignature(right[index])) return false;
+  }
+  return true;
+}
+
+/// Drop the messages that are farther from the reader than the window. The
+/// records are still on disk; the cursor for the next page is the remaining
+/// tail, so nothing is lost.
+function dropFeedMessages(feed, count, fromStart) {
+  if (count <= 0) return;
+  const removed = fromStart
+    ? feed.loaded.splice(0, count)
+    : feed.loaded.splice(feed.loaded.length - count, count);
+  for (const message of removed) feed.byId.delete(Number(message.id));
+}
+
+function pruneFeedHeights(feed) {
+  const keys = new Set(feed.rows.map((row) => row.key));
+  for (const key of [...feed.heights.keys()]) {
+    if (!keys.has(key)) feed.heights.delete(key);
+  }
+}
+
+/// The reader moved up: keep the older end, drop the newest messages from
+/// memory. They are fetched again with `after` on the way down.
+function trimFeedTail(feed) {
+  if (feed.loaded.length <= FEED_WINDOW) return false;
+  dropFeedMessages(feed, feed.loaded.length - FEED_WINDOW, false);
+  feed.atNewest = false;
+  return true;
+}
+
+/// The reader moved down: keep the newer end, drop the oldest messages from
+/// memory. They are fetched again with `before` on the way up.
+function trimFeedHead(feed) {
+  if (feed.loaded.length <= FEED_WINDOW) return false;
+  dropFeedMessages(feed, feed.loaded.length - FEED_WINDOW, true);
+  feed.hasOlder = true;
+  return true;
+}
+
+/// Draw the newest page the sync loop fetched. A redraw keeps the row the
+/// reader is looking at where it is; only a reader already at the bottom follows
+/// new messages.
+function draw(page, pending) {
+  const feed = app.feed;
+  if (!feed || !app.monolog) return;
+  if (page && page.monolog != null && Number(page.monolog) !== Number(feed.monolog.id)) {
+    return;
+  }
+  const view = el('view');
+  const wasAtBottom = atBottom({
+    offset: view.scrollTop,
+    height: view.scrollHeight,
+    viewport: view.clientHeight,
+  });
+  const messages = page && Array.isArray(page.messages) ? page.messages : [];
+  let changed = false;
+  rememberAnchor(feed);
+
+  const nextPending = (pending || []).filter(
+    (take) => Number(take.monolog) === Number(feed.monolog.id) && !take.remote,
+  );
+  if (!samePending(feed.pending, nextPending)) {
+    feed.pending = nextPending;
+    changed = true;
+  }
+
+  if (page && page.total != null) {
+    const total = Number(page.total);
+    if (Number.isFinite(total) && total !== feed.total) {
+      feed.total = Math.max(total, feed.loaded.length);
+      changed = true;
+    }
+  }
+
+  const lastLoaded = feed.loaded[feed.loaded.length - 1] || null;
+  // The reader is in an older window and the newest page starts after its
+  // tail: applying it would drag the window forward. The page is fetched again
+  // when the reader comes back down.
+  const blocked =
+    feed.atNewest === false &&
+    lastLoaded !== null &&
+    messages.length > 0 &&
+    compareMessages(messages[0], lastLoaded) > 0;
+  if (!blocked) {
+    for (const message of messages) {
+      const id = Number(message.id);
+      if (!Number.isFinite(id)) continue;
+      const previous = feed.byId.get(id);
+      if (previous) {
+        if (contentSignature(previous) !== contentSignature(message)) {
+          feed.byId.set(id, message);
+          const index = feed.loaded.findIndex((item) => Number(item.id) === id);
+          if (index >= 0) feed.loaded[index] = message;
+          changed = true;
+        }
+        continue;
+      }
+      feed.byId.set(id, message);
+      insertMessage(feed, message);
+      changed = true;
+    }
+  }
+  // The newest page did not touch the loaded tail: more than one page arrived
+  // since the last tick. Fill the gap with `after` pages instead of pretending
+  // the feed is contiguous.
+  const overlap =
+    lastLoaded && messages.length > 0 && compareMessages(messages[0], lastLoaded) <= 0;
+  const gap = Boolean(
+    !blocked && lastLoaded && messages.length >= FEED_PAGE && !overlap,
+  );
+
+  if (!changed) {
+    feed.anchor = undefined;
+    if (gap) fillNewer(feed).catch(() => {});
+    return;
+  }
+  feed.total = Math.max(feed.total, feed.loaded.length);
+  if (page && page.hasMore === true) feed.hasOlder = true;
+  if (!blocked && (messages.length === 0 || !lastLoaded || messages.length < FEED_PAGE || overlap)) {
+    feed.atNewest = true;
+  }
+  if (feed.loaded.length > FEED_WINDOW) {
+    if (wasAtBottom) trimFeedHead(feed);
+    else trimFeedTail(feed);
+  }
+  rebuildFeedRows(feed);
+  pruneFeedHeights(feed);
+  if (!feed.painted || wasAtBottom) feed.scrollToBottom = true;
+  paintVirtual(feed);
   updateComposer();
+  if (gap) fillNewer(feed).catch(() => {});
+}
+
+/// One older page, IndexedDB first. Prepending a page changes the content above
+/// the reader; `paintVirtual` anchors the first visible row so the screen does
+/// not jump.
+async function loadOlder(feed) {
+  if (feed.loadingOlder || !feed.hasOlder) return;
+  feed.loadingOlder = true;
+  try {
+    const first = feed.loaded[0] || null;
+    const cursor = first ? { recorded: first.recorded, id: first.id } : null;
+    const page = await app.sync.page(feed.monolog.id, {
+      before: cursor,
+      limit: FEED_PAGE,
+    });
+    if (feed !== app.feed) return;
+    if (page.total != null) {
+      const total = Number(page.total);
+      if (Number.isFinite(total)) feed.total = Math.max(feed.total, total);
+    }
+    rememberAnchor(feed);
+    let added = 0;
+    for (const message of page.messages) {
+      const id = Number(message.id);
+      if (!Number.isFinite(id) || feed.byId.has(id)) continue;
+      feed.byId.set(id, message);
+      feed.loaded.push(message);
+      added += 1;
+    }
+    if (added > 0) {
+      feed.loaded.sort(compareMessages);
+      feed.hasOlder =
+        page.hasMore === true || page.messages.length >= FEED_PAGE;
+      trimFeedTail(feed);
+      rebuildFeedRows(feed);
+      pruneFeedHeights(feed);
+      paintVirtual(feed);
+    } else {
+      feed.anchor = undefined;
+      feed.hasOlder = page.hasMore === true;
+    }
+  } finally {
+    feed.loadingOlder = false;
+  }
+}
+
+/// A page newer than the loaded tail, for the moments the in-memory window was
+/// trimmed or more than one page arrived between ticks. The normal newest page
+/// is the one `tick` fetches.
+async function fillNewer(feed) {
+  if (feed.loadingNewer || feed.atNewest) return;
+  feed.loadingNewer = true;
+  try {
+    let guard = 0;
+    while (guard < 20 && feed === app.feed) {
+      guard += 1;
+      const last = feed.loaded[feed.loaded.length - 1];
+      if (!last) break;
+      const page = await app.sync.page(feed.monolog.id, {
+        after: { recorded: last.recorded, id: last.id },
+        limit: FEED_PAGE,
+      });
+      if (feed !== app.feed) return;
+      if (page.messages.length === 0) {
+        feed.atNewest = true;
+        break;
+      }
+      rememberAnchor(feed);
+      let added = 0;
+      for (const message of page.messages) {
+        const id = Number(message.id);
+        if (!Number.isFinite(id) || feed.byId.has(id)) continue;
+        feed.byId.set(id, message);
+        feed.loaded.push(message);
+        added += 1;
+      }
+      if (added > 0) {
+        feed.loaded.sort(compareMessages);
+        trimFeedHead(feed);
+        rebuildFeedRows(feed);
+        pruneFeedHeights(feed);
+        paintVirtual(feed);
+      } else {
+        feed.anchor = undefined;
+      }
+      if (page.messages.length < FEED_PAGE) {
+        feed.atNewest = true;
+        break;
+      }
+    }
+  } finally {
+    feed.loadingNewer = false;
+  }
+}
+
+function onFeedScroll(feed) {
+  const view = el('view');
+  const pad = padTop();
+  const layout = layoutRows(feed);
+  const top = Math.max(0, view.scrollTop - pad);
+  if (top < LOAD_MORE_PX && feed.hasOlder && !feed.loadingOlder) {
+    loadOlder(feed).catch(() => {});
+  }
+  const below = layout.total + pad - (view.scrollTop + view.clientHeight);
+  if (below < 320 && !feed.atNewest && !feed.loadingNewer) {
+    fillNewer(feed).catch(() => {});
+  }
+}
+
+function removeFeedMessage(id) {
+  const feed = app.feed;
+  if (!feed) return;
+  const number = Number(id);
+  if (!feed.byId.has(number)) return;
+  rememberAnchor(feed);
+  feed.byId.delete(number);
+  feed.loaded = feed.loaded.filter((message) => Number(message.id) !== number);
+  feed.total = Math.max(feed.loaded.length, feed.total - 1);
+  feed.hasOlder = feed.loaded.length < feed.total;
+  rebuildFeedRows(feed);
+  paintVirtual(feed);
+}
+
+function messageInFeed(id) {
+  const feed = app.feed;
+  return feed ? feed.byId.get(Number(id)) || null : null;
 }
 
 function messageCard(message) {
@@ -659,9 +1516,8 @@ function messageCard(message) {
   card.append(text);
   if (long && !app.recording && !inRecording) {
     card.append(
-      button(expanded ? t('collapse') : t('expand'), 'more', () => {
-        app.expandedMessage = expanded ? null : message.id;
-        draw(app.messages, app.pending);
+      actionButton(expanded ? t('collapse') : t('expand'), 'more', 'expand', {
+        id: message.id,
       }),
     );
   }
@@ -675,13 +1531,15 @@ function messageCard(message) {
       continue;
     }
     if (action === 'copy') {
-      actions.append(button(t('copy'), 'action', () => copy(message.text)));
+      actions.append(actionButton(t('copy'), 'action', 'copy', { id: message.id }));
     } else if (action === 'edit') {
-      actions.append(button(t('edit'), 'action', () => editSheet(message)));
+      actions.append(actionButton(t('edit'), 'action', 'edit', { id: message.id }));
     } else if (action === 'retry') {
-      actions.append(button(t('retry'), 'action', () => retryMessage(message)));
+      actions.append(actionButton(t('retry'), 'action', 'retry', { id: message.id }));
     } else if (action === 'delete') {
-      actions.append(button(t('delete'), 'action danger', () => deleteSheet(message)));
+      actions.append(
+        actionButton(t('delete'), 'action danger', 'delete', { id: message.id }),
+      );
     }
   }
   if (actions.childElementCount > 0) card.append(actions);
@@ -702,7 +1560,9 @@ function unsentCard(take) {
   card.append(text);
   const actions = document.createElement('div');
   actions.className = 'actions';
-  actions.append(button(t('delete'), 'action danger', () => discardTake(take)));
+  actions.append(
+    actionButton(t('delete'), 'action danger', 'discard', { local: take.localId }),
+  );
   card.append(actions);
   return card;
 }
@@ -877,6 +1737,11 @@ function deleteSheet(message) {
     button(t('delete'), 'danger', async () => {
       try {
         await call('DELETE', '/messages/' + message.id);
+        await app.cache.deleteMessage(
+          Number(message.monolog ?? app.monolog?.id ?? 0),
+          message,
+        );
+        removeFeedMessage(message.id);
         close();
         await app.sync.tick();
       } catch (error) {
@@ -1014,7 +1879,7 @@ function createMonologSheet() {
         close();
         offlineNote();
       }
-      await renderMonologs();
+      await renderMonologs(0);
     })
   );
   input.focus();
@@ -1042,10 +1907,27 @@ async function discardTake(take) {
     } catch (error) {
       /* the server may already be gone; the local copy still has to go */
     }
+    try {
+      await app.cache.deleteMessage(
+        Number(app.monolog ? app.monolog.id : take.monolog),
+        { recorded: take.recorded, id: take.remote },
+      );
+    } catch (error) {
+      /* the page may already have dropped this record */
+    }
+    removeFeedMessage(take.remote);
   }
   await app.outbox.remove(take.localId);
   app.loop.kick();
-  draw(app.messages, await app.outbox.list());
+  const feed = app.feed;
+  if (feed) {
+    rememberAnchor(feed);
+    feed.pending = (await app.outbox.list()).filter(
+      (item) => Number(item.monolog) === Number(feed.monolog.id) && !item.remote,
+    );
+    rebuildFeedRows(feed);
+    paintVirtual(feed);
+  }
 }
 
 // ---------------------------------------------------------------- composer
@@ -1370,12 +2252,43 @@ async function registerServiceWorker() {
   }
 }
 
+/// The holiday microphone for today, drawn on the record button and as the tab
+/// icon. Both come from the computer, from the same SVG file the tray draws, so
+/// the phone and the tray can never show different artwork. The button's colour
+/// is the icon's colour, which is why the microphone follows recording by itself.
+/// Nothing is drawn on an ordinary day, and a failure here must not delay the page.
+async function applyHoliday() {
+  const answer = await call('GET', '/me');
+  const id = answer.holiday;
+  const record = el('record');
+  if (!id || !record) return;
+  const response = await fetch(API + '/holiday.svg', {
+    headers: { Authorization: 'Bearer ' + app.token },
+  });
+  if (!response.ok) return;
+  const svg = await response.text();
+  // The markup is our own file, served by this computer, not user content.
+  record.innerHTML = svg;
+  const glyph = record.firstElementChild;
+  if (glyph) {
+    glyph.classList.add('glyph');
+    glyph.setAttribute('aria-hidden', 'true');
+  }
+  const favicon = el('favicon');
+  // A bare microphone has nothing to inherit from in a tab, so it is given the
+  // brand colour there.
+  if (favicon) {
+    favicon.href = 'data:image/svg+xml,' + encodeURIComponent(svg.replace('<svg ', '<svg color="#c7f36b" '));
+  }
+}
+
 async function boot() {
   await loadLanguage();
   if (!app.token) {
     showPairError();
     return;
   }
+  applyHoliday().catch(() => {});
   try {
     const storage = await openStorage();
     app.cache = createCache({
@@ -1395,20 +2308,33 @@ async function boot() {
       outbox: app.outbox,
       render: draw,
       cache: app.cache,
-      // The loop fetches the list; the page only draws what it is given.
-      renderList: async (server, archivedView) => {
+      // The loop fetches the first list page; the page only draws what is
+      // stored and pages in the rest as the reader scrolls.
+      renderList: async (page, archivedView) => {
         // A list fetched before the archive was opened must not paint itself
         // over the archive: only the answer for the view on screen is drawn.
-        if (app.monolog || app.archived !== archivedView) return;
-        const local = app.archived ? [] : await app.cache.localMonologs();
-        const pending = await app.outbox.list();
-        drawMonologs(mergeMonologs(server, local), pending);
+        if (app.monolog || app.archived !== archivedView || app.screen !== 'list') {
+          return;
+        }
+        const state = app.listState;
+        if (!state || state.archived !== archivedView) return;
+        await refreshListState(state);
+        state.pending = await app.outbox.list();
+        state.rows = buildListRows(state);
+        paintVirtual(state);
       },
       // A local monolog created on the computer while it is open here gets its
       // real id: the header, the history entry and the messages follow it.
       mapped: (localId, serverId) => {
-        if (!app.monolog || app.monolog.id !== localId) return;
+        if (!app.monolog || Number(app.monolog.id) !== Number(localId)) return;
         app.monolog = { id: serverId, name: app.monolog.name, local: false };
+        if (app.feed) {
+          app.feed.monolog = { ...app.feed.monolog, id: serverId, local: false };
+          app.feed.total = 0;
+          app.feed.hasOlder = false;
+          app.feed.loaded = [];
+          app.feed.byId.clear();
+        }
         try {
           history.replaceState(viewState({ monolog: app.monolog }), '');
         } catch (error) {
@@ -1546,7 +2472,13 @@ setTimeout(() => {
     if (!el('app').hidden || !el('pair-error').hidden) return;
     trace('boot-watchdog');
     header(t('monologs'), {});
-    drawMonologs([], []);
+    app.screen = 'list';
+    app.monolog = null;
+    const state = createListState(false);
+    state.rows = buildListRows(state);
+    app.listState = state;
+    mountScreen();
+    paintVirtual(state);
     offlineNote();
   } catch (error) {
     trace('watchdog-error:' + error);

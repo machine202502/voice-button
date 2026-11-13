@@ -75,7 +75,7 @@ impl Hub {
     /// froze the whole app (violet icon forever, tray dead, no way out).
     pub fn listen(&self, id: u64, cutter: Box<dyn Cutter + Send>, now: u64) {
         let opened = {
-            let db = self.db.lock().unwrap();
+            let mut db = self.db.lock().unwrap();
             let found = db
                 .message(id)
                 .map(|message| (message.segments_done, message.text.clone()));
@@ -236,12 +236,7 @@ impl Hub {
     }
 
     pub fn stages(&self) -> Vec<(u64, Stage)> {
-        let db = self.db.lock().unwrap();
-        db.data()
-            .messages
-            .iter()
-            .map(|message| (message.id, message.stage))
-            .collect()
+        self.db.lock().unwrap().stages()
     }
 }
 

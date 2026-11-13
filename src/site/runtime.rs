@@ -539,10 +539,9 @@ mod tests {
         // A retry or a repeated report must not file the same take twice.
         record_history(&root, &hub, &shared, message.id);
 
-        let text = std::fs::read_to_string(crate::history::history_path(&root)).unwrap();
-        let lines: Vec<&str> = text.lines().filter(|line| !line.trim().is_empty()).collect();
-        assert_eq!(lines.len(), 1, "one take, one entry");
-        let entry: HistoryEntry = serde_json::from_str(lines[0]).unwrap();
+        let history = crate::history::History::load(&root);
+        assert_eq!(history.len(), 1, "one take, one entry");
+        let entry: HistoryEntry = history.entry(0).unwrap();
         assert_eq!(entry.source, Source::Site, "the window says where it came from");
         assert_eq!(entry.message, Some(message.id), "it points at the phone message");
         assert_eq!(entry.text, "готово");

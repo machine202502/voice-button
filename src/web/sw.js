@@ -5,7 +5,7 @@
 // answered with the HTML page. Returning `index.html` for `js/app.js` made the
 // browser refuse the module ("text/html") and the app showed a black square.
 
-const SHELL = 'voice-button-shell-v30';
+const SHELL = 'voice-button-shell-v32';
 const FILES = [
   './',
   'css/styles.css',

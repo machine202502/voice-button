@@ -375,11 +375,10 @@ fn merged_entry(prev: state::HistoryEntry, piece: &str) -> state::HistoryEntry {
     entry
 }
 
-/// Parse the interactor out of a record-request file: the UI writes
-/// `{"kind":"user"}`, anything else is treated as the user.
+/// Parse the interactor out of a record-request value: the UI writes `user`,
+/// anything else is treated as the user.
 fn parse_interactor(content: &str) -> Interactor {
-    let value: serde_json::Value = serde_json::from_str(content).unwrap_or(serde_json::Value::Null);
-    if value.get("kind").and_then(|k| k.as_str()) == Some("server") {
+    if content.trim() == "server" {
         return Interactor::server();
     }
     Interactor::user()
@@ -513,14 +512,20 @@ fn toggle_record(
                     let _ = recorder.stop();
                     shared.lock().session = None;
                     ipc::write_session(&dirs.root, None);
-                    shared.set_error(format!("{e:#}"));
+                    shared.set_error(voice_button::i18n::trf(
+                        "Could not start the recording: {error}",
+                        &[("error", &format!("{e:#}"))],
+                    ));
                     daemon::set_status(shared, tray_cmds, dirs, Status::Idle);
                 }
             }
         }
         Err(e) => {
             log::log(&format!("failed to start recording: {e:#}"));
-            shared.set_error(format!("{e:#}"));
+            shared.set_error(voice_button::i18n::trf(
+                "Could not open the microphone: {error}",
+                &[("error", &format!("{e:#}"))],
+            ));
             daemon::set_status(shared, tray_cmds, dirs, Status::Idle);
         }
     }
@@ -563,7 +568,7 @@ fn publish_site_state(root: &std::path::Path, running: bool, port: u16, url: Str
     );
 }
 
-/// What the window asked the daemon to change in `site/db.json`.
+/// What the window asked the daemon to change in the phone database.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct SiteDbChange {
     pairing: bool,
@@ -603,7 +608,7 @@ fn apply_site_db_requests(
     }
     if change != SiteDbChange::default() {
         if let Err(e) = db.save() {
-            log::log(&format!("cannot save site/db.json: {e:#}"));
+            log::log(&format!("cannot save the phone database: {e:#}"));
         }
     }
     change
@@ -949,6 +954,10 @@ fn run_daemon() {
         cfg.swap_mouse_buttons,
     );
     let (events_tx, events_rx) = mpsc::channel::<AppEvent>();
+    // The holiday microphone and the two service entries follow the settings and
+    // the clock, so they are pushed to the tray instead of rebuilt with it.
+    let mut holiday_applied: Option<Option<String>> = None;
+    let mut entries_applied: Option<(bool, bool)> = None;
     let mut recorder = Recorder::new();
     // The recognizer runs in `voice-button.exe --asr-worker`, started lazily on
     // the first segment: a crash inside ONNX Runtime then costs one process,
@@ -996,7 +1005,7 @@ fn run_daemon() {
     let mut ui_language = cfg.ui_language.clone();
     let mut ui_child: Option<std::process::Child> = None;
     let mut last_config_mtime: Option<(u64, u32)> = None;
-    let mut published_download: Option<String> = None;
+    let mut published_download: Option<ipc::DownloadSnapshot> = None;
     let mut last_publish = std::time::Instant::now();
     let mut last_rotate = std::time::Instant::now();
     daemon::set_status(&shared, &tray_cmds, &dirs, Status::Idle);
@@ -1047,6 +1056,8 @@ fn run_daemon() {
                 tray::TrayAction::OpenHistory => show_ui(&mut ui_child, "history"),
                 tray::TrayAction::OpenSettings => show_ui(&mut ui_child, "settings"),
                 tray::TrayAction::OpenCapture => show_ui(&mut ui_child, "capture"),
+                tray::TrayAction::OpenTelegram => show_ui(&mut ui_child, "telegram"),
+                tray::TrayAction::OpenMonologs => show_ui(&mut ui_child, "phone"),
                 tray::TrayAction::CopyLast => match shared.lock().history.entry(0) {
                     Ok(entry) => copy_to_clipboard(&entry.text),
                     Err(e) => log::log(&format!("failed to read last history entry: {e:#}")),
@@ -1174,8 +1185,9 @@ fn run_daemon() {
                                         }
                                         Err(e) => {
                                             log::log(&format!("failed to append history: {e:#}"));
-                                            shared.set_error(format!(
-                                                "failed to save history: {e:#}"
+                                            shared.set_error(voice_button::i18n::trf(
+                                                "Could not save the history: {error}",
+                                                &[("error", &format!("{e:#}"))],
                                             ));
                                         }
                                     }
@@ -1209,7 +1221,10 @@ fn run_daemon() {
                                     }
                                     Err(e) => {
                                         log::log(&format!("failed to append history: {e:#}"));
-                                        shared.set_error(format!("failed to save history: {e:#}"));
+                                        shared.set_error(voice_button::i18n::trf(
+                                            "Could not save the history: {error}",
+                                            &[("error", &format!("{e:#}"))],
+                                        ));
                                     }
                                 }
                             }
@@ -1373,7 +1388,10 @@ fn run_daemon() {
                                 &ipc::FileSnapshot {
                                     path: path.clone(),
                                     name,
-                                    error: Some(format!("{e:#}")),
+                                    error: Some(voice_button::i18n::trf(
+                                        "Could not start transcribing the file: {error}",
+                                        &[("error", &format!("{e:#}"))],
+                                    )),
                                     running: false,
                                     ..Default::default()
                                 },
@@ -1429,36 +1447,28 @@ fn run_daemon() {
             }
         }
         // Publish download progress for the UI process (throttled).
-        let snap_string = {
+        let snapshot = {
             let data = shared.lock();
-            data.download.as_ref().map(|dl| {
-                serde_json::to_string(&ipc::DownloadSnapshot {
-                    model: dl.model.clone(),
-                    file: dl.file,
-                    files: dl.files,
-                    downloaded: dl.downloaded,
-                    total: dl.total,
-                    done_bytes: dl.done_bytes,
-                    done_total: dl.done_total,
-                    done: dl.done,
-                    error: dl.error.clone(),
-                })
-                .unwrap_or_default()
+            data.download.as_ref().map(|dl| ipc::DownloadSnapshot {
+                model: dl.model.clone(),
+                file: dl.file,
+                files: dl.files,
+                downloaded: dl.downloaded,
+                total: dl.total,
+                done_bytes: dl.done_bytes,
+                done_total: dl.done_total,
+                done: dl.done,
+                error: dl.error.clone(),
             })
         };
-        if snap_string != published_download && last_publish.elapsed() > Duration::from_millis(300)
+        if snapshot != published_download && last_publish.elapsed() > Duration::from_millis(300)
         {
             last_publish = std::time::Instant::now();
-            match &snap_string {
-                Some(s) if !s.is_empty() => {
-                    ipc::write_download_state(
-                        &dirs.root,
-                        &serde_json::from_str::<ipc::DownloadSnapshot>(s).unwrap_or_default(),
-                    );
-                }
-                _ => ipc::remove_download_state(&dirs.root),
+            match &snapshot {
+                Some(s) => ipc::write_download_state(&dirs.root, s),
+                None => ipc::remove_download_state(&dirs.root),
             }
-            published_download = snap_string;
+            published_download = snapshot;
         }
         // Config changes written by the UI process.
         let mtime_key = std::fs::metadata(dirs.root.join("config.json"))
@@ -1496,6 +1506,43 @@ fn run_daemon() {
         if background != last_background {
             last_background = background;
             let _ = tray_cmds.send(tray::TrayCommand::SetBackground(background));
+        }
+        // The holiday follows the local date and the interface language, so it
+        // changes at midnight without a restart. Turning the setting off empties
+        // it, which puts the plain icon back. `debug_holiday` in the config file
+        // pins one icon for testing and wins over both.
+        let debug = cfg.debug_holiday.trim();
+        let holiday = if voice_button::icons::is_holiday(debug) {
+            Some(debug.to_string())
+        } else if cfg.holiday_icons {
+            voice_button::holidays::active(
+                chrono::Local::now().date_naive(),
+                &voice_button::i18n::active_code(),
+            )
+            .map(|id| id.to_string())
+        } else {
+            None
+        };
+        if holiday_applied.as_ref() != Some(&holiday) {
+            holiday_applied = Some(holiday.clone());
+            log::log(&format!("tray holiday: {holiday:?}"));
+            // The phone page and the API read the same value, so the site badge
+            // and the tray icon cannot disagree.
+            voice_button::holidays::set_current(holiday.clone());
+            let _ = tray_cmds.send(tray::TrayCommand::SetHoliday(holiday));
+        }
+        // The two service entries are greyed out until the service can answer:
+        // the bot needs a saved token, the monologs page needs the phone server.
+        let entries = (
+            cfg.telegram_enabled && voice_button::telegram::has_token(&dirs),
+            cfg.site_enabled && phone.is_some(),
+        );
+        if entries_applied != Some(entries) {
+            entries_applied = Some(entries);
+            let _ = tray_cmds.send(tray::TrayCommand::SetEntries {
+                telegram: entries.0,
+                monologs: entries.1,
+            });
         }
         // The phone server follows the settings the way the local API does:
         // switching it on, off or to another port happens without a restart.
@@ -1541,11 +1588,19 @@ fn run_daemon() {
                         api_server = Some(server);
                     }
                     Err(e) => {
-                        let error = format!(
-                            "cannot listen on {}:{} ({e})",
+                        log::log(&format!(
+                            "api server not started: cannot listen on {}:{} ({e})",
                             wanted_api.1, wanted_api.2
+                        ));
+                        let port = wanted_api.2.to_string();
+                        let error = voice_button::i18n::trf(
+                            "Could not listen on {host}:{port}: {error}",
+                            &[
+                                ("host", &wanted_api.1),
+                                ("port", &port),
+                                ("error", &format!("{e}")),
+                            ],
                         );
-                        log::log(&format!("api server not started: {error}"));
                         ipc::write_api_state(
                             &dirs.root,
                             &ipc::ApiSnapshot {
@@ -1606,10 +1661,10 @@ fn run_daemon() {
                 Ok(mut db) => {
                     db.archive_monolog(request.monolog, request.archived);
                     if let Err(e) = db.save() {
-                        log::log(&format!("cannot save site/db.json: {e:#}"));
+                        log::log(&format!("cannot save the phone database: {e:#}"));
                     }
                 }
-                Err(e) => log::log(&format!("cannot open site/db.json: {e:#}")),
+                Err(e) => log::log(&format!("cannot open the phone database: {e:#}")),
             }
         }
         // Internet access: the script opens the firewall and, where it can,

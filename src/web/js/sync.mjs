@@ -13,10 +13,23 @@
 //     takes themselves;
 //   * the outbox is sent in order and each item is only dropped after the
 //     computer acknowledged it;
-//   * rendering is a function of the fetched list — the last one it received
-//     when the computer is away, or the cache — plus whatever the outbox holds.
+//   * the feed and the list are pages: `tick` fetches the newest feed page and
+//     the first list page, the page asks for older/newer pages while scrolling.
 
 import { Offline } from './offline.mjs';
+
+/** The API cursor for one message: the same `recorded|id` the server uses. */
+export function messageCursor(message) {
+  if (!message) return null;
+  return String(message.recorded ?? '') + '|' + Number(message.id);
+}
+
+function pageQuery({ limit, before = null, after = null } = {}) {
+  let query = '?limit=' + limit;
+  if (before) query += '&before=' + encodeURIComponent(messageCursor(before));
+  if (after) query += '&after=' + encodeURIComponent(messageCursor(after));
+  return query;
+}
 
 export function createSync({
   api,
@@ -26,13 +39,19 @@ export function createSync({
   cache = null,
   mapped = null,
   log = () => {},
+  pageSize = 50,
+  listPageSize = 100,
 }) {
   let running = false;
   let timer = null;
-  /** The last list the computer confirmed; drawn while it cannot be reached. */
-  let known = [];
+  /** The last feed page the computer confirmed; drawn while it cannot be reached. */
+  let known = { messages: [], hasMore: false, total: null };
   /** Which list the page is looking at: open monologs or the archive. */
   let archived = false;
+  /** The server's total for each list view, once an answer carried it. */
+  const totals = new Map();
+
+  const viewKey = (value) => (value ? '1' : '0');
 
   /** Create unsynced monologs and remember which server id each one got. */
   async function createLocalMonologs() {
@@ -51,7 +70,7 @@ export function createSync({
       // it, and asking for the old negative one would only get a 400.
       if (monologId === Number(monolog.localId)) {
         monologId = serverId;
-        known = [];
+        known = { messages: [], hasMore: false, total: null };
         if (mapped) mapped(Number(monolog.localId), serverId);
       }
     }
@@ -147,25 +166,94 @@ export function createSync({
     return sent;
   }
 
-  /** What the page shows of one monolog while the computer cannot be asked. */
-  async function fallback(id) {
-    return cache ? cache.messages(id) : known;
+  /** The newest feed page from the computer, stored on the way. */
+  async function fetchLatest(id) {
+    const answer = await api(
+      'GET',
+      '/monologues/' + id + '/messages?limit=' + pageSize,
+    );
+    const page = {
+      messages: Array.isArray(answer.messages) ? answer.messages : [],
+      hasMore: answer.has_more === true,
+      total: Number.isFinite(Number(answer.total)) ? Number(answer.total) : null,
+    };
+    known = page;
+    if (cache) await cache.putMessages(id, page.messages);
+    return page;
   }
 
-  /** Fetch one list view, store it and let the page draw it. */
-  async function refreshList() {
+  /** The newest page this phone already has, when the computer is away. */
+  async function cachedLatest(id) {
+    if (!cache) return known;
+    const page = await cache.messagePage(id, { limit: pageSize });
+    const total = await cache.messageCount(id);
+    return {
+      messages: page.messages,
+      hasMore: page.messages.length < total || page.hasMore,
+      total,
+    };
+  }
+
+  /**
+   * One page of a feed while the reader scrolls. IndexedDB first; the network
+   * only when the stored page is short and might hide older/newer messages.
+   */
+  async function page(id, { before = null, after = null, limit = pageSize } = {}) {
+    const cached = cache
+      ? await cache.messagePage(id, { before, after, limit })
+      : { messages: known.messages, hasMore: known.hasMore };
+    const full = cached.hasMore === true || cached.messages.length >= limit;
+    if (full) return cached;
+    try {
+      const answer = await api(
+        'GET',
+        '/monologues/' + id + '/messages' + pageQuery({ limit, before, after }),
+      );
+      const fetched = {
+        messages: Array.isArray(answer.messages) ? answer.messages : [],
+        hasMore: answer.has_more === true,
+        total: Number.isFinite(Number(answer.total)) ? Number(answer.total) : null,
+      };
+      if (cache) await cache.putMessages(id, fetched.messages);
+      return fetched;
+    } catch (error) {
+      if (error instanceof Offline) return cached;
+      throw error;
+    }
+  }
+
+  /** Fetch one list page from the computer, store it and remember the total. */
+  async function fetchMonologPage(archivedView, offset = 0, limit = listPageSize) {
+    const query =
+      '?archived=' + (archivedView ? '1' : '0') +
+      '&limit=' + limit +
+      '&offset=' + Math.max(0, Number(offset) || 0);
     let answer;
     try {
-      answer = await api('GET', '/monologues' + (archived ? '?archived=1' : ''));
+      answer = await api('GET', '/monologues' + query);
     } catch (error) {
-      // The cached list stays on screen; the loop will try again.
-      log('list failed: ' + error);
+      log('list page failed: ' + error);
       return null;
     }
-    const list = answer.monologs || [];
-    if (cache) await cache.putServerMonologs(list, archived);
-    if (renderList) await renderList(list, archived);
-    return list;
+    const list = Array.isArray(answer.monologs) ? answer.monologs : [];
+    const hasMore = answer.has_more === true;
+    const total = Number.isFinite(Number(answer.total)) ? Number(answer.total) : null;
+    if (total !== null) totals.set(viewKey(archivedView), total);
+    if (cache) {
+      await cache.putServerMonologs(list, archivedView, {
+        // Only a first page the computer calls complete is the whole view.
+        complete: offset === 0 && !hasMore,
+      });
+    }
+    return { monologs: list, total, hasMore };
+  }
+
+  /** Fetch the visible list view, store it and let the page draw it. */
+  async function refreshList() {
+    const page = await fetchMonologPage(archived, 0, listPageSize);
+    if (!page) return null;
+    if (renderList) await renderList(page, archived);
+    return page;
   }
 
   /**
@@ -201,9 +289,11 @@ export function createSync({
         // tries again. Nothing is lost, nothing is stuck.
         log('flush failed: ' + error);
         // The take the user just recorded still has to reach the screen: the
-        // page draws the cache (or what it last got) plus what waits, so a
-        // recording made offline is visible as "not sent" instead of silence.
-        if (monologId !== 0) await render(await fallback(monologId), await outbox.list());
+        // page draws the cached page (or what it last got) plus what waits, so
+        // a recording made offline is visible as "not sent" instead of silence.
+        if (monologId !== 0) {
+          await render(await cachedLatest(monologId), await outbox.list());
+        }
         return { sent: 0, failed: true, offline: error instanceof Offline };
       }
 
@@ -215,31 +305,29 @@ export function createSync({
           if (remote !== null) {
             const localId = monologId;
             monologId = remote;
-            known = [];
+            known = { messages: [], hasMore: false, total: null };
             if (mapped) mapped(localId, remote);
           }
         }
-        let answer;
+        let page;
         try {
-          answer = await api('GET', '/monologues/' + monologId + '/messages');
+          page = await fetchLatest(monologId);
         } catch (error) {
           log('fetch failed: ' + error);
-          await render(await fallback(monologId), await outbox.list());
-          return { sent, failed: true };
+          await render(await cachedLatest(monologId), await outbox.list());
+          return { sent, failed: true, offline: error instanceof Offline };
         }
-        known = answer.messages || [];
-        if (cache) await cache.putMessages(monologId, known);
-        await render(known, await outbox.list());
+        await render(page, await outbox.list());
         // A monolog created this tick changes the list too: refresh it even
         // while its page is open, so going back does not show a stale cache.
         if (renderList && mappedNow > 0) await refreshList();
-        return { sent, messages: known.length };
+        return { sent, messages: page.messages.length, total: page.total };
       }
 
       if (renderList) {
-        const list = await refreshList();
-        if (!list) return { sent, failed: true };
-        return { sent, monologs: list.length };
+        const page = await refreshList();
+        if (!page) return { sent, failed: true };
+        return { sent, monologs: page.monologs.length, total: page.total };
       }
       return { sent };
     } finally {
@@ -254,14 +342,23 @@ export function createSync({
     /** Which monolog the page shows; the tick fetches only this one. */
     show(id) {
       const next = Number(id) || 0;
-      // The last list belongs to the monolog it was fetched for: a switch made
+      // The last page belongs to the monolog it was fetched for: a switch made
       // while the computer is unreachable must not paint another thread.
-      if (next !== monologId) known = [];
+      if (next !== monologId) known = { messages: [], hasMore: false, total: null };
       monologId = next;
     },
     /** Which list the page is looking at; the tick fetches that view. */
     archive(value) {
       archived = Boolean(value);
+    },
+    /** One feed page for the page's scroll handler; cache first. */
+    page,
+    /** One list page from the computer, for scrolling past the cached rows. */
+    fetchMonologPage,
+    /** The server's total for a list view, or null while no answer had one. */
+    monologTotal(archivedView) {
+      const total = totals.get(viewKey(archivedView));
+      return Number.isFinite(total) ? total : null;
     },
     start(intervalMs = 1000) {
       if (timer) return;

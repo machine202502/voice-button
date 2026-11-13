@@ -23,6 +23,10 @@ pub enum TrayAction {
     OpenSettings,
     OpenHistory,
     OpenCapture,
+    /// Open the Telegram page of the external-access tab.
+    OpenTelegram,
+    /// Open the phone (monologs) page of the external-access tab.
+    OpenMonologs,
     CopyLast,
     OpenModelsFolder,
     Quit,
@@ -42,6 +46,12 @@ pub enum TrayCommand {
     SetPasteHotkey(Option<Hotkey>),
     /// Swap the left and middle tray mouse actions.
     SetMouseSwap(bool),
+    /// Which holiday microphone the idle tray icon shows; `None` for an ordinary
+    /// day, or when holiday icons are turned off.
+    SetHoliday(Option<String>),
+    /// Enable the entries that need a running service: the bot needs a token,
+    /// the monologs page needs the phone server.
+    SetEntries { telegram: bool, monologs: bool },
     /// Rebuild the menu and tooltip after the interface language changed.
     SetLanguage,
     Shutdown,
@@ -180,18 +190,29 @@ struct MenuIds {
     history: MenuId,
     capture: MenuId,
     copy_last: MenuId,
+    telegram: MenuId,
+    monologs: MenuId,
     open_folder: MenuId,
     quit: MenuId,
 }
 
-fn build_menu() -> (Menu, MenuIds) {
+/// The two entries whose availability follows a service are kept as handles so
+/// their state can change without rebuilding the menu.
+struct ServiceItems {
+    telegram: MenuItem,
+    monologs: MenuItem,
+}
+
+fn build_menu(telegram: bool, monologs: bool) -> (Menu, MenuIds, ServiceItems) {
     let menu = Menu::new();
     // Everything that was there stays, in this order: the last transcription
-    // first, the folder last, the three everyday actions between them.
+    // first, the everyday actions, then the two services, the folder, quit.
     let copy_last = MenuItem::new(tr("Copy last transcription"), true, None);
     let capture = MenuItem::new(tr("Capture"), true, None);
     let history = MenuItem::new(tr("History"), true, None);
     let settings = MenuItem::new(tr("Settings"), true, None);
+    let telegram_item = MenuItem::new(tr("Telegram"), telegram, None);
+    let monologs_item = MenuItem::new(tr("Monologs"), monologs, None);
     let open_folder = MenuItem::new(tr("Open models folder"), true, None);
     let separator = PredefinedMenuItem::separator();
     let quit = MenuItem::new(tr("Quit"), true, None);
@@ -200,6 +221,8 @@ fn build_menu() -> (Menu, MenuIds) {
         &capture,
         &history,
         &settings,
+        &telegram_item,
+        &monologs_item,
         &open_folder,
         &separator,
         &quit,
@@ -210,10 +233,16 @@ fn build_menu() -> (Menu, MenuIds) {
         history: history.id().clone(),
         capture: capture.id().clone(),
         copy_last: copy_last.id().clone(),
+        telegram: telegram_item.id().clone(),
+        monologs: monologs_item.id().clone(),
         open_folder: open_folder.id().clone(),
         quit: quit.id().clone(),
     };
-    (menu, ids)
+    let items = ServiceItems {
+        telegram: telegram_item,
+        monologs: monologs_item,
+    };
+    (menu, ids, items)
 }
 
 /// Which icon a status asks for. Idle plus background work is a background task
@@ -241,20 +270,33 @@ fn icon_choice(status: Status, background: bool) -> IconKind {
     }
 }
 
-fn icon_for(kind: IconKind) -> tray_icon::Icon {
+/// The colour of each status. A holiday changes the shape of the microphone, and
+/// the status always owns the colour: a holiday in its own palette read as a
+/// fourth status and made the icon hard to trust.
+fn status_color(kind: IconKind) -> [u8; 3] {
     match kind {
-        IconKind::Idle => icons::icon_idle(),
-        IconKind::Background => icons::icon_background(),
-        IconKind::Recording => icons::icon_recording(),
-        IconKind::Transcribing => icons::icon_transcribing(),
-        IconKind::Recovering => icons::icon_recovering(),
-        IconKind::File => icons::icon_file(),
-        IconKind::Disabled => icons::icon_disabled(),
+        IconKind::Idle => [0xff, 0xff, 0xff],
+        IconKind::Background => [0xb9, 0xa2, 0xf0],
+        IconKind::Recording => [0xff, 0x5c, 0x5c],
+        IconKind::Transcribing => [0xff, 0x9f, 0x43],
+        IconKind::Recovering => [0x6e, 0x9b, 0xff],
+        IconKind::File => [0x5c, 0xe0, 0x7a],
+        IconKind::Disabled => [0x8a, 0x8a, 0x8f],
     }
 }
 
-fn status_icon(status: Status, background: bool) -> tray_icon::Icon {
-    icon_for(icon_choice(status, background))
+/// The icon for a status: the holiday head when one is showing, the plain
+/// microphone otherwise, always in the status colour. A missing model shows the
+/// greyed-out icon — a decoration must not hide that recording is unavailable.
+fn icon_for(kind: IconKind, holiday: Option<&str>) -> tray_icon::Icon {
+    // Without a model the whole icon is grey: a coloured holiday head would read
+    // as "ready", which is exactly the state that is unavailable.
+    let holiday = if kind == IconKind::Disabled { None } else { holiday };
+    icons::tray_icon(holiday, status_color(kind))
+}
+
+fn status_icon(status: Status, background: bool, holiday: Option<&str>) -> tray_icon::Icon {
+    icon_for(icon_choice(status, background), holiday)
 }
 
 fn tooltip(swap_mouse_buttons: bool) -> String {
@@ -273,12 +315,14 @@ fn run(
     paste_hotkey: Option<Hotkey>,
     mut swap_mouse_buttons: bool,
 ) {
-    let (menu, mut ids) = build_menu();
+    let mut telegram_enabled = false;
+    let mut monologs_enabled = false;
+    let (menu, mut ids, mut service_items) = build_menu(telegram_enabled, monologs_enabled);
     let tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_menu_on_left_click(false)
         .with_tooltip(tooltip(swap_mouse_buttons))
-        .with_icon(icons::icon_idle())
+        .with_icon(icons::tray_icon(None, status_color(IconKind::Idle)))
         .build()
         .expect("failed to create tray icon");
     crate::log::log("tray icon created");
@@ -290,6 +334,7 @@ fn run(
     // a static icon is easy to miss.
     let mut current_status = Status::Idle;
     let mut background = false;
+    let mut holiday: Option<String> = None;
     let mut blink_at = std::time::Instant::now();
     let mut blink_bright = true;
     apply_hotkey(hotkey_window, HOTKEY_ID, &mut registered, hotkey, "record");
@@ -314,11 +359,13 @@ fn run(
         {
             blink_at = std::time::Instant::now();
             blink_bright = !blink_bright;
-            let icon = if blink_bright {
-                icons::icon_recovering()
+            // The dim frame is the same recovering blue, darkened.
+            let color = if blink_bright {
+                status_color(IconKind::Recovering)
             } else {
-                icons::icon_recovering_dim()
+                [0x38, 0x50, 0x85]
             };
+            let icon = icons::tray_icon(holiday.as_deref(), color);
             let _ = tray.set_icon(Some(icon));
         }
         if HOTKEY_FIRED.swap(false, std::sync::atomic::Ordering::SeqCst) {
@@ -339,7 +386,7 @@ fn run(
                     current_status = status;
                     blink_at = std::time::Instant::now();
                     blink_bright = true;
-                    let icon = status_icon(status, background);
+                    let icon = status_icon(status, background, holiday.as_deref());
                     let _ = tray.set_icon(Some(icon));
                     let hint = match status {
                         Status::Recovering => tr("Voice Button - recovering a recording"),
@@ -350,7 +397,7 @@ fn run(
                 }
                 TrayCommand::SetBackground(active) => {
                     background = active;
-                    let icon = status_icon(current_status, background);
+                    let icon = status_icon(current_status, background, holiday.as_deref());
                     let _ = tray.set_icon(Some(icon));
                 }
                 TrayCommand::Notify(text) => {
@@ -378,10 +425,22 @@ fn run(
                     let _ = tray.set_tooltip(Some(tooltip(swap)));
                     crate::log::log(&format!("tray mouse buttons swapped: {swap}"));
                 }
+                TrayCommand::SetHoliday(next) => {
+                    holiday = next;
+                    let icon = status_icon(current_status, background, holiday.as_deref());
+                    let _ = tray.set_icon(Some(icon));
+                }
+                TrayCommand::SetEntries { telegram, monologs } => {
+                    telegram_enabled = telegram;
+                    monologs_enabled = monologs;
+                    service_items.telegram.set_enabled(telegram);
+                    service_items.monologs.set_enabled(monologs);
+                }
                 TrayCommand::SetLanguage => {
-                    let (menu, next) = build_menu();
+                    let (menu, next, items) = build_menu(telegram_enabled, monologs_enabled);
                     tray.set_menu(Some(Box::new(menu)));
                     ids = next;
+                    service_items = items;
                     let _ = tray.set_tooltip(Some(tooltip(swap_mouse_buttons)));
                     crate::log::log("tray menu rebuilt for the new interface language");
                 }
@@ -446,6 +505,10 @@ fn run(
                 Some(TrayAction::OpenHistory)
             } else if id == ids.settings {
                 Some(TrayAction::OpenSettings)
+            } else if id == ids.telegram {
+                Some(TrayAction::OpenTelegram)
+            } else if id == ids.monologs {
+                Some(TrayAction::OpenMonologs)
             } else if id == ids.open_folder {
                 Some(TrayAction::OpenModelsFolder)
             } else if id == ids.quit {
@@ -485,7 +548,7 @@ fn pump_messages() -> bool {
     hotkey_pressed
 }
 
-/// Drain all queued click events. Every event must be processed — a quick
+/// Drain all queued click events. Every event must be processed вЂ” a quick
 /// left click queues both `Down` and `Up`, and keeping only the last one
 /// would silently swallow the `Down` we act on.
 fn poll_clicks() -> Vec<(MouseButton, MouseButtonState)> {
@@ -538,3 +601,4 @@ mod tests {
         }
     }
 }
+

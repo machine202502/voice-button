@@ -112,6 +112,14 @@ header .sub {
   white-space: nowrap;
 }
 
+/* The holiday microphone takes the record button's place; its strokes are
+   `currentColor`, so they follow the button through idle and recording. */
+#record .glyph {
+  width: 30px;
+  height: 30px;
+  display: block;
+}
+
 main {
   flex: 1;
   overflow-y: auto;
@@ -125,17 +133,59 @@ main {
   gap: 10px;
 }
 
+/* The feed and the monolog list are virtualized: one plain block column whose
+   children are the top spacer, the visible rows and the bottom spacer. The
+   browser must not run its own scroll anchoring on top of ours. */
+main.virtual {
+  display: block;
+  gap: 0;
+  overflow-anchor: none;
+}
+main.virtual .vspacer {
+  width: 100%;
+  pointer-events: none;
+}
+main.virtual .vrow {
+  display: flow-root;
+  padding-bottom: 10px;
+}
+main.virtual .new-monolog {
+  display: block;
+  width: 100%;
+}
+
 /* ---------- monologs ---------- */
 
+/* A card with unfinished work: the outline is deliberately loud, because the
+   whole point is to see it from the list without opening the monolog. */
 .monolog-card.active {
-  border-color: rgba(199, 243, 107, .55);
-  box-shadow: 0 0 0 1px rgba(199, 243, 107, .25), 0 0 18px rgba(199, 243, 107, .08);
+  border-color: rgba(199, 243, 107, .85);
+  box-shadow: 0 0 0 2px rgba(199, 243, 107, .3), 0 0 22px rgba(199, 243, 107, .14);
+  animation: card-working 2.4s ease-in-out infinite;
+}
+.monolog-card.unsent {
+  border-color: rgba(255, 189, 98, .85);
+  box-shadow: 0 0 0 2px rgba(255, 189, 98, .26), 0 0 20px rgba(255, 189, 98, .1);
+  animation: none;
 }
 .monolog-card.active strong::after {
   content: " ●";
   color: #c7f36b;
   font-size: 10px;
   vertical-align: middle;
+}
+.monolog-card.unsent strong::after {
+  content: " ●";
+  color: var(--amber);
+  font-size: 10px;
+  vertical-align: middle;
+}
+@keyframes card-working {
+  0%, 100% { box-shadow: 0 0 0 2px rgba(199, 243, 107, .26), 0 0 16px rgba(199, 243, 107, .1); }
+  50% { box-shadow: 0 0 0 2px rgba(199, 243, 107, .58), 0 0 26px rgba(199, 243, 107, .22); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .monolog-card.active { animation: none; }
 }
 
 .rec-bar {
@@ -342,16 +392,25 @@ main {
   height: 56px;
   border-radius: 50%;
   background: var(--lime);
-  color: #17200f;
+  /* The glyph is a dark tone of the button itself, not black: it reads as an
+     imprint of the same colour. The plain value is the fallback for a browser
+     without color-mix. */
+  color: #576c34;
+  color: color-mix(in srgb, var(--lime), #0d120f 60%);
   display: grid;
   place-items: center;
   flex: 0 0 auto;
   transition: background .15s;
 }
-#record.recording { background: var(--red); color: #2a0c0c; }
+#record.recording {
+  background: var(--red);
+  color: #6e302e;
+  color: color-mix(in srgb, var(--red), #0d120f 60%);
+}
 #record.recording.offline {
   background: #e0a13a;
-  color: #2a1c06;
+  color: #614a20;
+  color: color-mix(in srgb, #e0a13a, #0d120f 60%);
   box-shadow: 0 0 0 3px rgba(224, 161, 58, .22);
 }
 #record[disabled] { opacity: .45; }

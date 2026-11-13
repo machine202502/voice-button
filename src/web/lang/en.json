@@ -73,5 +73,8 @@
   "archive_read_only": "An archived monolog cannot be changed or recorded into. Take it out of the archive first.",
   "update_app": "Update",
   "back": "Back",
-  "record": "Record"
+  "record": "Record",
+  "site_version": "Site version",
+  "card_working": "The computer is working on this monolog",
+  "card_unsent": "A message here has not been sent to the computer yet"
 }

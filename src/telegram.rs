@@ -1,11 +1,12 @@
 //! The Telegram side of Voice Button.
 //!
 //! One long-polling thread receives updates, one worker turns queued media into
-//! text. The queue, the owner and the chat mirror live in `telegram.state.json`
+//! text. The queue, the owner and the chat mirror live in the SQLite database
 //! so a restart resumes instead of forgetting. Only private chats are served;
 //! strangers are ignored silently.
 
 use anyhow::{anyhow, bail, Context, Result};
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::VecDeque;
@@ -18,6 +19,13 @@ use crate::i18n::{tr, trf};
 use crate::state::{Shared, Status};
 
 const MAX_FILE: u64 = 20 * 1024 * 1024;
+/// The marks the bot puts on an incoming message. Telegram accepts only its own
+/// fixed set of reactions: a check mark ("✅", "✔", "☑") and "❌" are refused with
+/// REACTION_INVALID, a thumb is not. A non-premium bot may hold one reaction per
+/// message, so the later mark replaces the earlier one.
+const REACTION_WORKING: &str = "👀";
+const REACTION_DONE: &str = "👍";
+const REACTION_FAILED: &str = "👎";
 const SEGMENT_SECONDS: f32 = 15.0;
 const API_REAL: &str = "https://api.telegram.org";
 
@@ -139,10 +147,23 @@ pub fn read_secure(dirs: &AppDirs) -> Secure {
     let Ok(bytes) = std::fs::read(&path) else {
         return Secure::default();
     };
-    unprotect(&bytes)
-        .ok()
-        .and_then(|plain| serde_json::from_slice(&plain).ok())
-        .unwrap_or_default()
+    let Ok(plain) = unprotect(&bytes) else {
+        return Secure::default();
+    };
+    let text = String::from_utf8_lossy(&plain);
+    let mut lines = text.splitn(2, '\n');
+    Secure {
+        token: lines.next().unwrap_or_default().to_string(),
+        proxy: lines.next().unwrap_or_default().to_string(),
+    }
+}
+
+pub fn has_token(dirs: &AppDirs) -> bool {
+    // Only existence matters here: the tray decides whether the Telegram entry
+    // is usable, and decrypting the file on every pass would be wasteful.
+    std::fs::metadata(secure_path(dirs))
+        .map(|meta| meta.len() > 0)
+        .unwrap_or(false)
 }
 
 pub fn write_secure(dirs: &AppDirs, token: &str, proxy: &str) -> Result<()> {
@@ -150,11 +171,10 @@ pub fn write_secure(dirs: &AppDirs, token: &str, proxy: &str) -> Result<()> {
 }
 
 pub fn write_secure_root(root: &Path, token: &str, proxy: &str) -> Result<()> {
-    let plain = serde_json::to_vec(&Secure {
-        token: token.to_string(),
-        proxy: proxy.to_string(),
-    })?;
-    let protected = protect(&plain)?;
+    // The Windows DPAPI protects the file; inside it the two values are a plain
+    // token line and a proxy line, not JSON.
+    let plain = format!("{token}\n{proxy}");
+    let protected = protect(plain.as_bytes())?;
     std::fs::write(secure_path_root(root), protected).context("writing telegram.secure")?;
     Ok(())
 }
@@ -172,8 +192,15 @@ trait Api {
     fn file_path(&self, file_id: &str) -> Result<(String, u64)>;
     fn download(&self, file_path: &str, target: &Path) -> Result<u64>;
     fn send_text(&self, chat: i64, reply_to: i64, text: &str) -> Result<()>;
-    fn send_document(&self, chat: i64, reply_to: i64, name: &str, bytes: &[u8]) -> Result<()>;
-    fn react(&self, chat: i64, message: i64, emoji: &str) -> Result<()>;
+    fn send_document(
+        &self,
+        chat: i64,
+        reply_to: i64,
+        name: &str,
+        bytes: &[u8],
+        caption: &str,
+    ) -> Result<()>;
+    fn react(&self, chat: i64, message: i64, emojis: &[&str]) -> Result<()>;
 }
 
 impl Api for Client {
@@ -186,11 +213,18 @@ impl Api for Client {
     fn send_text(&self, chat: i64, reply_to: i64, text: &str) -> Result<()> {
         Client::send_text(self, chat, reply_to, text)
     }
-    fn send_document(&self, chat: i64, reply_to: i64, name: &str, bytes: &[u8]) -> Result<()> {
-        Client::send_document(self, chat, reply_to, name, bytes)
+    fn send_document(
+        &self,
+        chat: i64,
+        reply_to: i64,
+        name: &str,
+        bytes: &[u8],
+        caption: &str,
+    ) -> Result<()> {
+        Client::send_document(self, chat, reply_to, name, bytes, caption)
     }
-    fn react(&self, chat: i64, message: i64, emoji: &str) -> Result<()> {
-        Client::react(self, chat, message, emoji)
+    fn react(&self, chat: i64, message: i64, emojis: &[&str]) -> Result<()> {
+        Client::react(self, chat, message, emojis)
     }
 }
 
@@ -303,7 +337,14 @@ impl Client {
         Ok(())
     }
 
-    fn send_document(&self, chat: i64, reply_to: i64, name: &str, bytes: &[u8]) -> Result<()> {
+    fn send_document(
+        &self,
+        chat: i64,
+        reply_to: i64,
+        name: &str,
+        bytes: &[u8],
+        caption: &str,
+    ) -> Result<()> {
         let boundary = format!(
             "----voice-button-{}",
             std::time::SystemTime::now()
@@ -322,6 +363,9 @@ impl Client {
         };
         field("chat_id", &chat.to_string());
         field("reply_to_message_id", &reply_to.to_string());
+        if !caption.is_empty() {
+            field("caption", caption);
+        }
         body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
         body.extend_from_slice(
             format!("Content-Disposition: form-data; name=\"document\"; filename=\"{name}\"\r\n")
@@ -341,13 +385,17 @@ impl Client {
         Ok(())
     }
 
-    fn react(&self, chat: i64, message: i64, emoji: &str) -> Result<()> {
+    fn react(&self, chat: i64, message: i64, emojis: &[&str]) -> Result<()> {
+        let reactions: Vec<Value> = emojis
+            .iter()
+            .map(|emoji| json!({ "type": "emoji", "emoji": emoji }))
+            .collect();
         self.call(
             "setMessageReaction",
             &json!({
                 "chat_id": chat,
                 "message_id": message,
-                "reaction": [{ "type": "emoji", "emoji": emoji }],
+                "reaction": reactions,
             }),
         )?;
         Ok(())
@@ -402,6 +450,9 @@ pub struct ChatEntry {
     pub text: String,
     #[serde(default)]
     pub error: Option<String>,
+    /// Who sent the media: name, @username, or the generic "User".
+    #[serde(default)]
+    pub sender: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -427,6 +478,12 @@ pub struct Job {
     #[serde(default)]
     pub error: Option<String>,
     #[serde(default)]
+    pub sender: String,
+    /// Telegram's original message date, in local RFC 3339. Empty only for old
+    /// queued jobs that were saved before this field existed.
+    #[serde(default)]
+    pub original_at: String,
+    #[serde(default)]
     pub received_at: String,
     #[serde(default)]
     pub started_at: String,
@@ -443,56 +500,295 @@ pub struct TelegramState {
     #[serde(default)]
     pub current: Option<Job>,
     #[serde(default)]
-    pub chat: Vec<ChatEntry>,
-    #[serde(default)]
     pub last_error: Option<String>,
     #[serde(default)]
     pub bot_name: String,
 }
 
-fn state_path(dirs: &AppDirs) -> PathBuf {
-    dirs.root.join("telegram.state.json")
+fn open_store(root: &Path) -> Option<crate::store::Store> {
+    match crate::store::Store::open(root) {
+        Ok(store) => Some(store),
+        Err(error) => {
+            crate::log::log(&format!("telegram database: {error:#}"));
+            None
+        }
+    }
 }
 
-fn state_path_root(root: &Path) -> PathBuf {
-    root.join("telegram.state.json")
+const JOB_COLUMNS: &str = "update_id, chat_id, message_id, file_id, file_name, kind, size,
+    seconds, done_seconds, stage, progress, text, error, sender, original_at,
+    received_at, started_at";
+
+fn read_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
+    Ok(Job {
+        update_id: row.get(0)?,
+        chat_id: row.get(1)?,
+        message_id: row.get(2)?,
+        file_id: row.get(3)?,
+        file_name: row.get(4)?,
+        kind: row.get(5)?,
+        size: row.get::<_, i64>(6)? as u64,
+        seconds: row.get(7)?,
+        done_seconds: row.get(8)?,
+        stage: row.get(9)?,
+        progress: row.get(10)?,
+        text: row.get(11)?,
+        error: row.get(12)?,
+        sender: row.get(13)?,
+        original_at: row.get(14)?,
+        received_at: row.get(15)?,
+        started_at: row.get(16)?,
+    })
+}
+
+fn write_job(
+    transaction: &rusqlite::Transaction<'_>,
+    table: &str,
+    key_column: &str,
+    position: i64,
+    job: &Job,
+) -> rusqlite::Result<()> {
+    let sql = format!(
+        "INSERT OR REPLACE INTO {table}({key_column}, {JOB_COLUMNS})
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)"
+    );
+    transaction.execute(
+        &sql,
+        rusqlite::params![
+            position,
+            job.update_id,
+            job.chat_id,
+            job.message_id,
+            job.file_id,
+            job.file_name,
+            job.kind,
+            job.size as i64,
+            job.seconds,
+            job.done_seconds,
+            job.stage,
+            job.progress,
+            job.text,
+            job.error,
+            job.sender,
+            job.original_at,
+            job.received_at,
+            job.started_at
+        ],
+    )?;
+    Ok(())
 }
 
 fn load_state(dirs: &AppDirs) -> TelegramState {
-    std::fs::read(state_path(dirs))
+    let Some(store) = open_store(&dirs.root) else {
+        return TelegramState::default();
+    };
+    let mut state = TelegramState::default();
+    state.owner = store
+        .kv_get("telegram.owner")
         .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
+        .flatten()
+        .and_then(|value| value.parse().ok());
+    state.offset = store
+        .kv_get("telegram.offset")
+        .ok()
+        .flatten()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    state.last_error = store.kv_get("telegram.last_error").ok().flatten();
+    state.bot_name = store.kv_get("telegram.bot_name").ok().flatten().unwrap_or_default();
+    let conn = store.conn();
+    state.current = conn
+        .query_row(
+            &format!("SELECT {JOB_COLUMNS} FROM telegram_current WHERE id = 1"),
+            [],
+            read_job,
+        )
+        .optional()
+        .unwrap_or(None);
+    if let Ok(mut statement) = conn.prepare(&format!(
+        "SELECT {JOB_COLUMNS} FROM telegram_queue ORDER BY position"
+    )) {
+        if let Ok(rows) = statement.query_map([], read_job) {
+            for job in rows.flatten() {
+                state.queue.push_back(job);
+            }
+        }
+    }
+    state
 }
 
 fn save_state(dirs: &AppDirs, state: &TelegramState) {
-    let path = state_path(dirs);
-    let temporary = path.with_extension("json.tmp");
-    if let Ok(bytes) = serde_json::to_vec_pretty(state) {
-        if std::fs::write(&temporary, bytes).is_ok() {
-            let _ = std::fs::rename(&temporary, &path);
-        }
+    let Some(store) = open_store(&dirs.root) else {
+        return;
+    };
+    let mut conn = store.conn();
+    let Ok(transaction) = conn.transaction() else {
+        return;
+    };
+    let _ = transaction.execute(
+        "INSERT INTO kv(key, value) VALUES ('telegram.owner', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [state.owner.map(|id| id.to_string()).unwrap_or_default()],
+    );
+    let _ = transaction.execute(
+        "INSERT INTO kv(key, value) VALUES ('telegram.offset', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [state.offset.to_string()],
+    );
+    let _ = transaction.execute(
+        "INSERT INTO kv(key, value) VALUES ('telegram.last_error', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [state.last_error.as_deref().unwrap_or("")],
+    );
+    let _ = transaction.execute(
+        "INSERT INTO kv(key, value) VALUES ('telegram.bot_name', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [state.bot_name.as_str()],
+    );
+    let _ = transaction.execute("DELETE FROM telegram_current", []);
+    if let Some(job) = &state.current {
+        let _ = write_job(&transaction, "telegram_current", "id", 1, job);
     }
+    // The queue is small and changes often; replacing those rows is cheaper
+    // than tracking each move. The chat grows forever and is append-only.
+    let _ = transaction.execute("DELETE FROM telegram_queue", []);
+    for (position, job) in state.queue.iter().enumerate() {
+        let _ = write_job(&transaction, "telegram_queue", "position", position as i64, job);
+    }
+    let _ = transaction.execute(
+        "INSERT INTO kv(key, value) VALUES ('rev.telegram', '1')
+         ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1",
+        [],
+    );
+    let _ = transaction.commit();
 }
 
-/// Read the chat for the desktop window without touching the bot thread.
-pub fn chat(dirs: &AppDirs) -> Vec<ChatEntry> {
-    load_state(dirs).chat
+fn append_chat(root: &Path, entry: &ChatEntry) {
+    let Some(store) = open_store(root) else {
+        return;
+    };
+    let mut conn = store.conn();
+    let Ok(transaction) = conn.transaction() else {
+        return;
+    };
+    let _ = transaction.execute(
+        "INSERT INTO telegram_chat(update_id, chat_id, message_id, at, sender, kind,
+            file_name, seconds, text, error)
+         VALUES (0, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        rusqlite::params![
+            entry.chat_id,
+            entry.message_id,
+            entry.at,
+            entry.sender,
+            entry.kind,
+            entry.file_name,
+            entry.seconds,
+            entry.text,
+            entry.error
+        ],
+    );
+    if let Err(error) = transaction.execute(
+        "INSERT INTO kv(key, value) VALUES ('rev.telegram', '1')
+         ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1",
+        [],
+    ) {
+        crate::log::log(&format!("telegram: cannot bump the chat revision: {error}"));
+    }
+    let _ = transaction.commit();
 }
+
+fn read_chat(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatEntry> {
+    Ok(ChatEntry {
+        chat_id: row.get(1)?,
+        message_id: row.get(2)?,
+        at: row.get(3)?,
+        sender: row.get(4)?,
+        kind: row.get(5)?,
+        file_name: row.get(6)?,
+        seconds: row.get(7)?,
+        text: row.get(8)?,
+        error: row.get(9)?,
+    })
+}
+
+const CHAT_COLUMNS: &str = "id, chat_id, message_id, at, sender, kind, file_name,
+    seconds, text, error";
 
 pub fn reset_owner(root: &Path) {
-    let path = state_path_root(root);
-    let mut state: TelegramState = std::fs::read(&path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default();
-    state.owner = None;
-    let temporary = path.with_extension("json.tmp");
-    if let Ok(bytes) = serde_json::to_vec_pretty(&state) {
-        if std::fs::write(&temporary, bytes).is_ok() {
-            let _ = std::fs::rename(&temporary, &path);
-        }
+    if let Some(store) = open_store(root) {
+        let _ = store.kv_delete("telegram.owner");
     }
+}
+
+/// One page of the chat, oldest first, for the window's lazy list.
+pub fn chat_page(dirs: &AppDirs, limit: usize, offset: usize) -> Vec<ChatEntry> {
+    let Some(store) = open_store(&dirs.root) else {
+        return Vec::new();
+    };
+    let conn = store.conn();
+    let Ok(mut statement) = conn.prepare(&format!(
+        "SELECT {CHAT_COLUMNS} FROM telegram_chat ORDER BY id LIMIT ?1 OFFSET ?2"
+    )) else {
+        return Vec::new();
+    };
+    statement
+        .query_map([limit as i64, offset as i64], read_chat)
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default()
+}
+
+pub fn chat_count(dirs: &AppDirs) -> usize {
+    open_store(&dirs.root)
+        .and_then(|store| {
+            store
+                .conn()
+                .query_row("SELECT COUNT(*) FROM telegram_chat", [], |row| row.get::<_, i64>(0))
+                .ok()
+        })
+        .unwrap_or(0) as usize
+}
+
+pub fn chat_search_page(dirs: &AppDirs, needle: &str, limit: usize, offset: usize) -> Vec<ChatEntry> {
+    let Some(store) = open_store(&dirs.root) else {
+        return Vec::new();
+    };
+    let pattern = format!("%{}%", needle.trim().replace('%', "\\%").replace('_', "\\_"));
+    let conn = store.conn();
+    let Ok(mut statement) = conn.prepare(&format!(
+        "SELECT {CHAT_COLUMNS} FROM telegram_chat
+         WHERE vb_lower(text) LIKE vb_lower(?1) ESCAPE '\\'
+            OR vb_lower(sender) LIKE vb_lower(?1) ESCAPE '\\'
+            OR vb_lower(file_name) LIKE vb_lower(?1) ESCAPE '\\'
+         ORDER BY id LIMIT ?2 OFFSET ?3"
+    )) else {
+        return Vec::new();
+    };
+    statement
+        .query_map(
+            rusqlite::params![pattern, limit as i64, offset as i64],
+            read_chat,
+        )
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default()
+}
+
+pub fn chat_search_count(dirs: &AppDirs, needle: &str) -> usize {
+    open_store(&dirs.root)
+        .and_then(|store| {
+            let pattern = format!("%{}%", needle.trim().replace('%', "\\%").replace('_', "\\_"));
+            store
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM telegram_chat
+                     WHERE vb_lower(text) LIKE vb_lower(?1) ESCAPE '\\'
+                        OR vb_lower(sender) LIKE vb_lower(?1) ESCAPE '\\'
+                        OR vb_lower(file_name) LIKE vb_lower(?1) ESCAPE '\\'",
+                    [pattern],
+                    |row| row.get::<_, i64>(0),
+                )
+                .ok()
+        })
+        .unwrap_or(0) as usize
 }
 
 /// What the settings window shows about the bot, without the token.
@@ -505,10 +801,10 @@ pub struct Snapshot {
 }
 
 pub fn snapshot(root: &Path) -> Snapshot {
-    let state: TelegramState = std::fs::read(state_path_root(root))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default();
+    let state = load_state(&crate::config::AppDirs {
+        root: root.to_path_buf(),
+        models: std::path::PathBuf::new(),
+    });
     Snapshot {
         owner: state.owner,
         queued: state.queue.len(),
@@ -617,6 +913,16 @@ fn settings(dirs: &AppDirs, shared: &Arc<Shared>) -> (bool, String, String, Stri
 /// wait quietly while the setting is off or no token is stored.
 pub fn spawn(dirs: AppDirs, shared: Arc<Shared>, asr: Arc<crate::asr_engine::Engine>) {
     let state = Arc::new(Mutex::new(load_state(&dirs)));
+    // A downloaded take is a temporary file: it is deleted as soon as its job
+    // ends. Files found here belong to a run that crashed mid-job, so they are
+    // removed before the worker starts.
+    if let Ok(entries) = std::fs::read_dir(dirs.root.join("telegram")) {
+        for entry in entries.flatten() {
+            if entry.path().is_file() {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
 
     let poll_dirs = dirs.clone();
     let poll_shared = shared.clone();
@@ -739,6 +1045,94 @@ pub fn spawn(dirs: AppDirs, shared: Arc<Shared>, asr: Arc<crate::asr_engine::Eng
     });
 }
 
+/// The bot names the computer's time zone explicitly; the app deliberately
+/// does not, so changing the computer's zone re-renders the same stored instant.
+fn telegram_date_label_with_zone(value: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .map(|time| {
+            time.with_timezone(&chrono::Local)
+                .format("[%d.%m.%y %H:%M UTC%:z]")
+                .to_string()
+        })
+        .unwrap_or_default()
+}
+
+fn message_date(message: &Value) -> String {
+    let seconds = message
+        .get("forward_origin")
+        .and_then(|origin| origin.get("date"))
+        .and_then(Value::as_i64)
+        .or_else(|| message.get("forward_date").and_then(Value::as_i64))
+        .or_else(|| message.get("date").and_then(Value::as_i64));
+    seconds
+        .and_then(|seconds| chrono::DateTime::from_timestamp(seconds, 0)).map(|time| time.with_timezone(&chrono::Local))
+        .map(|time| time.to_rfc3339())
+        .unwrap_or_default()
+}
+
+fn user_label(value: &Value) -> Option<String> {
+    let first = value.get("first_name").and_then(Value::as_str).unwrap_or("").trim();
+    let last = value.get("last_name").and_then(Value::as_str).unwrap_or("").trim();
+    let name = format!("{first} {last}").trim().to_string();
+    let username = value.get("username").and_then(Value::as_str).map(str::trim).filter(|u| !u.is_empty());
+    if !name.is_empty() {
+        return Some(match username {
+            Some(username) => format!("{name} (@{username})"),
+            None => name,
+        });
+    }
+    username.map(|username| format!("@{username}"))
+}
+
+fn chat_label(value: &Value) -> Option<String> {
+    value
+        .get("title")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .map(str::to_string)
+        .or_else(|| user_label(value))
+}
+
+/// The forwarded person wins over the sender: the question is whose words were
+/// transcribed. Telegram has two shapes for this (old `forward_from` and new
+/// `forward_origin`), so both are read.
+fn sender_label(message: &Value) -> String {
+    if let Some(origin) = message.get("forward_origin") {
+        let kind = origin.get("type").and_then(Value::as_str).unwrap_or("");
+        let label = match kind {
+            "user" => origin.get("sender_user").and_then(user_label),
+            "hidden_user" => origin
+                .get("sender_user_name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_string),
+            "chat" | "channel" => origin.get("sender_chat").and_then(chat_label),
+            _ => None,
+        };
+        return label.unwrap_or_else(|| tr("User"));
+    }
+    if let Some(person) = message.get("forward_from").and_then(user_label) {
+        return person;
+    }
+    if let Some(name) = message
+        .get("forward_sender_name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        return name.to_string();
+    }
+    if let Some(chat) = message.get("forward_from_chat").and_then(chat_label) {
+        return chat;
+    }
+    message
+        .get("from")
+        .and_then(user_label)
+        .unwrap_or_else(|| tr("User"))
+}
+
 fn handle_update(
     client: &dyn Api,
     dirs: &AppDirs,
@@ -809,11 +1203,13 @@ fn handle_update(
         )?;
         return Ok(());
     }
-    client.react(chat_id, message_id, "👀")?;
+    client.react(chat_id, message_id, &[REACTION_WORKING])?;
     let mut job = media;
     job.update_id = update.get("update_id").and_then(Value::as_i64).unwrap_or(0);
     job.chat_id = chat_id;
     job.message_id = message_id;
+    job.sender = sender_label(message);
+    job.original_at = message_date(message);
     job.received_at = chrono::Local::now().to_rfc3339();
     {
         let mut state = state.lock().unwrap();
@@ -862,6 +1258,8 @@ fn extract_media(message: &Value) -> Option<Job> {
             file_id: file_id.to_string(),
             file_name: name,
             kind: kind.to_string(),
+            sender: String::new(),
+            original_at: String::new(),
             size,
             seconds: duration,
             done_seconds: 0.0,
@@ -874,6 +1272,16 @@ fn extract_media(message: &Value) -> Option<Job> {
         });
     }
     None
+}
+
+/// Removes a downloaded take when its job leaves the scope, whatever the
+/// outcome. The original file stays in Telegram; only the local copy goes.
+struct TemporaryAudio(PathBuf);
+
+impl Drop for TemporaryAudio {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 fn process_job(
@@ -902,6 +1310,10 @@ fn process_job(
         .and_then(|value| value.to_str())
         .unwrap_or("bin");
     let target = root.join(format!("{}.{}", job.update_id, extension));
+    // The file exists only for this job: success, error and an early return all
+    // remove it, so the data directory does not grow with old audio. The guard
+    // is created before the download so a half-written file is removed too.
+    let _temporary = TemporaryAudio(target.clone());
     let downloaded = client.download(&file_path, &target)?;
     if downloaded > MAX_FILE {
         bail!("файл больше 20 МБ");
@@ -1026,7 +1438,13 @@ fn finish_job(
     job: &Job,
     outcome: Result<String>,
 ) {
-    let at = chrono::Local::now().to_rfc3339();
+    let finished_at = chrono::Local::now().to_rfc3339();
+    let at = if job.original_at.trim().is_empty() {
+        finished_at
+    } else {
+        job.original_at.clone()
+    };
+    let transcribed = matches!(&outcome, Ok(text) if !text.trim().is_empty());
     let (text, error) = match outcome {
         Ok(text) if !text.trim().is_empty() => (text, None),
         Ok(_) => (tr("Bot: speech was not recognised."), None),
@@ -1055,18 +1473,51 @@ fn finish_job(
             crate::log::log(&format!("telegram: history: {problem:#}"));
         }
     }
-    let send = if text.chars().count() <= 4096 {
-        client.send_text(job.chat_id, job.message_id, &text)
+    let sender = if job.sender.trim().is_empty() {
+        tr("User")
+    } else {
+        job.sender.clone()
+    };
+    let stamp = telegram_date_label_with_zone(&at);
+    let meta = if stamp.is_empty() {
+        sender.clone()
+    } else {
+        format!("{stamp} {sender}")
+    };
+    let answer = if transcribed {
+        format!("{meta}: {text}")
+    } else {
+        text.clone()
+    };
+    let send = if answer.chars().count() <= 4096 {
+        client.send_text(job.chat_id, job.message_id, &answer)
     } else {
         let name = format!("telegram-{}.txt", job.update_id);
-        client.send_document(job.chat_id, job.message_id, &name, text.as_bytes())
+        // The attachment keeps the same metadata in its caption (visible in
+        // Telegram) and as its first line (visible after opening the file).
+        client.send_document(
+            job.chat_id,
+            job.message_id,
+            &name,
+            answer.as_bytes(),
+            &meta,
+        )
     };
     if let Err(problem) = send {
         crate::log::log(&format!("telegram: reply: {problem:#}"));
     }
-    let _ = client.react(job.chat_id, job.message_id, "✅");
+    // The terminal mark replaces the eyes: one reaction is all a non-premium bot
+    // may hold, and the last state is the one worth reading.
+    let terminal = if error.is_none() {
+        REACTION_DONE
+    } else {
+        REACTION_FAILED
+    };
+    if let Err(problem) = client.react(job.chat_id, job.message_id, &[terminal]) {
+        crate::log::log(&format!("telegram: cannot mark the message: {problem:#}"));
+    }
     let mut state = state.lock().unwrap();
-    state.chat.push(ChatEntry {
+    let chat_entry = ChatEntry {
         chat_id: job.chat_id,
         message_id: job.message_id,
         at,
@@ -1075,7 +1526,9 @@ fn finish_job(
         seconds: job.seconds,
         text: text.clone(),
         error,
-    });
+        sender: job.sender.clone(),
+    };
+    append_chat(&dirs.root, &chat_entry);
     state.current = None;
     save_state(dirs, &state);
 }
@@ -1118,12 +1571,22 @@ mod tests {
             self.sent.lock().unwrap().push((chat, reply_to, text.to_string()));
             Ok(())
         }
-        fn send_document(&self, _chat: i64, _reply_to: i64, name: &str, _bytes: &[u8]) -> Result<()> {
+        fn send_document(
+            &self,
+            _chat: i64,
+            _reply_to: i64,
+            name: &str,
+            _bytes: &[u8],
+            _caption: &str,
+        ) -> Result<()> {
             self.documents.lock().unwrap().push(name.to_string());
             Ok(())
         }
-        fn react(&self, _chat: i64, message: i64, emoji: &str) -> Result<()> {
-            self.reactions.lock().unwrap().push((message, emoji.to_string()));
+        fn react(&self, _chat: i64, message: i64, emojis: &[&str]) -> Result<()> {
+            self.reactions
+                .lock()
+                .unwrap()
+                .push((message, emojis.join("")));
             Ok(())
         }
     }
@@ -1236,6 +1699,8 @@ mod tests {
             file_id: "f".into(),
             file_name: "long.ogg".into(),
             kind: "voice".into(),
+            sender: String::new(),
+            original_at: String::new(),
             size: 1000,
             seconds: 100.0,
             done_seconds: 25.0,
@@ -1265,6 +1730,8 @@ mod tests {
             file_id: "f".into(),
             file_name: "long.ogg".into(),
             kind: "voice".into(),
+            sender: String::new(),
+            original_at: String::new(),
             size: 1000,
             seconds: 60.0,
             done_seconds: 60.0,
@@ -1279,7 +1746,7 @@ mod tests {
         finish_job(&api, &dirs, &state, &job, Ok("я".repeat(5000)));
         assert_eq!(api.documents.lock().unwrap().len(), 1, "a document, not a message");
         assert!(api.sent().is_empty(), "nothing over 4096 is sent as text");
-        assert_eq!(api.reactions.lock().unwrap()[0], (8, "✅".to_string()));
+        assert_eq!(api.reactions.lock().unwrap().last().unwrap().1, "👍");
         let _ = std::fs::remove_dir_all(&dirs.root);
     }
 
@@ -1311,6 +1778,71 @@ mod tests {
         .unwrap();
         client.set_commands().expect("register start/status");
         println!("commands registered in ru, en and zh");
+    }
+
+    /// Live diagnosis of the reaction on a message this computer already
+    /// handled: prints what Telegram answers instead of guessing.
+    #[test]
+    #[ignore]
+    fn real_bot_api_reaction_on_a_stored_message() {
+        let dirs = crate::config::AppDirs {
+            root: std::env::var_os("APPDATA")
+                .map(std::path::PathBuf::from)
+                .unwrap()
+                .join("voice-button"),
+            models: std::path::PathBuf::new(),
+        };
+        let secure = read_secure(&dirs);
+        println!(
+            "token: {} chars, unchanged by trim: {}, whitespace inside: {}",
+            secure.token.chars().count(),
+            secure.token == secure.token.trim(),
+            secure.token.chars().any(char::is_whitespace),
+        );
+        println!("proxy: {:?}", secure.proxy);
+        let client = match Client::new(
+            secure.token.clone(),
+            &secure.proxy,
+            "https://api.telegram.org",
+        ) {
+            Ok(client) => client,
+            Err(error) => {
+                println!("client: {error:#}");
+                return;
+            }
+        };
+        match client.call("getMe", &json!({})) {
+            Ok(me) => println!("getMe: ok, bot @{}", me["result"]["username"]),
+            Err(error) => println!("getMe failed: {error:#}"),
+        }
+        let entries = chat_page(&dirs, 5, 0);
+        println!("stored messages: {}", entries.len());
+        for entry in &entries {
+            println!(
+                "  chat {} message {} at {} kind {}",
+                entry.chat_id, entry.message_id, entry.at, entry.kind
+            );
+        }
+        let Some(entry) = entries.first() else {
+            println!("nothing in the chat table, nothing to react to");
+            return;
+        };
+        // Which of the candidate marks Telegram actually accepts.
+        for emoji in [
+            "👀", "✅", "✔", "☑", "👍", "👌", "🎉", "💯", "🏆", "🙏", "🤝", "🔥", "❤", "👎",
+            "❌", "⚠", "🚫", "💔", "🤬", "😢", "🤨", "🫡", "📝", "✍",
+        ] {
+            let answer = client.react(entry.chat_id, entry.message_id, &[emoji]);
+            println!(
+                "react {emoji}: {}",
+                match answer {
+                    Ok(()) => "allowed".to_string(),
+                    Err(error) => format!("{error:#}"),
+                }
+            );
+        }
+        // Leave the message with the mark the bot itself would end on.
+        let _ = client.react(entry.chat_id, entry.message_id, &[REACTION_DONE]);
     }
 
     #[test]
@@ -1348,6 +1880,8 @@ mod tests {
             file_id: "f".into(),
             file_name: "pending.ogg".into(),
             kind: "voice".into(),
+            sender: String::new(),
+            original_at: String::new(),
             size: 10,
             seconds: 0.0,
             done_seconds: 0.0,
@@ -1366,6 +1900,45 @@ mod tests {
         reset_owner(&dirs.root);
         assert_eq!(load_state(&dirs).owner, None, "the reset clears the owner");
         let _ = std::fs::remove_dir_all(&dirs.root);
+    }
+
+    #[test]
+    fn the_original_message_date_is_preferred_over_the_forward_date() {
+        let plain = json!({"date": 1_700_000_000});
+        assert!(!message_date(&plain).is_empty());
+        assert!(telegram_date_label_with_zone(&message_date(&plain)).starts_with('['));
+
+        let forwarded = json!({
+            "date": 1_700_000_100,
+            "forward_origin": {"type": "user", "date": 1_600_000_000,
+                               "sender_user": {"first_name": "Борис"}}
+        });
+        let parsed = chrono::DateTime::parse_from_rfc3339(&message_date(&forwarded)).unwrap();
+        assert_eq!(parsed.timestamp(), 1_600_000_000);
+    }
+
+    #[test]
+    fn the_sender_is_the_forwarded_person_or_the_sender_name() {
+        assert_eq!(
+            sender_label(&json!({"from":{"first_name":"Анна","last_name":"Петрова","username":"anna"}})),
+            "Анна Петрова (@anna)"
+        );
+        assert_eq!(
+            sender_label(&json!({"from":{"username":"just_user"}})),
+            "@just_user"
+        );
+        assert_eq!(
+            sender_label(&json!({"from":{"id":1},"forward_origin":{"type":"user","sender_user":{"first_name":"Борис","username":"b"}}})),
+            "Борис (@b)"
+        );
+        assert_eq!(
+            sender_label(&json!({"from":{"first_name":"Анна"},"forward_origin":{"type":"hidden_user","sender_user_name":"Скрытый"}})),
+            "Скрытый"
+        );
+        assert_eq!(
+            sender_label(&json!({"from":{"id":1}})),
+            tr("User")
+        );
     }
 
     #[test]
@@ -1399,6 +1972,23 @@ mod tests {
     }
 
     #[test]
+    fn the_reaction_marks_are_ones_telegram_accepts() {
+        // Telegram accepts only a fixed set of emoji. This was read off the live
+        // API: a check mark, a cross and a warning sign are refused with
+        // REACTION_INVALID, which is why the bot appeared to do nothing.
+        const ALLOWED: [&str; 25] = [
+            "👍", "👎", "❤", "🔥", "🥰", "👏", "😁", "🤔", "🤯", "😱", "🤬", "🎉", "🤩", "🙏",
+            "👌", "🕊", "🤡", "🥱", "😍", "🐳", "🌭", "💯", "🤣", "⚡", "👀",
+        ];
+        for mark in [REACTION_WORKING, REACTION_DONE, REACTION_FAILED] {
+            assert!(ALLOWED.contains(&mark), "{mark} is refused by Telegram");
+        }
+        for refused in ["✅", "✔", "☑", "❌", "⚠", "🚫"] {
+            assert!(!ALLOWED.contains(&refused), "{refused} must not come back");
+        }
+    }
+
+    #[test]
     fn a_failed_file_is_answered_as_an_error_and_marked_in_the_chat() {
         let dirs = dirs("error");
         let api = Fake::new(1000);
@@ -1410,6 +2000,8 @@ mod tests {
             file_id: "f".into(),
             file_name: "broken.ogg".into(),
             kind: "voice".into(),
+            sender: String::new(),
+            original_at: String::new(),
             size: 1,
             seconds: 0.0,
             done_seconds: 0.0,
@@ -1423,8 +2015,8 @@ mod tests {
         state.lock().unwrap().current = Some(job.clone());
         finish_job(&api, &dirs, &state, &job, Err(anyhow!("broken container")));
         assert!(api.sent()[0].contains(tr("Bot: could not transcribe: {error}").split("{error}").next().unwrap()));
-        assert_eq!(api.reactions.lock().unwrap()[0], (9, "✅".to_string()));
-        let entry = state.lock().unwrap().chat[0].clone();
+        assert_eq!(api.reactions.lock().unwrap().last().unwrap().1, "👎");
+        let entry = chat_page(&dirs, 1, 0)[0].clone();
         assert!(entry.error.is_some());
         assert!(entry.text.contains("broken container"));
         let _ = std::fs::remove_dir_all(&dirs.root);
@@ -1442,6 +2034,8 @@ mod tests {
             file_id: "f".into(),
             file_name: "silence.ogg".into(),
             kind: "voice".into(),
+            sender: String::new(),
+            original_at: String::new(),
             size: 1,
             seconds: 1.0,
             done_seconds: 1.0,

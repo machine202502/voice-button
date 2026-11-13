@@ -54,6 +54,16 @@ pub struct Config {
     /// Swap the tray icon's left and middle mouse actions.
     #[serde(default)]
     pub swap_mouse_buttons: bool,
+    /// Draw the holiday microphone in the tray and on the site. On by default;
+    /// turning it off leaves the plain icon all year.
+    #[serde(default = "default_true")]
+    pub holiday_icons: bool,
+    /// Debug: pin one holiday microphone regardless of the date, e.g.
+    /// `"halloween"`. It works even when `holiday_icons` is off, so every icon
+    /// can be looked at on the same machine. There is no field for it in
+    /// Settings — it is set by hand in `config.json` and empty by default.
+    #[serde(default)]
+    pub debug_holiday: String,
     /// Separator added after text inserted by record-and-paste.
     #[serde(default)]
     pub paste_separator: PasteSeparator,
@@ -173,6 +183,8 @@ impl Default for Config {
             language: "auto".to_string(),
             input_device: String::new(),
             swap_mouse_buttons: false,
+            holiday_icons: true,
+            debug_holiday: String::new(),
             paste_separator: PasteSeparator::Space,
             autostart: true,
             silent_start: true,

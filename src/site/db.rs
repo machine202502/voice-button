@@ -1,19 +1,24 @@
 //! Storage for monologs and their messages.
 //!
-//! One file (`site/db.json`) holds everything the phone owns: the paired
-//! client, the monologs, the messages, and the stage each message is in. The
-//! file is small, so it is written whole on every change; that keeps the code
-//! obvious and makes a torn write impossible to observe as a partial state.
+//! The phone's data is typed SQLite: one row per monolog, one row per message,
+//! one client row. Stages and flags are columns, never a serialized blob. The
+//! daemon keeps the working set in memory while it runs; the window reads pages
+//! straight from the database and never loads a whole monolog.
 //!
 //! Stages are not free-form: `set_stage` refuses a move the state machine does
 //! not allow, so a message can never jump back into "transcribing" after it is
 //! done, and can never sit in a state that lies about the work left.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
+use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use super::monolog::{Monolog, Stage};
 use std::path::{Path, PathBuf};
+use std::collections::BTreeSet;
+use std::sync::Arc;
+
+use crate::store::Store;
 
 /// The paired phone. One at a time: a new pairing replaces the old one.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -66,26 +71,29 @@ pub struct Message {
     pub closed: bool,
 }
 
-/// Everything the phone half owns.
+/// Everything the phone half owns, in the daemon's memory. Messages are not
+/// kept here: they are read by id from SQLite, so a phone with 100 000 takes
+/// costs the daemon a few bytes, not 100 000 structs.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Data {
     #[serde(default)]
     pub client: Client,
     #[serde(default)]
     pub monologues: Vec<Monolog>,
-    #[serde(default)]
-    pub messages: Vec<Message>,
 }
 
-/// A loaded `db.json`.
+/// A loaded phone database.
 pub struct Db {
     root: PathBuf,
+    store: Arc<Store>,
     data: Data,
+    dirty_client: bool,
+    dirty_monologs: BTreeSet<u64>,
 }
 
 impl Db {
     pub fn path(root: &Path) -> PathBuf {
-        root.join("site").join("db.json")
+        root.join("voice-button.sqlite3")
     }
 
     /// The raw PCM16 the phone sent, exactly as it arrived: a retry decodes
@@ -98,36 +106,55 @@ impl Db {
         &self.root
     }
 
-    /// Open the file.
-    ///
-    /// This layer has no old vocabulary and no migrations: a file written by
-    /// another version is not parsed, not guessed at. It is renamed and kept,
-    /// and the phone starts with an empty database instead of refusing to
-    /// start at all. Nothing is deleted, and the reason reaches the log.
+    pub fn store(&self) -> &Store {
+        &self.store
+    }
+
     pub fn open(root: &Path) -> Result<Self> {
-        let path = Self::path(root);
-        let data = match std::fs::read_to_string(&path) {
-            Ok(text) => match serde_json::from_str::<Data>(&text) {
-                Ok(data) => data,
-                Err(error) => {
-                    match set_aside(&path) {
-                        Some(kept) => crate::log::log(&format!(
-                            "site: db.json does not fit this version ({error}); kept as {} and starting empty",
-                            kept.display()
-                        )),
-                        None => crate::log::log(&format!(
-                            "site: db.json does not fit this version ({error}) and could not be moved aside; starting empty"
-                        )),
-                    }
-                    Data::default()
-                }
-            },
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Data::default(),
-            Err(error) => return Err(error).context("cannot read db.json"),
-        };
+        let store = Arc::new(Store::open(root)?);
+        let mut data = Data::default();
+        {
+            let conn = store.conn();
+            let client = conn
+                .query_row(
+                    "SELECT token, paired, created, expires, last_seen, last_ip
+                     FROM site_client WHERE id = 1",
+                    [],
+                    |row| {
+                        Ok(Client {
+                            token: row.get(0)?,
+                            paired: row.get::<_, i64>(1)? != 0,
+                            created: row.get(2)?,
+                            expires: row.get(3)?,
+                            last_seen: row.get(4)?,
+                            last_ip: row.get(5)?,
+                        })
+                    },
+                )
+                .optional()?;
+            data.client = client.unwrap_or_default();
+            {
+                let mut statement =
+                    conn.prepare("SELECT id, name, archived, created FROM monologs ORDER BY id")?;
+                data.monologues = statement
+                    .query_map([], |row| {
+                        Ok(Monolog {
+                            id: row.get::<_, i64>(0)? as u64,
+                            name: row.get(1)?,
+                            archived: row.get::<_, i64>(2)? != 0,
+                            created: row.get(3)?,
+                            count: 0,
+                        })
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+            }
+        }
         Ok(Self {
             root: root.to_path_buf(),
+            store,
             data,
+            dirty_client: false,
+            dirty_monologs: BTreeSet::new(),
         })
     }
 
@@ -136,26 +163,69 @@ impl Db {
     }
 
     pub fn data_mut(&mut self) -> &mut Data {
+        self.dirty_client = true;
+        self.dirty_monologs.extend(self.data.monologues.iter().map(|monolog| monolog.id));
         &mut self.data
     }
 
-    /// Write the whole file. The temporary name makes a crash mid-write leave
-    /// the previous file intact instead of half a new one.
-    pub fn save(&self) -> Result<()> {
-        let path = Self::path(&self.root);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).context("cannot create site/")?;
+    /// Write the changed client/monolog rows. Messages are written by their own
+    /// methods, so nothing here has to keep a copy of them.
+    pub fn save(&mut self) -> Result<()> {
+        if !self.dirty_client && self.dirty_monologs.is_empty() {
+            return Ok(());
         }
-        let text = serde_json::to_string_pretty(&self.data).context("cannot encode db.json")?;
-        let temporary = path.with_extension("json.tmp");
-        std::fs::write(&temporary, text).context("cannot write db.json")?;
-        std::fs::rename(&temporary, &path).context("cannot replace db.json")?;
+        let mut conn = self.store.conn();
+        let transaction = conn.transaction()?;
+        if self.dirty_client {
+            let client = &self.data.client;
+            transaction.execute(
+                "INSERT INTO site_client(id, token, paired, created, expires, last_seen, last_ip)
+                 VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(id) DO UPDATE SET token = excluded.token, paired = excluded.paired,
+                    created = excluded.created, expires = excluded.expires,
+                    last_seen = excluded.last_seen, last_ip = excluded.last_ip",
+                params![
+                    client.token,
+                    client.paired as i64,
+                    client.created,
+                    client.expires,
+                    client.last_seen,
+                    client.last_ip
+                ],
+            )?;
+        }
+        for monolog in &self.data.monologues {
+            if !self.dirty_monologs.contains(&monolog.id) {
+                continue;
+            }
+            transaction.execute(
+                "INSERT INTO monologs(id, name, archived, created)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(id) DO UPDATE SET name = excluded.name,
+                    archived = excluded.archived, created = excluded.created",
+                params![
+                    monolog.id as i64,
+                    monolog.name,
+                    monolog.archived as i64,
+                    monolog.created
+                ],
+            )?;
+        }
+        transaction.execute(
+            "INSERT INTO kv(key, value) VALUES ('rev.site', '1')
+             ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1",
+            [],
+        )?;
+        transaction.commit()?;
+        self.dirty_client = false;
+        self.dirty_monologs.clear();
         Ok(())
     }
 
     // ---- client ---------------------------------------------------------
 
     pub fn start_pairing(&mut self, token: &str, now: &str) {
+        self.dirty_client = true;
         self.data.client.token = token.to_string();
         self.data.client.paired = false;
         self.data.client.created = now.to_string();
@@ -170,6 +240,7 @@ impl Db {
     }
 
     pub fn mark_paired(&mut self, ip: &str, now: &str) {
+        self.dirty_client = true;
         self.data.client.paired = true;
         self.data.client.expires.clear();
         self.data.client.last_ip = ip.to_string();
@@ -177,6 +248,7 @@ impl Db {
     }
 
     pub fn revoke(&mut self) {
+        self.dirty_client = true;
         self.data.client.paired = false;
         self.data.client.token.clear();
         self.data.client.expires.clear();
@@ -209,23 +281,27 @@ impl Db {
             count: 0,
         };
         self.data.monologues.push(monolog.clone());
+        self.dirty_monologs.insert(id);
         monolog
     }
 
     /// Monologs with the number of messages each holds.
     pub fn monologs(&self, include_archived: bool) -> Vec<Monolog> {
+        let conn = self.store.conn();
         self.data
             .monologues
             .iter()
             .filter(|monolog| include_archived || !monolog.archived)
             .map(|monolog| {
                 let mut copy = monolog.clone();
-                copy.count = self
-                    .data
-                    .messages
-                    .iter()
-                    .filter(|message| message.monolog == monolog.id && !message.deleted)
-                    .count() as u32;
+                copy.count = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM site_messages
+                         WHERE monolog_id = ?1 AND deleted = 0",
+                        [monolog.id as i64],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap_or(0) as u32;
                 copy
             })
             .collect()
@@ -236,6 +312,7 @@ impl Db {
     }
 
     pub fn rename_monolog(&mut self, id: u64, name: &str) {
+        self.dirty_monologs.insert(id);
         if let Some(monolog) = self
             .data
             .monologues
@@ -247,6 +324,7 @@ impl Db {
     }
 
     pub fn archive_monolog(&mut self, id: u64, archived: bool) {
+        self.dirty_monologs.insert(id);
         if let Some(monolog) = self
             .data
             .monologues
@@ -260,16 +338,12 @@ impl Db {
     // ---- messages -------------------------------------------------------
 
     pub fn add_message(&mut self, monolog: u64, recorded: &str, now: &str) -> Message {
-        let id = self
-            .data
-            .messages
-            .iter()
-            .map(|message| message.id)
-            .max()
-            .unwrap_or(0)
-            + 1;
+        let conn = self.store.conn();
+        let id: i64 = conn
+            .query_row("SELECT COALESCE(MAX(id), 0) + 1 FROM site_messages", [], |row| row.get(0))
+            .unwrap_or(1);
         let message = Message {
-            id,
+            id: id as u64,
             monolog,
             recorded: recorded.to_string(),
             received: now.to_string(),
@@ -283,138 +357,637 @@ impl Db {
             history_at: None,
             closed: false,
         };
-        self.data.messages.push(message.clone());
+        let _ = conn.execute(
+            "INSERT INTO site_messages(id, monolog_id, recorded, received, stage)
+             VALUES (?1, ?2, ?3, ?4, 'draft')",
+            params![message.id as i64, monolog as i64, message.recorded, message.received],
+        );
+        bump(&conn);
         message
     }
 
-    pub fn message(&self, id: u64) -> Option<&Message> {
-        self.data.messages.iter().find(|message| message.id == id)
+    pub fn message(&self, id: u64) -> Option<Message> {
+        self.store
+            .conn()
+            .query_row(
+                "SELECT id, monolog_id, recorded, received, stage, text, original, edited,
+                    deleted, duration, segments_done, history_at, closed
+                 FROM site_messages WHERE id = ?1",
+                [id as i64],
+                read_message,
+            )
+            .optional()
+            .ok()
+            .flatten()
     }
 
-    pub fn messages(&self, monolog: Option<u64>) -> Vec<&Message> {
-        let mut list: Vec<&Message> = self
-            .data
-            .messages
-            .iter()
-            .filter(|message| !message.deleted)
-            .filter(|message| monolog.map(|id| message.monolog == id).unwrap_or(true))
-            .collect();
-        list.sort_by(|left, right| left.recorded.cmp(&right.recorded));
-        list
+    pub fn messages(&self, monolog: Option<u64>) -> Vec<Message> {
+        let conn = self.store.conn();
+        let sql = if monolog.is_some() {
+            "SELECT id, monolog_id, recorded, received, stage, text, original, edited,
+                deleted, duration, segments_done, history_at, closed
+             FROM site_messages WHERE deleted = 0 AND monolog_id = ?1
+             ORDER BY recorded, id"
+        } else {
+            "SELECT id, monolog_id, recorded, received, stage, text, original, edited,
+                deleted, duration, segments_done, history_at, closed
+             FROM site_messages WHERE deleted = 0 ORDER BY recorded, id"
+        };
+        let mut statement = match conn.prepare(sql) {
+            Ok(statement) => statement,
+            Err(_) => return Vec::new(),
+        };
+        let rows = if let Some(monolog) = monolog {
+            statement.query_map([monolog as i64], read_message)
+        } else {
+            statement.query_map([], read_message)
+        };
+        rows.map(|rows| rows.flatten().collect()).unwrap_or_default()
     }
 
-    /// Move a message to another stage. A move the machine does not allow is
-    /// refused and logged: this is the one place that can corrupt the story the
-    /// interface tells, so it is the one place that checks.
-    /// Remember that the phone closed the take, whatever stage it shows.
     pub fn close_take(&mut self, id: u64) {
-        if let Some(message) = self.data.messages.iter_mut().find(|item| item.id == id) {
-            message.closed = true;
+        let conn = self.store.conn();
+        if conn
+            .execute("UPDATE site_messages SET closed = 1 WHERE id = ?1", [id as i64])
+            .unwrap_or(0)
+            > 0
+        {
+            bump(&conn);
         }
     }
 
     pub fn set_stage(&mut self, id: u64, stage: Stage) -> bool {
-        let Some(message) = self
-            .data
-            .messages
-            .iter_mut()
-            .find(|message| message.id == id)
+        let conn = self.store.conn();
+        let Some(current) = conn
+            .query_row(
+                "SELECT stage FROM site_messages WHERE id = ?1",
+                [id as i64],
+                |row| Ok(Stage::from_storage(&row.get::<_, String>(0)?)),
+            )
+            .optional()
+            .ok()
+            .flatten()
         else {
             return false;
         };
-        if message.stage == stage {
+        if current == stage {
             return true;
         }
-        if !message.stage.can_move_to(stage) {
+        if !current.can_move_to(stage) {
             crate::log::log(&format!(
-                "site: message {id} cannot go from {:?} to {:?}",
-                message.stage, stage
+                "site: message {id} cannot go from {current:?} to {stage:?}"
             ));
             return false;
         }
-        message.stage = stage;
+        let _ = conn.execute(
+            "UPDATE site_messages SET stage = ?1 WHERE id = ?2",
+            params![stage.as_storage(), id as i64],
+        );
+        bump(&conn);
         true
     }
 
     pub fn add_seconds(&mut self, id: u64, seconds: f64) {
-        if let Some(message) = self
-            .data
-            .messages
-            .iter_mut()
-            .find(|message| message.id == id)
-        {
-            message.duration += seconds;
-            if message.stage == Stage::Draft && message.duration > 0.0 {
-                let _ = message.stage.can_move_to(Stage::Uploading);
-                message.stage = Stage::Uploading;
-            }
-        }
+        let conn = self.store.conn();
+        let Some((stage, duration)) = conn
+            .query_row(
+                "SELECT stage, duration FROM site_messages WHERE id = ?1",
+                [id as i64],
+                |row| {
+                    Ok((
+                        Stage::from_storage(&row.get::<_, String>(0)?),
+                        row.get::<_, f64>(1)?,
+                    ))
+                },
+            )
+            .optional()
+            .ok()
+            .flatten()
+        else {
+            return;
+        };
+        let duration = duration + seconds;
+        let stage = if stage == Stage::Draft && duration > 0.0 {
+            Stage::Uploading
+        } else {
+            stage
+        };
+        let _ = conn.execute(
+            "UPDATE site_messages SET duration = ?1, stage = ?2 WHERE id = ?3",
+            params![duration, stage.as_storage(), id as i64],
+        );
+        bump(&conn);
     }
 
     pub fn set_progress(&mut self, id: u64, text: &str, segments_done: u32) {
-        if let Some(message) = self
-            .data
-            .messages
-            .iter_mut()
-            .find(|message| message.id == id)
+        let conn = self.store.conn();
+        if conn
+            .execute(
+                "UPDATE site_messages SET text = ?1, segments_done = ?2 WHERE id = ?3",
+                params![text, segments_done as i64, id as i64],
+            )
+            .unwrap_or(0)
+            > 0
         {
-            message.text = text.to_string();
-            message.segments_done = segments_done;
+            bump(&conn);
         }
     }
 
     /// Remember that the original text reached the history. False when it was
     /// already written: a retry or a second completion must not add it twice.
     pub fn mark_history(&mut self, id: u64, at: &str) -> bool {
-        let Some(message) = self
-            .data
-            .messages
-            .iter_mut()
-            .find(|message| message.id == id)
-        else {
-            return false;
-        };
-        if message.history_at.is_some() {
-            return false;
+        let conn = self.store.conn();
+        let changed = conn
+            .execute(
+                "UPDATE site_messages SET history_at = ?1
+                 WHERE id = ?2 AND history_at IS NULL",
+                params![at, id as i64],
+            )
+            .unwrap_or(0);
+        if changed > 0 {
+            bump(&conn);
         }
-        message.history_at = Some(at.to_string());
-        true
+        changed > 0
     }
 
     pub fn set_edited(&mut self, id: u64, text: &str, now: &str) {
-        if let Some(message) = self
-            .data
-            .messages
-            .iter_mut()
-            .find(|message| message.id == id)
+        let conn = self.store.conn();
+        if conn
+            .execute(
+                "UPDATE site_messages SET text = ?1, edited = ?2 WHERE id = ?3",
+                params![text, now, id as i64],
+            )
+            .unwrap_or(0)
+            > 0
         {
-            message.text = text.to_string();
-            message.edited = Some(now.to_string());
+            bump(&conn);
         }
     }
 
     pub fn delete(&mut self, id: u64) {
-        if let Some(message) = self
-            .data
-            .messages
-            .iter_mut()
-            .find(|message| message.id == id)
+        let conn = self.store.conn();
+        if conn
+            .execute(
+                "UPDATE site_messages SET deleted = 1, stage = 'cancelled' WHERE id = ?1",
+                [id as i64],
+            )
+            .unwrap_or(0)
+            > 0
         {
-            message.deleted = true;
-            message.stage = Stage::Cancelled;
+            bump(&conn);
         }
+    }
+
+    /// Every message id and stage, for the tests that inspect the whole phone
+    /// state. Never used to render a list.
+    pub fn stages(&self) -> Vec<(u64, Stage)> {
+        let conn = self.store.conn();
+        let Ok(mut statement) = conn.prepare("SELECT id, stage FROM site_messages ORDER BY id") else {
+            return Vec::new();
+        };
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u64,
+                    Stage::from_storage(&row.get::<_, String>(1)?),
+                ))
+            })
+            .map(|rows| rows.flatten().collect())
+            .unwrap_or_default()
+    }
+
+    pub fn message_count(&self, monolog: u64) -> usize {
+        self.store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM site_messages WHERE monolog_id = ?1 AND deleted = 0",
+                [monolog as i64],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|count| count as usize)
+            .unwrap_or(0)
+    }
+
+    /// One page of the feed, oldest-first like the screen. `before` asks for
+    /// messages older than that cursor; `after` for newer ones. With neither,
+    /// the newest page is returned.
+    pub fn message_page(
+        &self,
+        monolog: u64,
+        before: Option<(&str, u64)>,
+        after: Option<(&str, u64)>,
+        limit: usize,
+    ) -> Vec<Message> {
+        let conn = self.store.conn();
+        let select = "SELECT id, monolog_id, recorded, received, stage, text, original, edited,
+                deleted, duration, segments_done, history_at, closed
+             FROM site_messages";
+        let (sql, params): (String, Vec<Box<dyn rusqlite::ToSql>>) = match (before, after) {
+            (Some((recorded, id)), _) => (
+                format!(
+                    "{select} WHERE deleted = 0 AND monolog_id = ?1
+                     AND (recorded < ?2 OR (recorded = ?2 AND id < ?3))
+                     ORDER BY recorded DESC, id DESC LIMIT ?4"
+                ),
+                vec![
+                    Box::new(monolog as i64),
+                    Box::new(recorded.to_string()),
+                    Box::new(id as i64),
+                    Box::new(limit as i64),
+                ],
+            ),
+            (_, Some((recorded, id))) => (
+                format!(
+                    "{select} WHERE deleted = 0 AND monolog_id = ?1
+                     AND (recorded > ?2 OR (recorded = ?2 AND id > ?3))
+                     ORDER BY recorded ASC, id ASC LIMIT ?4"
+                ),
+                vec![
+                    Box::new(monolog as i64),
+                    Box::new(recorded.to_string()),
+                    Box::new(id as i64),
+                    Box::new(limit as i64),
+                ],
+            ),
+            _ => (
+                format!(
+                    "{select} WHERE deleted = 0 AND monolog_id = ?1
+                     ORDER BY recorded DESC, id DESC LIMIT ?2"
+                ),
+                vec![Box::new(monolog as i64), Box::new(limit as i64)],
+            ),
+        };
+        let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|value| value.as_ref()).collect();
+        let newest_first = after.is_none();
+        let mut rows: Vec<Message> = match conn.prepare(&sql) {
+            Ok(mut statement) => statement
+                .query_map(refs.as_slice(), read_message)
+                .map(|rows| rows.flatten().collect())
+                .unwrap_or_default(),
+            Err(_) => Vec::new(),
+        };
+        if newest_first {
+            rows.reverse();
+        }
+        rows
+    }
+
+    /// One page of monologs, newest first, with counts from SQL.
+    pub fn monologs_page(&self, archived: bool, offset: usize, limit: usize) -> (Vec<Monolog>, usize) {
+        let conn = self.store.conn();
+        let total: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM monologs WHERE archived = ?1",
+                [archived as i64],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        let mut result = Vec::new();
+        if let Ok(mut statement) = conn.prepare(
+            "SELECT m.id, m.name, m.archived, m.created,
+                (SELECT COUNT(*) FROM site_messages s
+                 WHERE s.monolog_id = m.id AND s.deleted = 0)
+             FROM monologs m WHERE m.archived = ?1
+             ORDER BY m.created DESC, m.id DESC LIMIT ?2 OFFSET ?3",
+        ) {
+            if let Ok(rows) = statement.query_map(
+                params![archived as i64, limit as i64, offset as i64],
+                |row| {
+                    Ok(Monolog {
+                        id: row.get::<_, i64>(0)? as u64,
+                        name: row.get(1)?,
+                        archived: row.get::<_, i64>(2)? != 0,
+                        created: row.get(3)?,
+                        count: row.get::<_, i64>(4)? as u32,
+                    })
+                },
+            ) {
+                result = rows.flatten().collect();
+            }
+        }
+        (result, total.max(0) as usize)
+    }
+
+    pub fn monolog_count(&self, archived: bool) -> usize {
+        self.store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM monologs WHERE archived = ?1",
+                [archived as i64],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|count| count as usize)
+            .unwrap_or(0)
+    }
+
+    /// Newest non-empty text of a monolog, for its card.
+    pub fn last_text(&self, monolog: u64) -> Option<Message> {
+        self.store
+            .conn()
+            .query_row(
+                "SELECT id, monolog_id, recorded, received, stage, text, original, edited,
+                    deleted, duration, segments_done, history_at, closed
+                 FROM site_messages
+                 WHERE monolog_id = ?1 AND deleted = 0 AND trim(text) <> ''
+                 ORDER BY recorded DESC, id DESC LIMIT 1",
+                [monolog as i64],
+                read_message,
+            )
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    pub fn monolog_busy(&self, monolog: u64) -> bool {
+        self.store
+            .conn()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM site_messages
+                 WHERE monolog_id = ?1 AND deleted = 0
+                   AND stage IN ('draft','uploading','queued','transcribing'))",
+                [monolog as i64],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|value| value != 0)
+            .unwrap_or(false)
     }
 
     /// Messages the phone left in flight: their audio is on disk and must be
     /// finished or closed by the worker at startup.
     pub fn unfinished(&self) -> Vec<u64> {
-        self.data
-            .messages
-            .iter()
-            .filter(|message| message.stage.is_open())
-            .map(|message| message.id)
-            .collect()
+        let conn = self.store.conn();
+        let Ok(mut statement) = conn.prepare(
+            "SELECT id FROM site_messages
+             WHERE stage IN ('draft', 'uploading', 'queued', 'transcribing') ORDER BY id",
+        ) else {
+            return Vec::new();
+        };
+        statement
+            .query_map([], |row| row.get::<_, i64>(0))
+            .map(|rows| rows.flatten().map(|id| id as u64).collect())
+            .unwrap_or_default()
     }
+}
+
+/// Add one to the window's revision counter after a message write.
+fn bump(conn: &rusqlite::Connection) {
+    let _ = conn.execute(
+        "INSERT INTO kv(key, value) VALUES ('rev.site', '1')
+         ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1",
+        [],
+    );
+}
+
+fn read_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
+    Ok(Message {
+        id: row.get::<_, i64>(0)? as u64,
+        monolog: row.get::<_, i64>(1)? as u64,
+        recorded: row.get(2)?,
+        received: row.get(3)?,
+        stage: Stage::from_storage(&row.get::<_, String>(4)?),
+        text: row.get(5)?,
+        original: row.get(6)?,
+        edited: row.get(7)?,
+        deleted: row.get::<_, i64>(8)? != 0,
+        duration: row.get(9)?,
+        segments_done: row.get::<_, i64>(10)? as u32,
+        history_at: row.get(11)?,
+        closed: row.get::<_, i64>(12)? != 0,
+    })
+}
+
+/// The paired client record, without opening a monolog or a message.
+pub fn client(store: &Store) -> Option<Client> {
+    store
+        .conn()
+        .query_row(
+            "SELECT token, paired, created, expires, last_seen, last_ip
+             FROM site_client WHERE id = 1",
+            [],
+            |row| {
+                Ok(Client {
+                    token: row.get(0)?,
+                    paired: row.get::<_, i64>(1)? != 0,
+                    created: row.get(2)?,
+                    expires: row.get(3)?,
+                    last_seen: row.get(4)?,
+                    last_ip: row.get(5)?,
+                })
+            },
+        )
+        .optional()
+        .ok()
+        .flatten()
+}
+
+/// One monolog row as the window lists it. `preview` and `last_at` come from
+/// the newest message, computed in SQL, so the list does not load a monolog's
+/// messages to show a single line.
+#[derive(Debug, Clone, Default)]
+pub struct MonologRow {
+    pub id: u64,
+    pub name: String,
+    pub archived: bool,
+    pub created: String,
+    pub count: u32,
+    pub preview: String,
+    pub last_at: String,
+}
+
+/// One message row as the window lists it: only what the row draws.
+#[derive(Debug, Clone, Default)]
+pub struct MessageRow {
+    pub id: u64,
+    pub recorded: String,
+    pub stage: Stage,
+    pub text: String,
+}
+
+pub fn monolog_count(store: &Store, archived: bool, needle: &str) -> usize {
+    let mut sql = String::from(
+        "SELECT COUNT(*) FROM monologs m WHERE m.archived = ?1",
+    );
+    let needle = needle.trim().to_lowercase();
+    if !needle.is_empty() {
+        sql.push_str(
+            " AND (vb_lower(m.name) LIKE ?2 ESCAPE '\\' OR vb_lower(COALESCE((
+                SELECT text FROM site_messages s WHERE s.monolog_id = m.id AND s.deleted = 0
+                ORDER BY s.recorded DESC, s.id DESC LIMIT 1), '')) LIKE ?2 ESCAPE '\\')",
+        );
+    }
+    let conn = store.conn();
+    let result = if needle.is_empty() {
+        conn.query_row(&sql, [archived as i64], |row| row.get::<_, i64>(0))
+    } else {
+        conn.query_row(
+            &sql,
+            params![archived as i64, format!("%{needle}%")],
+            |row| row.get::<_, i64>(0),
+        )
+    };
+    if let Err(error) = &result {
+        crate::log::log(&format!("monolog search failed: {error}"));
+    }
+    result.map(|count| count as usize).unwrap_or(0)
+}
+
+pub fn monolog_page(
+    store: &Store,
+    archived: bool,
+    needle: &str,
+    offset: usize,
+    limit: usize,
+) -> Vec<MonologRow> {
+    let needle = needle.trim().to_lowercase();
+    let mut sql = String::from(
+        "SELECT m.id, m.name, m.archived, m.created,
+            (SELECT COUNT(*) FROM site_messages s WHERE s.monolog_id = m.id AND s.deleted = 0),
+            COALESCE((SELECT text FROM site_messages s WHERE s.monolog_id = m.id AND s.deleted = 0
+                ORDER BY s.recorded DESC, s.id DESC LIMIT 1), ''),
+            COALESCE((SELECT recorded FROM site_messages s WHERE s.monolog_id = m.id AND s.deleted = 0
+                ORDER BY s.recorded DESC, s.id DESC LIMIT 1), '')
+         FROM monologs m WHERE m.archived = ?1",
+    );
+    if !needle.is_empty() {
+        sql.push_str(
+            " AND (vb_lower(m.name) LIKE ?2 ESCAPE '\\' OR vb_lower(COALESCE((
+                SELECT text FROM site_messages s WHERE s.monolog_id = m.id AND s.deleted = 0
+                ORDER BY s.recorded DESC, s.id DESC LIMIT 1), '')) LIKE ?2 ESCAPE '\\')",
+        );
+    }
+    sql.push_str(" ORDER BY m.created DESC, m.id DESC LIMIT ?3 OFFSET ?4");
+    let conn = store.conn();
+    let mut statement = match conn.prepare(&sql) {
+        Ok(statement) => statement,
+        Err(_) => return Vec::new(),
+    };
+    let mapper = |row: &rusqlite::Row<'_>| {
+        Ok(MonologRow {
+            id: row.get::<_, i64>(0)? as u64,
+            name: row.get(1)?,
+            archived: row.get::<_, i64>(2)? != 0,
+            created: row.get(3)?,
+            count: row.get::<_, i64>(4)? as u32,
+            preview: row.get(5)?,
+            last_at: row.get(6)?,
+        })
+    };
+    let rows = if needle.is_empty() {
+        statement.query_map(
+            params![archived as i64, "", limit as i64, offset as i64],
+            mapper,
+        )
+    } else {
+        statement.query_map(
+            params![archived as i64, format!("%{needle}%"), limit as i64, offset as i64],
+            mapper,
+        )
+    };
+    rows.map(|rows| rows.flatten().collect()).unwrap_or_default()
+}
+
+pub fn message_count(store: &Store, monolog: u64) -> usize {
+    store
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM site_messages WHERE monolog_id = ?1 AND deleted = 0",
+            [monolog as i64],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|count| count as usize)
+        .unwrap_or(0)
+}
+
+pub fn message_page(store: &Store, monolog: u64, offset: usize, limit: usize) -> Vec<MessageRow> {
+    let conn = store.conn();
+    let mut statement = match conn.prepare(
+        "SELECT id, recorded, stage, text FROM site_messages
+         WHERE monolog_id = ?1 AND deleted = 0
+         ORDER BY recorded, id LIMIT ?2 OFFSET ?3",
+    ) {
+        Ok(statement) => statement,
+        Err(_) => return Vec::new(),
+    };
+    statement
+        .query_map(params![monolog as i64, limit as i64, offset as i64], |row| {
+            Ok(MessageRow {
+                id: row.get::<_, i64>(0)? as u64,
+                recorded: row.get(1)?,
+                stage: Stage::from_storage(&row.get::<_, String>(2)?),
+                text: row.get(3)?,
+            })
+        })
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default()
+}
+
+/// Texts of the selected takes, in the order they were spoken. The selection
+/// may span pages that are not loaded, so the query goes to the table.
+pub fn message_texts(store: &Store, ids: &[u64]) -> Vec<String> {
+    if ids.is_empty() {
+        return Vec::new();
+    }
+    let marks = vec!["?"; ids.len()].join(",");
+    let sql = format!(
+        "SELECT text FROM site_messages WHERE id IN ({marks}) AND deleted = 0
+         ORDER BY recorded, id"
+    );
+    let conn = store.conn();
+    let Ok(mut statement) = conn.prepare(&sql) else {
+        return Vec::new();
+    };
+    let values: Vec<i64> = ids.iter().map(|id| *id as i64).collect();
+    let refs: Vec<&dyn rusqlite::ToSql> = values.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+    statement
+        .query_map(refs.as_slice(), |row| row.get::<_, String>(0))
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default()
+}
+
+/// One monolog by id, for the detail panel when the page it belongs to is not
+/// loaded.
+pub fn monolog_row(store: &Store, id: u64) -> Option<MonologRow> {
+    let conn = store.conn();
+    conn.query_row(
+        "SELECT m.id, m.name, m.archived, m.created,
+            (SELECT COUNT(*) FROM site_messages s WHERE s.monolog_id = m.id AND s.deleted = 0),
+            COALESCE((SELECT text FROM site_messages s WHERE s.monolog_id = m.id AND s.deleted = 0
+                ORDER BY s.recorded DESC, s.id DESC LIMIT 1), ''),
+            COALESCE((SELECT recorded FROM site_messages s WHERE s.monolog_id = m.id AND s.deleted = 0
+                ORDER BY s.recorded DESC, s.id DESC LIMIT 1), '')
+         FROM monologs m WHERE m.id = ?1",
+        [id as i64],
+        |row| {
+            Ok(MonologRow {
+                id: row.get::<_, i64>(0)? as u64,
+                name: row.get(1)?,
+                archived: row.get::<_, i64>(2)? != 0,
+                created: row.get(3)?,
+                count: row.get::<_, i64>(4)? as u32,
+                preview: row.get(5)?,
+                last_at: row.get(6)?,
+            })
+        },
+    )
+    .optional()
+    .ok()
+    .flatten()
+}
+
+/// Every visible message id of a monolog, for "Select all". This is the one
+/// action that deliberately touches every id; it does not load texts.
+pub fn message_ids(store: &Store, monolog: u64) -> Vec<u64> {
+    let conn = store.conn();
+    let Ok(mut statement) = conn.prepare(
+        "SELECT id FROM site_messages WHERE monolog_id = ?1 AND deleted = 0
+         ORDER BY recorded, id",
+    ) else {
+        return Vec::new();
+    };
+    statement
+        .query_map([monolog as i64], |row| row.get::<_, i64>(0))
+        .map(|rows| rows.flatten().map(|id| id as u64).collect())
+        .unwrap_or_default()
 }
 
 /// How long a pairing link may be used.
@@ -428,22 +1001,6 @@ pub fn expires_at(now: &str) -> String {
     }
 }
 
-/// Rename a file this version cannot read, keeping it for the user. Returns
-/// where it went, or `None` when it could not be moved (a locked file stays
-/// where it is and the caller still starts empty).
-fn set_aside(path: &Path) -> Option<PathBuf> {
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let name = format!(
-        "db.json.old-{stamp}-{}",
-        std::process::id()
-    );
-    let target = path.parent()?.join(name);
-    std::fs::rename(path, &target).ok().map(|_| target)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -453,33 +1010,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         root
-    }
-
-    #[test]
-    fn a_database_from_another_version_is_set_aside_not_fatal() {
-        let root = root_for("old-db");
-        std::fs::create_dir_all(root.join("site")).unwrap();
-        // The shape the 0.4.0 layer wrote: groups, messages with a `group`.
-        let old = r#"{"client":{},"groups":[{"id":1}],"messages":[{"id":1,"group":1,"status":"live"}]}"#;
-        std::fs::write(Db::path(&root), old).unwrap();
-        let db = Db::open(&root).expect("an old file must not stop the phone");
-        assert!(db.data().monologues.is_empty());
-        assert!(db.data().messages.is_empty());
-        let kept: Vec<String> = std::fs::read_dir(root.join("site"))
-            .unwrap()
-            .filter_map(|entry| entry.ok())
-            .map(|entry| entry.file_name().to_string_lossy().to_string())
-            .filter(|name| name.starts_with("db.json.old-"))
-            .collect();
-        assert_eq!(kept.len(), 1, "the old file is kept, not deleted: {kept:?}");
-        assert_eq!(
-            std::fs::read_to_string(root.join("site").join(&kept[0])).unwrap(),
-            old
-        );
-        // The next start is clean and does not set anything aside again.
-        let again = Db::open(&root).unwrap();
-        assert!(again.data().messages.is_empty());
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -514,6 +1044,36 @@ mod tests {
     }
 
     #[test]
+    fn message_pages_walk_backwards_and_forwards() {
+        let root = root_for("cursor");
+        let mut db = Db::open(&root).unwrap();
+        let monolog = db.create_monolog("Лента", "2026-11-12T10:00:00+05:00");
+        let mut ids = Vec::new();
+        for index in 0..5 {
+            let clock = format!("2026-11-12T10:00:0{index}+05:00");
+            ids.push(db.add_message(monolog.id, &clock, &clock).id);
+        }
+        db.save().unwrap();
+
+        let newest = db.message_page(monolog.id, None, None, 2);
+        assert_eq!(newest.iter().map(|m| m.id).collect::<Vec<_>>(), ids[3..]);
+        let older = db.message_page(monolog.id, Some((&newest[0].recorded, newest[0].id)), None, 2);
+        assert_eq!(older.iter().map(|m| m.id).collect::<Vec<_>>(), ids[1..3]);
+        let newer = db.message_page(
+            monolog.id,
+            None,
+            Some((&newest[0].recorded, newest[0].id)),
+            2,
+        );
+        assert_eq!(newer.iter().map(|m| m.id).collect::<Vec<_>>(), ids[4..]);
+        assert_eq!(db.message_count(monolog.id), 5);
+        let (page, total) = db.monologs_page(false, 0, 10);
+        assert_eq!(total, 1);
+        assert_eq!(page[0].count, 5);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn a_saved_database_reads_back_whole() {
         let root = root_for("roundtrip");
         {
@@ -526,12 +1086,11 @@ mod tests {
         }
         let reopened = Db::open(&root).unwrap();
         assert_eq!(reopened.monologs(true).len(), 1);
-        let message = reopened.messages(None)[0];
+        let message = reopened.messages(None)[0].clone();
         assert_eq!(message.stage, Stage::Queued);
         assert!((message.duration - 2.0).abs() < 0.001);
         let _ = std::fs::remove_dir_all(root);
     }
-
 
     #[test]
     fn deleted_messages_leave_the_list_but_not_the_file() {
@@ -542,7 +1101,8 @@ mod tests {
         db.delete(message.id);
         assert!(db.messages(None).is_empty(), "a deleted take is hidden");
         assert_eq!(db.message(message.id).unwrap().stage, Stage::Cancelled);
-        assert!(db.data().messages.len() == 1, "but it is still stored");
+        assert!(db.data().monologues.len() == 1, "the monolog is still stored");
+        assert!(db.message(message.id).is_some(), "and so is the deleted take");
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -569,5 +1129,36 @@ mod tests {
         assert!(!db.pairing_alive("2026-11-12T10:02:00+05:00"));
         assert!(db.data().client.paired);
         assert!(db.data().client.expires.is_empty());
+    }
+
+    #[test]
+    fn the_window_reads_pages_without_opening_a_monolog() {
+        let root = root_for("pages");
+        {
+            let mut db = Db::open(&root).unwrap();
+            let monolog = db.create_monolog("Работа", "2026-11-12T10:00:00+05:00");
+            for index in 0..500 {
+                let clock = format!("2026-11-12T15:00:{:02}+05:00", index % 60);
+                let message = db.add_message(monolog.id, &clock, &clock);
+                db.set_progress(message.id, &format!("take {index}"), 1);
+            }
+            db.save().unwrap();
+        }
+        let store = Store::open(&root).unwrap();
+        assert_eq!(monolog_count(&store, false, ""), 1);
+        let page = monolog_page(&store, false, "", 0, 10);
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].count, 500);
+        assert_eq!(monolog_count(&store, false, "Работа"), 1);
+        assert_eq!(monolog_count(&store, false, "nothing like this"), 0);
+        assert_eq!(message_count(&store, page[0].id), 500);
+        assert_eq!(message_page(&store, page[0].id, 0, 200).len(), 200);
+        assert_eq!(message_page(&store, page[0].id, 400, 200).len(), 100);
+        let ids: Vec<u64> = message_page(&store, page[0].id, 0, 3)
+            .iter()
+            .map(|row| row.id)
+            .collect();
+        assert_eq!(message_texts(&store, &ids).len(), 3);
+        let _ = std::fs::remove_dir_all(root);
     }
 }

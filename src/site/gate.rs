@@ -13,6 +13,7 @@ use std::net::IpAddr;
 use std::path::Path;
 
 use crate::http::{self, Request, Response};
+use crate::i18n::tr;
 
 use super::api::{self, Ctx};
 use super::db::Db;
@@ -104,16 +105,34 @@ fn authorised(request: &Request, gate: &Gate) -> bool {
 /// The pairing page stores the token in the phone and moves to the app.
 fn pairing_page(request: &Request, gate: &Gate) -> Response {
     let token = http::query_param(&request.query, "t").unwrap_or_default();
+    // Served in the language of the computer, which is the one the person
+    // reading the screen has been using.
     let (title, line, keep) = {
         let db = gate.db.lock().unwrap();
         if db.data().client.paired {
-            ("Ссылка уже использована", "Этот телефон уже подключён. Попросите новый QR-код на компьютере.", None)
+            (
+                tr("The link has already been used"),
+                tr("This phone is already connected. Ask for a new QR code on the computer."),
+                None,
+            )
         } else if !db.token_matches(&token) {
-            ("Ссылка недействительна", "Попросите новый QR-код на компьютере.", None)
+            (
+                tr("The link is not valid"),
+                tr("Ask for a new QR code on the computer."),
+                None,
+            )
         } else if !db.pairing_alive(gate.now) {
-            ("Срок ссылки истёк", "Ссылка действует пять минут. Попросите новый QR-код на компьютере.", None)
+            (
+                tr("The link has expired"),
+                tr("The link is valid for five minutes. Ask for a new QR code on the computer."),
+                None,
+            )
         } else {
-            ("Подключение", "Телефон сейчас подключится к компьютеру.", Some(token))
+            (
+                tr("Connecting"),
+                tr("The phone is connecting to the computer."),
+                Some(token),
+            )
         }
     };
     let script = match keep {
@@ -122,8 +141,9 @@ fn pairing_page(request: &Request, gate: &Gate) -> Response {
         ),
         None => String::new(),
     };
+    let lang = crate::i18n::active_code();
     let body = format!(
-        "<!DOCTYPE html><html lang=\"ru\"><head><meta charset=\"utf-8\">\
+        "<!DOCTYPE html><html lang=\"{lang}\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
          <title>Voice Button</title><style>body{{background:#111713;color:#e7f0e0;\
          font:16px/1.5 system-ui;margin:0;display:grid;place-items:center;height:100vh}}\
@@ -377,7 +397,7 @@ mod tests {
         assert_eq!(case.ask("GET", "/site/api/monologues", "", Some("secret")).0, 401);
         let (status, body) = case.ask("GET", "/pair", "t=secret", None);
         assert_eq!(status, 200);
-        assert!(body.contains("Срок ссылки истёк"));
+        assert!(body.contains("The link has expired"));
     }
 
     #[test]
@@ -408,12 +428,12 @@ mod tests {
             db.mark_paired("5.79.1.2", NOW);
         }
         let (_, body) = case.ask("GET", "/pair", "t=secret", None);
-        assert!(body.contains("уже использована"));
+        assert!(body.contains("The link has already been used"));
 
         // A wrong token is reported as such while nobody is paired.
         let fresh = Case::new("used-fresh");
         let (_, body) = fresh.ask("GET", "/pair", "t=nonsense", None);
-        assert!(body.contains("недействительна"));
+        assert!(body.contains("The link is not valid"));
     }
 
     #[test]

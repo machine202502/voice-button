@@ -489,7 +489,7 @@ fn the_worker_refuses_audio_longer_than_one_segment() {
 #[test]
 #[ignore = "needs a downloaded model and the app binary"]
 fn an_imported_file_is_transcribed_without_copying_it() {
-    use std::sync::{mpsc, Arc, Mutex};
+    use std::sync::{mpsc, Arc};
     use std::time::Duration;
     use voice_button::config::{AppDirs, Backend, Config};
     use voice_button::history::{History, Source};

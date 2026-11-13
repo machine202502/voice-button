@@ -3,9 +3,9 @@
 //! Two things have to happen outside the app: a Windows Firewall rule for the
 //! port, and a port mapping on the router. The first always needs administrator
 //! rights, the second needs a router that speaks UPnP. Both live in
-//! `net.ps1`, which re-launches itself elevated, does the work and writes
-//! `site/network.json` with what actually happened. The app never believes a
-//! button click: it reads that file.
+//! `net.ps1`, which re-launches itself elevated, does the work and writes a
+//! plain `key=value` hand-off file. The app imports that file into SQLite and
+//! deletes it; the database is the only place the result stays.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -43,24 +43,121 @@ pub struct Upnp {
     pub added: bool,
 }
 
-/// Path of the state file the script writes.
+/// Path of the hand-off file the script writes. The app imports it into
+/// SQLite immediately and deletes it; it is never the source of truth.
 pub fn state_path(root: &Path) -> PathBuf {
-    root.join("site").join("network.json")
+    root.join("site").join("network.state")
+}
+
+fn truthy(value: &str) -> bool {
+    matches!(value.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes")
+}
+
+fn parse(text: &str) -> Option<State> {
+    let mut map = std::collections::BTreeMap::new();
+    for line in text.lines() {
+        if let Some((key, value)) = line.split_once('=') {
+            map.insert(key.trim().to_string(), value.trim().to_string());
+        }
+    }
+    if map.is_empty() {
+        return None;
+    }
+    let get = |key: &str| map.get(key).cloned().unwrap_or_default();
+    let upnp = if get("upnp_router").is_empty() && get("upnp_external_port").is_empty() {
+        None
+    } else {
+        Some(Upnp {
+            router: get("upnp_router"),
+            external_port: get("upnp_external_port").parse().unwrap_or(0),
+            internal_ip: get("upnp_internal_ip"),
+            added: truthy(&get("upnp_added")),
+        })
+    };
+    Some(State {
+        port: get("port").parse().unwrap_or(0),
+        enabled: truthy(&get("enabled")),
+        firewall_rule: get("firewall_rule"),
+        firewall_created: get("firewall_created"),
+        upnp,
+        error: Some(get("error")).filter(|value| !value.is_empty()),
+        updated: get("updated"),
+    })
 }
 
 pub fn read(root: &Path) -> Option<State> {
-    let text = std::fs::read_to_string(state_path(root)).ok()?;
-    serde_json::from_str(&text).ok()
+    let store = crate::store::Store::open(root).ok()?;
+    let conn = store.conn();
+    conn.query_row(
+        "SELECT port, enabled, firewall_rule, firewall_created, upnp_router,
+            upnp_external_port, upnp_internal_ip, upnp_added, error, updated
+         FROM site_network WHERE id = 1",
+        [],
+        |row| {
+            Ok(State {
+                port: row.get::<_, i64>(0)? as u16,
+                enabled: row.get::<_, i64>(1)? != 0,
+                firewall_rule: row.get(2)?,
+                firewall_created: row.get(3)?,
+                upnp: {
+                    let router: String = row.get(4)?;
+                    let external_port: i64 = row.get(5)?;
+                    let internal_ip: String = row.get(6)?;
+                    if router.is_empty() && external_port == 0 && internal_ip.is_empty() {
+                        None
+                    } else {
+                        Some(Upnp {
+                            router,
+                            external_port: external_port as u16,
+                            internal_ip,
+                            added: row.get::<_, i64>(7)? != 0,
+                        })
+                    }
+                },
+                error: row.get(8)?,
+                updated: row.get(9)?,
+            })
+        },
+    )
+    .ok()
 }
 
 pub fn write(root: &Path, state: &State) -> Result<()> {
-    let path = state_path(root);
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let text = serde_json::to_vec_pretty(state)?;
-    crate::ipc::atomic_write(path, &text);
+    let store = crate::store::Store::open(root)?;
+    store.conn().execute(
+        "INSERT INTO site_network(id, port, enabled, firewall_rule, firewall_created,
+            upnp_router, upnp_external_port, upnp_internal_ip, upnp_added, error, updated)
+         VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         ON CONFLICT(id) DO UPDATE SET port = excluded.port, enabled = excluded.enabled,
+            firewall_rule = excluded.firewall_rule, firewall_created = excluded.firewall_created,
+            upnp_router = excluded.upnp_router, upnp_external_port = excluded.upnp_external_port,
+            upnp_internal_ip = excluded.upnp_internal_ip, upnp_added = excluded.upnp_added,
+            error = excluded.error, updated = excluded.updated",
+        rusqlite::params![
+            state.port as i64,
+            state.enabled as i64,
+            state.firewall_rule,
+            state.firewall_created,
+            state.upnp.as_ref().map(|upnp| upnp.router.as_str()).unwrap_or(""),
+            state.upnp.as_ref().map(|upnp| upnp.external_port as i64).unwrap_or(0),
+            state.upnp.as_ref().map(|upnp| upnp.internal_ip.as_str()).unwrap_or(""),
+            state.upnp.as_ref().map(|upnp| upnp.added as i64).unwrap_or(0),
+            state.error,
+            state.updated
+        ],
+    )?;
     Ok(())
+}
+
+/// Import the script's hand-off file and remove it. The database is the only
+/// place the state stays.
+fn import(root: &Path) -> Option<State> {
+    let path = state_path(root);
+    let text = std::fs::read_to_string(&path).ok()?;
+    let state = parse(&text)?;
+    let _ = write(root, &state);
+    let _ = std::fs::remove_file(path);
+    Some(state)
 }
 
 /// Where the script lives: next to the executable, like the locales.
@@ -84,13 +181,17 @@ pub fn script_path() -> Option<PathBuf> {
 /// thread because the user may take a while to answer the UAC prompt.
 pub fn apply(root: &Path, port: u16, internal_ip: &str, skip_upnp: bool) -> Result<State> {
     run(root, "enable", port, internal_ip, skip_upnp)?;
-    read(root).context("the network script wrote no state")
+    import(root)
+        .or_else(|| read(root))
+        .context("the network script wrote no state")
 }
 
 /// Remove the firewall rule and the router mapping. Also blocking.
 pub fn clear(root: &Path) -> Result<State> {
     run(root, "disable", 0, "", false)?;
-    read(root).context("the network script wrote no state")
+    import(root)
+        .or_else(|| read(root))
+        .context("the network script wrote no state")
 }
 
 /// Remember that the last attempt failed, so the window can say so instead of

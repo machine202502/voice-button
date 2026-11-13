@@ -1,5 +1,7 @@
 target/
 dist/
+design/
+plans/
 # Written by tests/phone-e2e.py when a run fails.
 tests/e2e-diag.log
 # Python bytecode from the test scripts.

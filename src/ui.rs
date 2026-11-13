@@ -1,6 +1,9 @@
 use crate::autostart;
 use crate::config::{self, AppDirs, Backend, PasteSeparator};
 use crate::model_manager;
+use crate::paging::Paged;
+use crate::site::db::{MessageRow, MonologRow};
+use crate::store::Store;
 use crate::i18n::{tr, trf};
 use crate::state::{self, Data, Shared};
 use arboard;
@@ -41,14 +44,15 @@ enum HistoryFilter {
 }
 
 impl HistoryFilter {
-    fn matches(self, source: state::Source) -> bool {
+    /// Sources to ask SQL for. Empty means every row.
+    fn sources(self) -> Vec<state::Source> {
         match self {
-            HistoryFilter::All => true,
-            HistoryFilter::User => source == state::Source::User,
-            HistoryFilter::Server => source == state::Source::Server,
-            HistoryFilter::File => source == state::Source::File,
-            HistoryFilter::Phone => source == state::Source::Site,
-            HistoryFilter::Telegram => source == state::Source::Telegram,
+            HistoryFilter::All => Vec::new(),
+            HistoryFilter::User => vec![state::Source::User],
+            HistoryFilter::Server => vec![state::Source::Server],
+            HistoryFilter::File => vec![state::Source::File],
+            HistoryFilter::Phone => vec![state::Source::Site],
+            HistoryFilter::Telegram => vec![state::Source::Telegram],
         }
     }
 }
@@ -138,7 +142,7 @@ pub fn run_from_args() {
                 message: Some(42),
             },
         ]);
-        // The Phone tab lists what the daemon stores in `site/db.json`. The
+        // The Phone tab lists what the daemon stores in the phone database. The
         // snapshot has no daemon, so seed that file the way the daemon would:
         // one monolog with two finished takes. The real file poller then picks
         // it up, exactly as it does in the running app.
@@ -224,10 +228,17 @@ fn install_cjk_fonts(ctx: &egui::Context) {
 
 fn run_ui(config: config::Config, history: state::History, dirs: AppDirs, tab: String) {
     let shared = Arc::new(Shared::new(config, history));
+    let store = match Store::open(&dirs.root) {
+        Ok(store) => Arc::new(store),
+        Err(error) => {
+            crate::log::log(&format!("ui: cannot open the database: {error:#}"));
+            return;
+        }
+    };
     if let Some(pid) = current_parent_pid() {
         spawn_parent_watcher(pid);
     }
-    spawn_file_poller(shared.clone(), dirs.clone());
+    spawn_file_poller(shared.clone(), dirs.clone(), store.clone());
     let initial_tab = if tab == "settings" {
         Tab::Settings
     } else if tab == "history" {
@@ -250,6 +261,7 @@ fn run_ui(config: config::Config, history: state::History, dirs: AppDirs, tab: S
     let app = MainWindow {
         shared: shared.clone(),
         dirs: dirs.clone(),
+        store,
         tab: initial_tab,
         external_tab: if tab == "telegram" {
             ExternalTab::Telegram
@@ -261,13 +273,18 @@ fn run_ui(config: config::Config, history: state::History, dirs: AppDirs, tab: S
         show_about: false,
         expanded_history: None,
         history_filter: HistoryFilter::All,
+        history_search: String::new(),
+        history_paged: Paged::new(),
+        history_key: None,
+        history_query: None,
         download_done_seen: false,
         api_copied_at: 0.0,
         site_qr: None,
         phone: PhoneState::default(),
-        telegram_chat: Vec::new(),
-        telegram_chat_at: None,
+        telegram_chat: Paged::new(),
+        telegram_key: None,
         telegram_form: TelegramForm::default(),
+        telegram_search: String::new(),
         snapshot_dir: std::env::var("VB_SNAPSHOT").ok().map(PathBuf::from),
         snapshot_frame: 0,
     };
@@ -357,33 +374,13 @@ fn sync_config_from_disk(data: &mut Data, cfg: config::Config) {
     }
 }
 
-/// Keep the in-memory state in sync with files written by the daemon
-/// (config is also written by us; history and download progress come from
-/// the daemon).
-fn spawn_file_poller(shared: Arc<Shared>, dirs: AppDirs) {
+/// Keep the in-memory state in sync with the daemon's SQLite runtime rows.
+/// Config is also written by us, so it keeps its timestamp check; everything
+/// else is a cheap key/value read.
+fn spawn_file_poller(shared: Arc<Shared>, dirs: AppDirs, store: Arc<crate::store::Store>) {
     std::thread::spawn(move || {
         let config_path = dirs.root.join("config.json");
-        let history_path = crate::history::history_path(&dirs.root);
-        let download_path = dirs.root.join("download.state.json");
-        let status_path = dirs.root.join("status.txt");
-        let live_path = dirs.root.join("live.json");
-        let api_path = dirs.root.join("api.state.json");
-        let site_path = dirs.root.join("site.state.json");
-        let site_db_path = crate::site::db::Db::path(&dirs.root);
-        let network_path = crate::site::network::state_path(&dirs.root);
-        let session_path = dirs.root.join("session.json");
         let mut config_meta = meta_key(&std::fs::metadata(&config_path).ok());
-        let mut history_meta = meta_key(&std::fs::metadata(&history_path).ok());
-        // None forces an initial read when a file already exists. This is
-        // essential when the UI is opened after recording/download has begun.
-        let mut download_meta = None;
-        let mut status_meta = None;
-        let mut live_meta = None;
-        let mut api_meta = None;
-        let mut site_meta = None;
-        let mut site_db_meta = None;
-        let mut network_meta = None;
-        let mut session_meta = None;
         loop {
             std::thread::sleep(Duration::from_millis(300));
             let m = meta_key(&std::fs::metadata(&config_path).ok());
@@ -392,107 +389,56 @@ fn spawn_file_poller(shared: Arc<Shared>, dirs: AppDirs) {
                 let cfg = config::load_config(&dirs.root);
                 sync_config_from_disk(&mut shared.lock(), cfg);
             }
-            let m = meta_key(&std::fs::metadata(&history_path).ok());
-            if m != history_meta {
-                history_meta = m;
-                let history = state::load_history(&dirs.root);
-                shared.lock().history = history;
-            }
-            let m = meta_key(&std::fs::metadata(&download_path).ok());
-            if m != download_meta {
-                download_meta = m;
-                let download = crate::ipc::read_download_state(&dirs.root).map(|s| {
-                    state::DownloadProgress {
-                        model: s.model,
-                        file: s.file,
-                        files: s.files,
-                        downloaded: s.downloaded,
-                        total: s.total,
-                        done_bytes: s.done_bytes,
-                        done_total: s.done_total,
-                        done: s.done,
-                        error: s.error,
-                        // Cancellation is file-based in the UI process.
-                        cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                    }
-                });
-                shared.lock().download = download;
-            }
-            let m = meta_key(&std::fs::metadata(&status_path).ok());
-            if m != status_meta {
-                status_meta = m;
-                if let Some(status) = crate::ipc::read_status(&dirs.root) {
-                    shared.lock().status = status;
+            let download = crate::ipc::read_download_state(&dirs.root).map(|s| {
+                state::DownloadProgress {
+                    model: s.model,
+                    file: s.file,
+                    files: s.files,
+                    downloaded: s.downloaded,
+                    total: s.total,
+                    done_bytes: s.done_bytes,
+                    done_total: s.done_total,
+                    done: s.done,
+                    error: s.error,
+                    // Cancellation is file-based in the UI process.
+                    cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 }
-            }
-            let m = meta_key(&std::fs::metadata(&live_path).ok());
-            if m != live_meta {
-                live_meta = m;
+            });
+            {
+                let mut data = shared.lock();
+                data.download = download;
+                if let Some(status) = crate::ipc::read_status(&dirs.root) {
+                    data.status = status;
+                }
                 match crate::ipc::read_live(&dirs.root) {
                     Some(live) => {
-                        let mut data = shared.lock();
                         data.live_text = live.text;
                         data.live_started_ms = live.started;
                     }
                     None => {
-                        let mut data = shared.lock();
                         data.live_text.clear();
                         data.live_started_ms = 0;
                     }
                 }
-            }
-            let m = meta_key(&std::fs::metadata(&api_path).ok());
-            if m != api_meta {
-                api_meta = m;
-                if let Some(state) = crate::ipc::read_api_state(&dirs.root) {
-                    shared.lock().api = Some(state.into());
-                }
-            }
-            let m = meta_key(&std::fs::metadata(&site_path).ok());
-            if m != site_meta {
-                site_meta = m;
-                shared.lock().site = crate::ipc::read_site_state(&dirs.root);
-            }
-            // The daemon owns `site/db.json`; the window mirrors the pairing
-            // record (for the QR code) and the monologs (for the phone list).
-            let m = meta_key(&std::fs::metadata(&site_db_path).ok());
-            if m != site_db_meta {
-                site_db_meta = m;
-                let (pairing, monologs) = match crate::site::db::Db::open(&dirs.root) {
-                    Ok(db) => {
-                        let client = &db.data().client;
-                        let pairing = if client.paired || client.token.is_empty() {
-                            None
-                        } else {
-                            Some(state::SitePairing {
-                                token: client.token.clone(),
-                                until: client.expires.clone(),
-                            })
-                        };
-                        (pairing, Some(state::SiteMonologs::from_db(&db)))
+                data.api = crate::ipc::read_api_state(&dirs.root).map(Into::into);
+                data.site = crate::ipc::read_site_state(&dirs.root);
+                data.session_view = crate::ipc::read_session(&dirs.root).map(Into::into);
+                data.site_pairing = crate::site::db::client(&store).and_then(|client| {
+                    if client.paired || client.token.is_empty() {
+                        None
+                    } else {
+                        Some(state::SitePairing {
+                            token: client.token,
+                            until: client.expires,
+                        })
                     }
-                    Err(_) => (None, None),
-                };
-                let mut data = shared.lock();
-                data.site_pairing = pairing;
-                data.site_monologs = monologs;
-            }
-            let m = meta_key(&std::fs::metadata(&network_path).ok());
-            if m != network_meta {
-                network_meta = m;
-                shared.lock().site_network = crate::site::network::read(&dirs.root);
-            }
-            shared.lock().site_network_busy = crate::ipc::site_network_busy(&dirs.root);
-            let m = meta_key(&std::fs::metadata(&session_path).ok());
-            if m != session_meta {
-                session_meta = m;
-                let view = crate::ipc::read_session(&dirs.root).map(Into::into);
-                shared.lock().session_view = view;
+                });
+                data.site_network = crate::site::network::read(&dirs.root);
+                data.site_network_busy = crate::ipc::site_network_busy(&dirs.root);
             }
         }
     });
 }
-
 /// Which half of the phone list is on screen: active monologs or the archive.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum PhoneView {
@@ -511,20 +457,32 @@ struct PhoneState {
     selected: std::collections::BTreeSet<u64>,
     /// Snapshot mode only: scroll the phone page to the monolog list.
     focus_list: bool,
+    /// One page window over `monologs`, keyed by (revision, archive, search).
+    monologs: Paged<MonologRow>,
+    monolog_key: Option<(u64, bool, String)>,
+    monolog_query: Option<(bool, String)>,
+    /// One page window over the open monolog's messages, keyed by
+    /// (revision, monolog id).
+    messages: Paged<MessageRow>,
+    message_key: Option<(u64, u64)>,
 }
 
 /// Messages drawn per frame. A phone can collect thousands of takes; drawing
 /// all of them would make the window crawl. The newest ones are shown first.
-const PHONE_MESSAGE_CAP: usize = 200;
 
 pub struct MainWindow {
     shared: Arc<Shared>,
     dirs: AppDirs,
+    store: Arc<Store>,
     tab: Tab,
     external_tab: ExternalTab,
     show_about: bool,
     expanded_history: Option<usize>,
     history_filter: HistoryFilter,
+    history_search: String,
+    history_paged: Paged<crate::history::HistoryRow>,
+    history_key: Option<(u64, HistoryFilter, String)>,
+    history_query: Option<(HistoryFilter, String)>,
     download_done_seen: bool,
     /// egui timestamp of the last "Copy" click on the API address; drives the
     /// transient "Copied!" feedback in the API tab.
@@ -532,9 +490,10 @@ pub struct MainWindow {
     /// The QR code of the current pairing link, cached by its text.
     site_qr: Option<(String, egui::TextureHandle)>,
     phone: PhoneState,
-    telegram_chat: Vec<crate::telegram::ChatEntry>,
-    telegram_chat_at: Option<Instant>,
+    telegram_chat: Paged<crate::telegram::ChatEntry>,
+    telegram_key: Option<(u64, String)>,
     telegram_form: TelegramForm,
+    telegram_search: String,
     snapshot_dir: Option<PathBuf>,
     snapshot_frame: u32,
 }
@@ -543,13 +502,7 @@ impl eframe::App for MainWindow {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Keep the UI fresh (e.g. download progress) between events.
         ctx.request_repaint_after(Duration::from_millis(250));
-        if self.tab == Tab::External
-            && self.external_tab == ExternalTab::Telegram
-            && self.telegram_chat_at.map(|at| at.elapsed() > Duration::from_millis(500)).unwrap_or(true)
-        {
-            self.telegram_chat = crate::telegram::chat(&self.dirs);
-            self.telegram_chat_at = Some(Instant::now());
-        }
+        self.refresh_pages();
         if self.tab == Tab::External
             && self.external_tab == ExternalTab::Telegram
             && self
@@ -591,6 +544,8 @@ impl eframe::App for MainWindow {
                     &mut data,
                     &mut self.expanded_history,
                     &mut self.history_filter,
+                    &mut self.history_search,
+                    &mut self.history_paged,
                 ),
                 Tab::Settings => {
                     // The settings page is taller than the window on small
@@ -604,13 +559,15 @@ impl eframe::App for MainWindow {
                     ui,
                     &mut data,
                     &self.dirs,
+                    &self.store,
                     ctx,
                     &mut self.api_copied_at,
                     &mut self.external_tab,
                     &mut self.site_qr,
                     &mut self.phone,
-                    &self.telegram_chat,
+                    &mut self.telegram_chat,
                     &mut self.telegram_form,
+                    &mut self.telegram_search,
                 ),
             }
         });
@@ -623,10 +580,11 @@ impl eframe::App for MainWindow {
         if !download_done {
             self.download_done_seen = false;
         }
+        let holiday_icons = data.config.holiday_icons;
         drop(data);
 
         if self.show_about {
-            show_about_modal(ctx, &mut self.show_about, &self.dirs);
+            show_about_modal(ctx, &mut self.show_about, &self.dirs, holiday_icons);
         }
 
         self.drive_snapshot();
@@ -634,6 +592,63 @@ impl eframe::App for MainWindow {
 }
 
 impl MainWindow {
+    /// Decide which pages the visible lists need. Runs every frame and is
+    /// cheap: two revision reads and a count only when a query or the table
+    /// actually changed.
+    fn refresh_pages(&mut self) {
+        let history_key = (
+            self.store.revision("rev.history"),
+            self.history_filter,
+            self.history_search.trim().to_string(),
+        );
+        let history_query = (history_key.1, history_key.2.clone());
+        if self.history_query.as_ref() != Some(&history_query) {
+            self.expanded_history = None;
+            self.history_query = Some(history_query);
+        }
+        if self.history_key.as_ref() != Some(&history_key) {
+            let sources = self.history_filter.sources();
+            let total = self.shared.lock().history.count(&sources, &history_key.2);
+            self.history_paged.reset(total);
+            self.history_key = Some(history_key);
+        }
+
+        let telegram_key = (
+            self.store.revision("rev.telegram"),
+            self.telegram_search.trim().to_string(),
+        );
+        if self.telegram_key.as_ref() != Some(&telegram_key) {
+            let total = if telegram_key.1.is_empty() {
+                crate::telegram::chat_count(&self.dirs)
+            } else {
+                crate::telegram::chat_search_count(&self.dirs, &telegram_key.1)
+            };
+            self.telegram_chat.reset(total);
+            self.telegram_key = Some(telegram_key);
+        }
+
+        let monolog_key = (
+            self.store.revision("rev.site"),
+            self.phone.view == PhoneView::Archive,
+            self.phone.search.trim().to_string(),
+        );
+        let monolog_query = (monolog_key.1, monolog_key.2.clone());
+        if self.phone.monolog_query.as_ref() != Some(&monolog_query) {
+            self.phone.monolog_query = Some(monolog_query);
+            self.phone.open = None;
+            self.phone.selected.clear();
+        }
+        if self.phone.monolog_key.as_ref() != Some(&monolog_key) {
+            let total = crate::site::db::monolog_count(
+                &self.store,
+                monolog_key.1,
+                &monolog_key.2,
+            );
+            self.phone.monologs.reset(total);
+            self.phone.monolog_key = Some(monolog_key);
+        }
+    }
+
     /// Snapshot test mode (VB_SNAPSHOT=<dir>): walk through the main UI
     /// states and capture the window into PNG files, then exit.
     fn drive_snapshot(&mut self) {
@@ -1218,13 +1233,26 @@ fn settings_body(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs) {
         .changed()
     {
         apply_settings(data, dirs);
-    }
-    ui.label(
+    }    ui.label(
         RichText::new(if data.config.swap_mouse_buttons {
             tr("Left click records and pastes at the cursor; middle click records a new message.")
         } else {
             tr("Left click records a new message; middle click records and pastes at the cursor.")
         })
+        .weak(),
+    );
+    ui.separator();
+    ui.heading(tr("Appearance"));
+    if ui
+        .checkbox(&mut data.config.holiday_icons, tr("Holiday icons"))
+        .changed()
+    {
+        apply_settings(data, dirs);
+    }
+    ui.label(
+        RichText::new(tr(
+            "Show the holiday microphone in the tray and on the site: a tree around New Year, the clock on the night itself, and the symbol of each holiday on its day. Recording and file processing keep their own colour.",
+        ))
         .weak(),
     );
     ui.separator();
@@ -1315,6 +1343,32 @@ struct TelegramForm {
     snapshot_at: Option<Instant>,
 }
 
+/// The job stage is stored as an English word; it is translated when drawn, so
+/// the database keeps one stable value whatever the interface language is.
+fn telegram_stage_label(stage: &str) -> String {
+    match stage {
+        "" | "queued" => tr("queued"),
+        "downloading" => tr("downloading"),
+        "transcribing" => tr("transcribing"),
+        "engine busy" => tr("engine busy"),
+        "done" => tr("done"),
+        // A value this build does not know stays as it is instead of vanishing.
+        other => other.to_string(),
+    }
+}
+
+/// The media kind of a Telegram message, translated at display time only.
+fn telegram_kind_label(kind: &str) -> String {
+    match kind {
+        "voice" => tr("Voice note"),
+        "video_note" => tr("Video note"),
+        "audio" => tr("Audio"),
+        "video" => tr("Video"),
+        "document" => tr("File"),
+        other => other.to_string(),
+    }
+}
+
 fn telegram_settings(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs, form: &mut TelegramForm) {
     ui.heading(tr("Telegram bot"));
     let mut commit = ui
@@ -1358,9 +1412,10 @@ fn telegram_settings(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs, form: &
         ui.label(trf("Owner: {owner}", &[("owner", &owner)]));
         ui.label(trf("In queue: {count}", &[("count", &snapshot.queued.to_string())]));
         if let Some(current) = &snapshot.current {
+            let stage = telegram_stage_label(&current.stage);
             ui.label(trf(
                 "Now: {file} · {stage}",
-                &[("file", &current.file_name), ("stage", &current.stage)],
+                &[("file", &current.file_name), ("stage", &stage)],
             ));
         }
         if let Some(error) = &snapshot.last_error {
@@ -1372,7 +1427,32 @@ fn telegram_settings(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs, form: &
     }
 }
 
-fn telegram_body(ui: &mut egui::Ui, chat: &[crate::telegram::ChatEntry]) {
+fn telegram_date_label(value: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .map(|time| {
+            time.with_timezone(&chrono::Local)
+                .format("[%d.%m.%y %H:%M]")
+                .to_string()
+        })
+        .unwrap_or_else(|_| value.get(11..16).unwrap_or("").to_string())
+}
+
+fn telegram_day_label(value: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .map(|time| {
+            time.with_timezone(&chrono::Local)
+                .format("%d.%m.%Y")
+                .to_string()
+        })
+        .unwrap_or_else(|_| value.get(..10).unwrap_or(value).to_string())
+}
+
+fn telegram_body(
+    ui: &mut egui::Ui,
+    dirs: &AppDirs,
+    chat: &mut Paged<crate::telegram::ChatEntry>,
+    search: &mut String,
+) {
     ui.heading(tr("Telegram"));
     ui.label(
         RichText::new(tr(
@@ -1381,73 +1461,134 @@ fn telegram_body(ui: &mut egui::Ui, chat: &[crate::telegram::ChatEntry]) {
         .weak()
         .small(),
     );
-    if chat.is_empty() {
-        ui.label(RichText::new(tr("Nothing from Telegram yet.")).weak());
+    if chat.total() == 0 {
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(search)
+                    .hint_text(tr("Search"))
+                    .desired_width(220.0),
+            );
+        });
+        ui.label(
+            RichText::new(if search.trim().is_empty() {
+                tr("Nothing from Telegram yet.")
+            } else {
+                tr("No matching messages.")
+            })
+            .weak(),
+        );
         return;
     }
+    ui.horizontal(|ui| {
+        ui.add(
+            egui::TextEdit::singleline(search)
+                .hint_text(tr("Search"))
+                .desired_width(220.0),
+        );
+        ui.label(
+            RichText::new(trf("Messages: {count}", &[("count", &chat.total().to_string())]))
+                .small()
+                .weak(),
+        );
+    });
     ui.separator();
+    // Uniform rows let egui draw only what is visible; the pages around the
+    // viewport come from SQLite on demand.
+    const ROW_HEIGHT: f32 = 220.0;
+    let needle = search.trim().to_string();
+    let total = chat.total();
     ScrollArea::vertical()
         .id_source("telegram_scroll")
         .auto_shrink([false, false])
         .stick_to_bottom(true)
-        .show(ui, |ui| {
-            let mut day = String::new();
-            for entry in chat {
-                let entry_day = entry.at.get(..10).unwrap_or("").to_string();
-                if entry_day != day {
-                    day = entry_day;
-                    ui.add_space(6.0);
-                    ui.label(RichText::new(&day).small().weak());
+        .show_rows(ui, ROW_HEIGHT, total, |ui, range| {
+            chat.ensure(range.clone(), |offset, limit| {
+                if needle.is_empty() {
+                    crate::telegram::chat_page(dirs, limit, offset)
+                } else {
+                    crate::telegram::chat_search_page(dirs, &needle, limit, offset)
                 }
-                egui::Frame::group(ui.style()).show(ui, |ui| {
-                    let clock = entry.at.get(11..16).unwrap_or("");
-                    let seconds = if entry.seconds > 0.0 {
-                        format!(" · {:.0} {}", entry.seconds, tr("s"))
-                    } else {
-                        String::new()
-                    };
-                    ui.label(RichText::new(format!(
-                        "{} · {}{}{}",
-                        clock,
-                        entry.kind,
-                        if entry.file_name.is_empty() { "" } else { " · " },
-                        entry.file_name
-                    )).small().weak());
-                    let body = if entry.text.is_empty() { "—" } else { entry.text.as_str() };
-                    if body.chars().count() > 1200 {
-                        // A long transcript keeps its own scrollbar inside a
-                        // fixed-height box instead of pushing the chat away.
-                        let width = ui.available_width();
-                        ui.allocate_ui(egui::vec2(width, 150.0), |ui| {
-                            ScrollArea::vertical()
-                                .id_source(("telegram_text", entry.message_id))
-                                .max_height(150.0)
-                                .auto_shrink([false, true])
-                                .show(ui, |ui| {
-                                    ui.add(
-                                        egui::Label::new(body)
-                                            .wrap(true)
-                                            .sense(egui::Sense::hover()),
-                                    );
-                                });
-                        });
-                    } else {
-                        ui.label(body);
-                    }
-                    if let Some(error) = &entry.error {
-                        ui.label(RichText::new(error).color(egui::Color32::from_rgb(230, 90, 90)).small());
-                    }
-                    ui.horizontal(|ui| {
-                        if !entry.text.is_empty() && ui.small_button(tr("Copy")).clicked() {
-                            copy_to_clipboard(&entry.text);
+            });
+            for index in range {
+                let Some(entry) = chat.get(index) else {
+                    continue;
+                };
+                let entry_day = telegram_day_label(&entry.at);
+                let previous_day = index
+                    .checked_sub(1)
+                    .and_then(|previous| chat.get(previous))
+                    .map(|previous| telegram_day_label(&previous.at));
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), ROW_HEIGHT - 6.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        if previous_day.as_deref() != Some(entry_day.as_str()) {
+                            ui.label(RichText::new(&entry_day).small().weak());
                         }
-                        ui.label(RichText::new(seconds).small().weak());
-                    });
-                });
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            let clock = telegram_date_label(&entry.at);
+                            let sender = if entry.sender.trim().is_empty() {
+                                tr("User")
+                            } else {
+                                entry.sender.clone()
+                            };
+                            let seconds = if entry.seconds > 0.0 {
+                                format!(" · {:.0} {}", entry.seconds, tr("s"))
+                            } else {
+                                String::new()
+                            };
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} · {} · {}{}{}",
+                                    clock,
+                                    sender,
+                                    telegram_kind_label(&entry.kind),
+                                    if entry.file_name.is_empty() { "" } else { " · " },
+                                    entry.file_name
+                                ))
+                                .size(12.5)
+                                .color(ui.visuals().text_color()),
+                            );
+                            let body = if entry.text.is_empty() { "—" } else { entry.text.as_str() };
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(ui.available_width(), 120.0),
+                                egui::Layout::top_down(egui::Align::Min),
+                                |ui| {
+                                    ScrollArea::vertical()
+                                        .id_source(("telegram_text", entry.message_id))
+                                        .max_height(120.0)
+                                        .auto_shrink([false, true])
+                                        .show(ui, |ui| {
+                                            ui.add(
+                                                egui::Label::new(body)
+                                                    .wrap(true)
+                                                    .sense(egui::Sense::hover()),
+                                            );
+                                        });
+                                },
+                            );
+                            if let Some(error) = &entry.error {
+                                ui.label(
+                                    RichText::new(error)
+                                        .color(egui::Color32::from_rgb(230, 90, 90))
+                                        .small(),
+                                );
+                            }
+                            ui.horizontal(|ui| {
+                                if !entry.text.is_empty()
+                                    && ui.small_button(tr("Copy")).clicked()
+                                {
+                                    copy_to_clipboard(&entry.text);
+                                }
+                                ui.label(RichText::new(seconds).small().weak());
+                            });
+                        });
+                    },
+                );
             }
         });
 }
-
 /// "External access": the local server for scripts and pages, and the phone
 /// that dictates into monologs.
 #[allow(clippy::too_many_arguments)]
@@ -1455,13 +1596,15 @@ fn external_body(
     ui: &mut egui::Ui,
     data: &mut Data,
     dirs: &AppDirs,
+    store: &Store,
     ctx: &egui::Context,
     copied_at: &mut f64,
     page: &mut ExternalTab,
     qr: &mut Option<(String, egui::TextureHandle)>,
     phone: &mut PhoneState,
-    telegram_chat: &[crate::telegram::ChatEntry],
+    telegram_chat: &mut Paged<crate::telegram::ChatEntry>,
     telegram: &mut TelegramForm,
+    telegram_search: &mut String,
 ) {
     ui.horizontal(|ui| {
         ui.selectable_value(page, ExternalTab::LocalServer, tr("Local server"));
@@ -1471,13 +1614,13 @@ fn external_body(
     ui.separator();
     match *page {
         ExternalTab::LocalServer => api_body(ui, data, dirs, ctx, copied_at),
-        ExternalTab::Phone => phone_body(ui, data, dirs, ctx, copied_at, qr, phone),
+        ExternalTab::Phone => phone_body(ui, data, dirs, store, ctx, copied_at, qr, phone),
         ExternalTab::Telegram => {
             source_model_picker(ui, data, dirs, SourceModel::Telegram);
             ui.separator();
             telegram_settings(ui, data, dirs, telegram);
             ui.separator();
-            telegram_body(ui, telegram_chat);
+            telegram_body(ui, dirs, telegram_chat, telegram_search);
         }
     }
 }
@@ -1567,6 +1710,7 @@ fn phone_body(
     ui: &mut egui::Ui,
     data: &mut Data,
     dirs: &AppDirs,
+    store: &Store,
     ctx: &egui::Context,
     copied_at: &mut f64,
     qr: &mut Option<(String, egui::TextureHandle)>,
@@ -1576,7 +1720,7 @@ fn phone_body(
         .id_source("phone_scroll")
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            phone_settings(ui, data, dirs, ctx, copied_at, qr, phone);
+            phone_settings(ui, data, dirs, store, ctx, copied_at, qr, phone);
         });
 }
 
@@ -1584,6 +1728,7 @@ fn phone_settings(
     ui: &mut egui::Ui,
     data: &mut Data,
     dirs: &AppDirs,
+    store: &Store,
     ctx: &egui::Context,
     copied_at: &mut f64,
     qr: &mut Option<(String, egui::TextureHandle)>,
@@ -1805,7 +1950,7 @@ fn phone_settings(
     // belong to the person, not to the connection.
     ui.separator();
     let list_top = ui.cursor().min;
-    phone_monologs(ui, &data.site_monologs, phone, dirs);
+    phone_monologs(ui, store, phone, dirs);
     if phone.focus_list {
         // Snapshot mode only: put the list in view for the screenshot.
         ui.scroll_to_rect(
@@ -1816,43 +1961,24 @@ fn phone_settings(
 }
 
 /// The monologs the phone dictated, with the open one's messages below.
-fn phone_preview(monolog: &state::SiteMonolog) -> String {
-    monolog
-        .messages
-        .iter()
-        .rev()
-        .find(|message| !message.text.trim().is_empty())
-        .map(|message| message.text.chars().take(110).collect())
-        .unwrap_or_default()
+/// The preview line of a monolog: the newest message, nothing more.
+fn phone_preview(monolog: &MonologRow) -> String {
+    monolog.preview.chars().take(110).collect()
 }
 
-fn phone_when(monolog: &state::SiteMonolog) -> String {
-    monolog
-        .messages
-        .iter()
-        .rev()
-        .next()
-        .map(|message| {
-            message
-                .recorded
-                .replace('T', " ")
-                .chars()
-                .take(16)
-                .collect()
-        })
-        .unwrap_or_else(|| {
-            monolog
-                .created
-                .replace('T', " ")
-                .chars()
-                .take(16)
-                .collect()
-        })
+/// The newest message's clock, or the monolog's creation time.
+fn phone_when(monolog: &MonologRow) -> String {
+    let at = if monolog.last_at.is_empty() {
+        &monolog.created
+    } else {
+        &monolog.last_at
+    };
+    at.replace('T', " ").chars().take(16).collect()
 }
 
 fn phone_monologs(
     ui: &mut egui::Ui,
-    monologs: &Option<state::SiteMonologs>,
+    store: &Store,
     phone: &mut PhoneState,
     dirs: &AppDirs,
 ) {
@@ -1864,39 +1990,22 @@ fn phone_monologs(
                 .desired_width(180.0),
         );
     });
-    let Some(site) = monologs else {
-        ui.label(RichText::new(tr("No monologs yet.")).weak());
-        return;
-    };
-    if site.monologs.is_empty() {
-        ui.label(RichText::new(tr("No monologs yet.")).weak());
-        return;
-    }
-    if let Some(open) = phone.open {
-        if !site.monologs.iter().any(|monolog| monolog.id == open) {
+    let showing_archive = phone.view == PhoneView::Archive;
+    let query = phone.search.trim().to_string();
+    let total = phone.monologs.total();
+    // Active and archived are two different jobs: read and archive the first,
+    // only unarchive the second.
+    ui.horizontal(|ui| {
+        let mut view = phone.view;
+        ui.selectable_value(&mut view, PhoneView::Active, tr("Active"));
+        ui.selectable_value(&mut view, PhoneView::Archive, tr("Archive section"));
+        if view != phone.view {
+            phone.view = view;
             phone.open = None;
             phone.selected.clear();
         }
-    }
-    // Active and archived are two different jobs: read and archive the first,
-    // only unarchive the second. One mixed list made neither clear.
-    ui.horizontal(|ui| {
-        ui.selectable_value(&mut phone.view, PhoneView::Active, tr("Active"));
-        ui.selectable_value(&mut phone.view, PhoneView::Archive, tr("Archive section"));
     });
-    let showing_archive = phone.view == PhoneView::Archive;
-    let query = phone.search.trim().to_lowercase();
-    let mut list: Vec<&state::SiteMonolog> = site
-        .monologs
-        .iter()
-        .filter(|monolog| monolog.archived == showing_archive)
-        .filter(|monolog| {
-            query.is_empty()
-                || monolog.name.to_lowercase().contains(&query)
-                || phone_preview(monolog).to_lowercase().contains(&query)
-        })
-        .collect();
-    if list.is_empty() {
+    if total == 0 {
         ui.label(
             RichText::new(if showing_archive {
                 tr("The archive is empty.")
@@ -1907,20 +2016,15 @@ fn phone_monologs(
         );
         return;
     }
-    // Newest monolog first, like the history. The id breaks ties for records
-    // written in the same second.
-    list.sort_by(|left, right| {
-        right
-            .created
-            .cmp(&left.created)
-            .then_with(|| right.id.cmp(&left.id))
-    });
-    if phone
-        .open
-        .map(|open| !list.iter().any(|monolog| monolog.id == open))
-        .unwrap_or(true)
-    {
-        phone.open = Some(list[0].id);
+    // Open the newest monolog when nothing is open yet. The row itself is on
+    // the first page, so this costs one query.
+    if phone.open.is_none() {
+        phone
+            .monologs
+            .ensure(0..1, |offset, limit| {
+                crate::site::db::monolog_page(store, showing_archive, &query, offset, limit)
+            });
+        phone.open = phone.monologs.get(0).map(|monolog| monolog.id);
         phone.selected.clear();
     }
     let mut archive: Option<(u64, bool)> = None;
@@ -1930,11 +2034,26 @@ fn phone_monologs(
             egui::vec2(350.0, list_height),
             egui::Layout::top_down(egui::Align::Min),
             |ui| {
+                // Uniform rows: only the visible monologs are drawn and only
+                // the pages near the viewport are loaded.
+                const MONOLOG_ROW_HEIGHT: f32 = 72.0;
                 ScrollArea::vertical()
                     .id_source("phone_monolog_list")
                     .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        for monolog in &list {
+                    .show_rows(ui, MONOLOG_ROW_HEIGHT, total, |ui, range| {
+                        phone.monologs.ensure(range.clone(), |offset, limit| {
+                            crate::site::db::monolog_page(
+                                store,
+                                showing_archive,
+                                &query,
+                                offset,
+                                limit,
+                            )
+                        });
+                        for index in range {
+                            let Some(monolog) = phone.monologs.get(index) else {
+                                continue;
+                            };
                             let selected = phone.open == Some(monolog.id);
                             let preview = phone_preview(monolog);
                             let when = phone_when(monolog);
@@ -1942,20 +2061,22 @@ fn phone_monologs(
                                 "{}\n{} · {}\n{}",
                                 monolog.name,
                                 when,
-                                trf("Messages: {count}", &[("count", &monolog.count().to_string())]),
+                                trf("Messages: {count}", &[("count", &monolog.count.to_string())]),
                                 preview
                             );
                             if ui
-                                .add(egui::SelectableLabel::new(
-                                    selected,
-                                    RichText::new(text).size(14.0),
-                                ))
+                                .add_sized(
+                                    egui::vec2(ui.available_width(), 66.0),
+                                    egui::SelectableLabel::new(
+                                        selected,
+                                        RichText::new(text).size(14.0),
+                                    ),
+                                )
                                 .clicked()
                             {
                                 phone.open = Some(monolog.id);
                                 phone.selected.clear();
                             }
-                            ui.add_space(2.0);
                         }
                     });
             },
@@ -1966,17 +2087,16 @@ fn phone_monologs(
             egui::Layout::top_down(egui::Align::Min),
             |ui| {
                 ui.set_max_width(ui.available_width());
-                let Some(selected) = list
-                    .iter()
-                    .copied()
-                    .find(|monolog| Some(monolog.id) == phone.open)
+                let Some(selected) = phone
+                    .open
+                    .and_then(|id| crate::site::db::monolog_row(store, id))
                 else {
                     ui.label(RichText::new(tr("No monologs yet.")).weak());
                     return;
                 };
                 ui.horizontal(|ui| {
                     ui.label(
-                        RichText::new(format!("{} ({})", selected.name, selected.count())).strong(),
+                        RichText::new(format!("{} ({})", selected.name, selected.count)).strong(),
                     );
                     if ui
                         .small_button(if showing_archive {
@@ -1990,12 +2110,16 @@ fn phone_monologs(
                     }
                 });
                 ui.label(
-                    RichText::new(format!("{} · {}", phone_when(selected), phone_preview(selected)))
-                        .small()
-                        .weak(),
+                    RichText::new(format!(
+                        "{} · {}",
+                        phone_when(&selected),
+                        phone_preview(&selected)
+                    ))
+                    .small()
+                    .weak(),
                 );
                 ui.separator();
-                phone_messages(ui, selected, phone);
+                phone_messages(ui, store, &selected, phone);
             },
         );
     });
@@ -2003,27 +2127,35 @@ fn phone_monologs(
         crate::ipc::request_site_archive(&dirs.root, monolog, archived);
     }
 }
+
 /// Messages of one open monolog: selection, copy, and the takes themselves.
-fn phone_messages(ui: &mut egui::Ui, monolog: &state::SiteMonolog, phone: &mut PhoneState) {
-    let total = monolog.messages.len();
+/// The list is one endless scroll; only the pages around the viewport are read.
+fn phone_messages(
+    ui: &mut egui::Ui,
+    store: &Store,
+    monolog: &MonologRow,
+    phone: &mut PhoneState,
+) {
+    let total = crate::site::db::message_count(store, monolog.id);
     if total == 0 {
         ui.label(RichText::new(tr("No messages from the phone yet.")).weak());
         return;
     }
+    let key = (store.revision("rev.site"), monolog.id);
+    if phone.message_key.as_ref() != Some(&key) {
+        phone.messages.reset(total);
+        phone.message_key = Some(key);
+    }
     ui.horizontal_wrapped(|ui| {
         if ui.small_button(tr("Select all")).clicked() {
-            for message in &monolog.messages {
-                phone.selected.insert(message.id);
+            for id in crate::site::db::message_ids(store, monolog.id) {
+                phone.selected.insert(id);
             }
         }
         if ui.small_button(tr("Clear selection")).clicked() {
             phone.selected.clear();
         }
-        let count = monolog
-            .messages
-            .iter()
-            .filter(|message| phone.selected.contains(&message.id))
-            .count();
+        let count = phone.selected.len();
         let copy = ui.add_enabled(
             count > 0,
             egui::Button::new(trf(
@@ -2032,7 +2164,13 @@ fn phone_messages(ui: &mut egui::Ui, monolog: &state::SiteMonolog, phone: &mut P
             )),
         );
         if copy.clicked() {
-            let text = selected_text(&monolog.messages, &phone.selected);
+            let ids: Vec<u64> = phone.selected.iter().copied().collect();
+            let text = crate::site::db::message_texts(store, &ids)
+                .into_iter()
+                .map(|text| text.trim().to_string())
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n\n");
             if !text.is_empty() {
                 copy_to_clipboard(&text);
             }
@@ -2040,75 +2178,84 @@ fn phone_messages(ui: &mut egui::Ui, monolog: &state::SiteMonolog, phone: &mut P
     });
     ui.add_space(2.0);
     // Like the phone's own chat: oldest at the top, newest at the bottom, one
-    // header per day. Only the newest `PHONE_MESSAGE_CAP` are drawn, so the
-    // window stays fast even when the phone has collected thousands of takes.
-    let first = total.saturating_sub(PHONE_MESSAGE_CAP);
-    let mut last_day = String::new();
-    for message in &monolog.messages[first..] {
-        let day = message.recorded.get(0..10).unwrap_or_default().to_string();
-        if day != last_day {
-            ui.separator();
-            ui.label(
-                RichText::new(day_header(&message.recorded))
-                    .small()
-                    .strong()
-                    .color(ui.visuals().weak_text_color()),
-            );
-            last_day = day;
-        }
-        ui.push_id(message.id, |ui| {
-            ui.horizontal(|ui| {
-                let mut checked = phone.selected.contains(&message.id);
-                if ui.checkbox(&mut checked, "").changed() {
-                    if checked {
-                        phone.selected.insert(message.id);
-                    } else {
-                        phone.selected.remove(&message.id);
-                    }
-                }
-                ui.label(RichText::new(message_time(&message.recorded)).small().weak());
-                ui.label(RichText::new(stage_label(message.stage)).small().weak());
+    // header per day. Uniform rows keep the scrollbar exact.
+    const MESSAGE_ROW_HEIGHT: f32 = 112.0;
+    ScrollArea::vertical()
+        .id_source(("phone_messages_scroll", monolog.id))
+        .auto_shrink([false, false])
+        .show_rows(ui, MESSAGE_ROW_HEIGHT, total, |ui, range| {
+            phone.messages.ensure(range.clone(), |offset, limit| {
+                crate::site::db::message_page(store, monolog.id, offset, limit)
             });
-            if message.text.trim().is_empty() {
-                ui.label(RichText::new("…").weak());
-            } else {
-                ui.add(egui::Label::new(RichText::new(&message.text)).wrap(true));
+            for index in range {
+                let Some(message) = phone.messages.get(index) else {
+                    continue;
+                };
+                let day = message.recorded.get(0..10).unwrap_or_default().to_string();
+                let previous_day = index
+                    .checked_sub(1)
+                    .and_then(|previous| phone.messages.get(previous))
+                    .and_then(|previous| previous.recorded.get(0..10));
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), MESSAGE_ROW_HEIGHT - 4.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        if previous_day != Some(day.as_str()) {
+                            ui.label(
+                                RichText::new(day_header(&message.recorded))
+                                    .small()
+                                    .strong()
+                                    .color(ui.visuals().weak_text_color()),
+                            );
+                        }
+                        ui.push_id(message.id, |ui| {
+                            ui.horizontal(|ui| {
+                                let mut checked = phone.selected.contains(&message.id);
+                                if ui.checkbox(&mut checked, "").changed() {
+                                    if checked {
+                                        phone.selected.insert(message.id);
+                                    } else {
+                                        phone.selected.remove(&message.id);
+                                    }
+                                }
+                                ui.label(
+                                    RichText::new(message_time(&message.recorded))
+                                        .small()
+                                        .weak(),
+                                );
+                                ui.label(
+                                    RichText::new(stage_label(message.stage))
+                                        .small()
+                                        .weak(),
+                                );
+                            });
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(ui.available_width(), 56.0),
+                                egui::Layout::top_down(egui::Align::Min),
+                                |ui| {
+                                    ScrollArea::vertical()
+                                        .id_source(("phone_text", message.id))
+                                        .max_height(56.0)
+                                        .auto_shrink([false, true])
+                                        .show(ui, |ui| {
+                                            if message.text.trim().is_empty() {
+                                                ui.label(RichText::new("…").weak());
+                                            } else {
+                                                ui.add(
+                                                    egui::Label::new(RichText::new(&message.text))
+                                                        .wrap(true),
+                                                );
+                                            }
+                                        });
+                                },
+                            );
+                        });
+                    },
+                );
             }
-            ui.add_space(2.0);
         });
-    }
-    if total > PHONE_MESSAGE_CAP {
-        ui.label(
-            RichText::new(trf(
-                "Showing the newest {shown} of {total} messages.",
-                &[
-                    ("shown", &PHONE_MESSAGE_CAP.to_string()),
-                    ("total", &total.to_string()),
-                ],
-            ))
-            .small()
-            .weak(),
-        );
-    }
 }
 
-/// The text "Copy selected" puts on the clipboard: the selected takes in the
-/// order they were spoken, separated by a blank line. Empty takes are skipped.
-fn selected_text(messages: &[state::SiteMessage], selected: &std::collections::BTreeSet<u64>) -> String {
-    let mut parts: Vec<&str> = Vec::new();
-    for message in messages {
-        if !selected.contains(&message.id) {
-            continue;
-        }
-        let text = message.text.trim();
-        if !text.is_empty() {
-            parts.push(text);
-        }
-    }
-    parts.join("\n\n")
-}
-
-/// `2026-11-12T09:31:00+05:00` -> `2026-11-12 09:31`; an unknown shape is
 /// shown unchanged instead of being hidden.
 fn message_time(recorded: &str) -> String {
     match recorded.get(0..16) {
@@ -2319,7 +2466,7 @@ fn start_hotkey_capture(data: &mut Data, dirs: &AppDirs, field: HotkeyField) {
     crate::ipc::set_hotkey_capture(&dirs.root, field == HotkeyField::Record);
     crate::ipc::set_append_hotkey_capture(&dirs.root, field == HotkeyField::Append);
     crate::ipc::set_paste_hotkey_capture(&dirs.root, field == HotkeyField::Paste);
-    let _ = std::fs::remove_file(crate::ipc::hotkey_result_path(&dirs.root));
+    let _ = crate::ipc::clear_hotkey_result(&dirs.root);
     crate::log::log("hotkey capture started");
 }
 
@@ -2789,7 +2936,7 @@ fn capture_body(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs) {
                 .button(RichText::new(tr("Stop recording")).color(egui::Color32::from_rgb(200, 60, 60)))
                 .clicked()
             {
-                crate::ipc::write_record_request(&dirs.root, r#"{"kind":"user"}"#);
+                crate::ipc::write_record_request(&dirs.root, "user");
             }
             // The same controls and cues serve both interactors; only the
             // attribution and the audio source differ.
@@ -2897,7 +3044,7 @@ fn capture_body(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs) {
                 .add_enabled(can_record, egui::Button::new(tr("Start recording")))
                 .clicked()
             {
-                crate::ipc::write_record_request(&dirs.root, r#"{"kind":"user"}"#);
+                crate::ipc::write_record_request(&dirs.root, "user");
             }
         }
     }
@@ -2912,11 +3059,6 @@ fn capture_body(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs) {
         file_body(ui, data, dirs);
     }
 }
-
-/// Take the visible rows of `indices` (newest first) and their heights. Only
-/// matching entries are laid out, so filtering keeps the virtualized list exact.
-/// Height of a "day" separator in the history list.
-const DAY_HEADER_HEIGHT: f32 = 30.0;
 
 /// "Today", "Yesterday" or "Tuesday · 04.11" for a history timestamp.
 fn day_header(at: &str) -> String {
@@ -2948,71 +3090,47 @@ fn weekday_name(day: chrono::Weekday) -> &'static str {
     }
 }
 
-fn history_row_offsets(
-    ui: &mut egui::Ui,
+/// Height of one collapsed history row. A day header lives inside this slot,
+/// so every row has the same height and the scrollbar can map a position to a
+/// row without measuring the whole table.
+const HISTORY_ROW_HEIGHT: f32 = 34.0;
+
+fn history_entry_for(
     history: &state::History,
-    indices: &[usize],
-    expanded: Option<usize>,
-    starts_day: &[bool],
-) -> Vec<f32> {
-    let spacing = ui.spacing().item_spacing.y;
-    let base_height = ui.spacing().interact_size.y + 2.0 * spacing + 2.0;
-    let wrap_width = ui.available_width().max(32.0);
-    let font = egui::TextStyle::Body.resolve(ui.style());
-    let color = ui.visuals().text_color();
-    let mut offsets = Vec::with_capacity(indices.len() + 1);
-    offsets.push(0.0);
-    for (position, &index) in indices.iter().enumerate() {
-        let mut height = base_height;
-        if starts_day.get(position).copied().unwrap_or(false) {
-            height += DAY_HEADER_HEIGHT;
-        }
-        if expanded == Some(index) {
-            if let Ok(entry) = history.entry(index) {
-                let text_height = ui.fonts(|f| {
-                    f.layout(entry.text, font.clone(), color, wrap_width)
-                        .size()
-                        .y
-                });
-                height += text_height + spacing + 4.0;
-                // Every appended piece adds its own row (copy button + time)
-                // and its wrapped text below the full message.
-                for part in &entry.parts {
-                    let part_height = ui.fonts(|f| {
-                        f.layout(part.text.clone(), font.clone(), color, wrap_width)
-                            .size()
-                            .y
-                    });
-                    height += ui.spacing().interact_size.y + part_height + 2.0 * spacing;
-                }
-                if !entry.parts.is_empty() {
-                    height += spacing;
-                }
-            }
-        }
-        offsets.push(offsets[position] + height);
+    row: &crate::history::HistoryRow,
+    index: usize,
+) -> Option<state::HistoryEntry> {
+    if row.id() == 0 {
+        history.entry(index).ok()
+    } else {
+        history.entry_by_id(row.id()).ok()
     }
-    offsets
 }
 
-fn visible_history_range(
-    offsets: &[f32],
-    viewport_min: f32,
-    viewport_max: f32,
-) -> std::ops::Range<usize> {
-    let rows = offsets.len().saturating_sub(1);
-    if rows == 0 {
-        return 0..0;
+fn history_expanded_extra(ui: &egui::Ui, entry: &state::HistoryEntry, wrap_width: f32) -> f32 {
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let color = ui.visuals().text_color();
+    let spacing = ui.spacing().item_spacing.y;
+    let mut height = ui.fonts(|fonts| {
+        fonts
+            .layout(entry.text.clone(), font.clone(), color, wrap_width)
+            .size()
+            .y
+    }) + spacing
+        + 8.0;
+    for part in &entry.parts {
+        let part_height = ui.fonts(|fonts| {
+            fonts
+                .layout(part.text.clone(), font.clone(), color, wrap_width)
+                .size()
+                .y
+        });
+        height += ui.spacing().interact_size.y + part_height + 2.0 * spacing;
     }
-    let first_visible = offsets
-        .partition_point(|&end| end < viewport_min)
-        .min(rows - 1);
-    let first = first_visible.saturating_sub(1);
-    let mut last = first + 1;
-    while last < rows && offsets[last] <= viewport_max {
-        last += 1;
+    if !entry.parts.is_empty() {
+        height += spacing;
     }
-    first..(last + 1).min(rows)
+    height
 }
 
 fn history_body(
@@ -3020,6 +3138,8 @@ fn history_body(
     data: &mut Data,
     expanded: &mut Option<usize>,
     filter: &mut HistoryFilter,
+    search: &mut String,
+    paged: &mut Paged<crate::history::HistoryRow>,
 ) {
     ui.horizontal(|ui| {
         ui.heading(tr("History"));
@@ -3032,199 +3152,223 @@ fn history_body(
         ui.selectable_value(&mut next, HistoryFilter::File, tr("File"));
         ui.selectable_value(&mut next, HistoryFilter::Phone, tr("Phone"));
         ui.selectable_value(&mut next, HistoryFilter::Telegram, tr("Telegram"));
-        *filter = next;
+        if next != *filter {
+            *filter = next;
+            *expanded = None;
+        }
+        ui.add(
+            egui::TextEdit::singleline(search)
+                .hint_text(tr("Search"))
+                .desired_width(200.0),
+        );
     });
     ui.separator();
-    let mut indices: Vec<usize> = (0..data.history.len())
-        .filter(|&index| {
-            data.history
-                .row(index)
-                .map(|row| filter.matches(row.source()))
-                .unwrap_or(false)
-        })
-        .collect();
-    // History is a log, not a chat: the newest message is always the first
-    // row. The order is by the time of the recording itself: the file is in the
-    // order things were saved, but a phone message may arrive hours later and
-    // must still sit in its own place.
-    indices.sort_by(|left, right| {
-        let left = data.history.row(*left).map(|row| row.at().to_string());
-        let right = data.history.row(*right).map(|row| row.at().to_string());
-        right.unwrap_or_default().cmp(&left.unwrap_or_default())
-    });
-    if indices.is_empty() {
-        ui.label(match filter {
-            HistoryFilter::All => "No transcriptions yet.",
-            HistoryFilter::User => "No transcriptions dictated by the user yet.",
-            HistoryFilter::Server => "No transcriptions started by the API server yet.",
-            HistoryFilter::File => "No imported files yet.",
-            HistoryFilter::Phone => "No messages from the phone yet.",
-            HistoryFilter::Telegram => "No Telegram messages yet.",
+    if paged.is_empty() {
+        ui.label(match *filter {
+            HistoryFilter::All => tr("No transcriptions yet."),
+            HistoryFilter::User => tr("No transcriptions dictated by the user yet."),
+            HistoryFilter::Server => tr("No transcriptions started by the API server yet."),
+            HistoryFilter::File => tr("No imported files yet."),
+            HistoryFilter::Phone => tr("No messages from the phone yet."),
+            HistoryFilter::Telegram => tr("No Telegram messages yet."),
         });
         return;
     }
 
+    let sources = filter.sources();
+    let needle = search.trim().to_string();
+    // The open entry is measured once; its extra height shifts the rows below
+    // it. Everything else has the same height, so no row is ever measured just
+    // to draw the scrollbar.
+    if let Some(open) = *expanded {
+        paged.ensure(open..(open + 1).min(paged.total()), |offset, limit| {
+            data.history.page(&sources, &needle, offset, limit)
+        });
+    }
+    let expanded_entry = expanded.and_then(|index| {
+        let row = paged.get(index)?;
+        history_entry_for(&data.history, row, index)
+    });
+    let wrap_width = ui.available_width().max(32.0);
+    let extra = expanded_entry
+        .as_ref()
+        .map(|entry| history_expanded_extra(ui, entry, wrap_width))
+        .unwrap_or(0.0);
+    let total = paged.total();
+    let total_height = total as f32 * HISTORY_ROW_HEIGHT + extra;
+
     let mut copied: Option<String> = None;
     let mut toggle: Option<usize> = None;
-    // One header per day, newest day first, like the log it is.
-    let dates: Vec<String> = indices
-        .iter()
-        .map(|&index| {
-            data.history
-                .row(index)
-                .map(|row| row.at().to_string())
-                .unwrap_or_default()
-        })
-        .collect();
-    let starts_day: Vec<bool> = dates
-        .iter()
-        .enumerate()
-        .map(|(position, date)| {
-            position == 0 || dates[position - 1].get(0..10) != date.get(0..10)
-        })
-        .collect();
-    let offsets = history_row_offsets(ui, &data.history, &indices, *expanded, &starts_day);
-    let total_height = offsets.last().copied().unwrap_or(0.0);
     ScrollArea::vertical()
         .id_source("history_rows")
         .auto_shrink([false, false])
         .show_viewport(ui, |ui, viewport| {
             ui.set_height(total_height);
-            let range = visible_history_range(&offsets, viewport.min.y, viewport.max.y);
-            let y_min = ui.max_rect().top() + offsets[range.start];
-            let y_max = ui.max_rect().top() + offsets[range.end];
-            let rect = egui::Rect::from_x_y_ranges(ui.max_rect().x_range(), y_min..=y_max);
-            ui.allocate_ui_at_rect(rect, |ui| {
-                for position in range {
-                    let index = indices[position];
-                    let Some(row) = data.history.row(index).cloned() else {
-                        continue;
-                    };
-                    let is_open = *expanded == Some(index);
-                    let full_entry = if is_open {
-                        data.history.entry(index).ok()
-                    } else {
-                        None
-                    };
-                    let height = offsets[position + 1] - offsets[position];
-                    let width = ui.available_width();
+            let first = ((viewport.min.y / HISTORY_ROW_HEIGHT).floor() as usize).saturating_sub(2);
+            let last = (viewport.max.y / HISTORY_ROW_HEIGHT).ceil() as usize + 3;
+            let last = last.min(total);
+            if first >= last {
+                return;
+            }
+            paged.ensure(first..last, |offset, limit| {
+                data.history.page(&sources, &needle, offset, limit)
+            });
+            let content_top = ui.max_rect().top();
+            for index in first..last {
+                let Some(row) = paged.get(index) else {
+                    continue;
+                };
+                let is_open = *expanded == Some(index);
+                let shift = if expanded.map(|open| open < index).unwrap_or(false) {
+                    extra
+                } else {
+                    0.0
+                };
+                let height = HISTORY_ROW_HEIGHT + if is_open { extra } else { 0.0 };
+                let top = content_top + index as f32 * HISTORY_ROW_HEIGHT + shift;
+                let rect = egui::Rect::from_min_size(
+                    egui::pos2(ui.max_rect().left(), top),
+                    egui::vec2(ui.max_rect().width(), height),
+                );
+                let starts_day = index == 0
+                    || paged
+                        .get(index - 1)
+                        .map(|previous| previous.at().get(0..10) != row.at().get(0..10))
+                        .unwrap_or(true);
+                let full_entry = if is_open {
+                    history_entry_for(&data.history, row, index)
+                } else {
+                    None
+                };
+                ui.allocate_ui_at_rect(rect, |ui| {
+                    ui.set_width(ui.available_width());
                     ui.push_id(index, |ui| {
-                        ui.allocate_ui(egui::vec2(width, height), |ui| {
-                            if starts_day.get(position).copied().unwrap_or(false) {
-                                ui.separator();
+                        ui.horizontal(|ui| {
+                            if ui.small_button(tr("Copy")).clicked() {
+                                match history_entry_for(&data.history, row, index) {
+                                    Some(entry) => copied = Some(entry.text),
+                                    None => crate::log::log(&format!(
+                                        "failed to read history entry {index}"
+                                    )),
+                                }
+                            }
+                            let pieces = if row.pieces() > 0 {
+                                trf(
+                                    " · +{count} piece(s)",
+                                    &[("count", &row.pieces().to_string())],
+                                )
+                            } else {
+                                String::new()
+                            };
+                            // The day divider used to sit above the line and
+                            // cost a whole block per entry; it reads better on
+                            // the line itself, next to the time.
+                            let at = if starts_day {
+                                format!("{} · {}", day_header(row.at()), row.at())
+                            } else {
+                                row.at().to_string()
+                            };
+                            ui.weak(trf(
+                                "{at} · {model}{pieces}",
+                                &[
+                                    ("at", &at),
+                                    // An empty model column reads as "unknown
+                                    // model"; that is a phrase, not an id.
+                                    ("model", &tr(row.model())),
+                                    ("pieces", &pieces),
+                                ],
+                            ));
+                            if row.source() == state::Source::Server {
                                 ui.label(
-                                    RichText::new(day_header(&dates[position]))
+                                    RichText::new(tr("server"))
                                         .small()
-                                        .strong()
-                                        .color(ui.visuals().weak_text_color()),
+                                        .color(egui::Color32::from_rgb(230, 170, 60)),
                                 );
                             }
-                            ui.horizontal(|ui| {
-                                if ui.small_button(tr("Copy")).clicked() {
-                                    match data.history.entry(index) {
-                                        Ok(entry) => copied = Some(entry.text),
-                                        Err(e) => crate::log::log(&format!(
-                                            "failed to read history entry {index}: {e:#}"
-                                        )),
-                                    }
-                                }
-                                let pieces = if row.pieces() > 0 {
-                                    trf(
-                                        " · +{count} piece(s)",
-                                        &[("count", &row.pieces().to_string())],
-                                    )
-                                } else {
-                                    String::new()
-                                };
-                                ui.weak(trf(
-                                    "{at} · {model}{pieces}",
-                                    &[("at", row.at()), ("model", row.model()), ("pieces", &pieces)],
-                                ));
-                                if row.source() == state::Source::Server {
-                                    ui.label(
-                                        RichText::new(tr("server"))
-                                            .small()
-                                            .color(egui::Color32::from_rgb(230, 170, 60)),
-                                    );
-                                }
-                                if row.source() == state::Source::File {
-                                    ui.label(
-                                        RichText::new(tr("file"))
-                                            .small()
-                                            .color(egui::Color32::from_rgb(70, 190, 90)),
-                                    );
-                                }
-                                if row.source() == state::Source::Telegram {
-                                    ui.label(
-                                        RichText::new(tr("Telegram"))
-                                            .small()
-                                            .color(egui::Color32::from_rgb(90, 170, 220)),
-                                    );
-                                }
-                                if row.source() == state::Source::Site {
-                                    let text = match row.group() {
-                                        Some(group) => format!("{} · {group}", tr("phone")),
-                                        None => tr("phone").to_string(),
-                                    };
-                                    ui.label(
-                                        RichText::new(text)
-                                            .small()
-                                            .color(egui::Color32::from_rgb(150, 110, 220)),
-                                    );
-                                }
-                                if row.state().is_partial() {
-                                    ui.label(
-                                        RichText::new(tr("incomplete"))
-                                            .small()
-                                            .color(egui::Color32::from_rgb(90, 150, 250)),
-                                    );
-                                }
-                                if ui.selectable_label(is_open, row.preview()).clicked() {
-                                    toggle = Some(index);
-                                }
-                            });
-                            if let Some(entry) = full_entry {
-                                if let Some(audio) = entry.audio.as_deref() {
-                                    let exists = std::path::Path::new(audio).exists();
-                                    ui.horizontal(|ui| {
-                                        if ui
-                                            .add_enabled(exists, egui::Button::new(tr("Open recording")))
-                                            .on_hover_text(audio)
-                                            .clicked()
-                                        {
-                                            open_path(audio);
-                                        }
-                                        if ui
-                                            .add_enabled(exists, egui::Button::new(tr("Show in folder")))
-                                            .clicked()
-                                        {
-                                            show_in_folder(audio);
-                                        }
-                                    });
-                                }
-                                ui.add(egui::Label::new(entry.text).wrap(true));
-                                ui.add_space(4.0);
-                                // Pieces appended with the append hotkey are
-                                // listed under the full message, each with its
-                                // own time and copy button.
-                                for (part_index, part) in entry.parts.iter().enumerate() {
-                                    ui.push_id(part_index, |ui| {
-                                        ui.add_space(2.0);
-                                        ui.horizontal(|ui| {
-                                            if ui.small_button(tr("Copy")).clicked() {
-                                                copied = Some(part.text.clone());
-                                            }
-                                            ui.weak(trf("appended {at}", &[("at", &part.at)]));
-                                        });
-                                        ui.label(RichText::new(&part.text).weak());
-                                    });
-                                }
+                            if row.source() == state::Source::File {
+                                ui.label(
+                                    RichText::new(tr("file"))
+                                        .small()
+                                        .color(egui::Color32::from_rgb(70, 190, 90)),
+                                );
                             }
-                            ui.separator();
+                            if row.source() == state::Source::Telegram {
+                                ui.label(
+                                    RichText::new(tr("Telegram"))
+                                        .small()
+                                        .color(egui::Color32::from_rgb(90, 170, 220)),
+                                );
+                            }
+                            if row.source() == state::Source::Site {
+                                let text = match row.group() {
+                                    Some(group) => format!("{} · {group}", tr("phone")),
+                                    None => tr("phone").to_string(),
+                                };
+                                ui.label(
+                                    RichText::new(text)
+                                        .small()
+                                        .color(egui::Color32::from_rgb(150, 110, 220)),
+                                );
+                            }
+                            if row.state().is_partial() {
+                                ui.label(
+                                    RichText::new(tr("incomplete"))
+                                        .small()
+                                        .color(egui::Color32::from_rgb(90, 150, 250)),
+                                );
+                            }
+                            if ui.selectable_label(is_open, row.preview()).clicked() {
+                                toggle = Some(index);
+                            }
                         });
+                        if let Some(entry) = &full_entry {
+                            if let Some(audio) = entry.audio.as_deref() {
+                                let exists = std::path::Path::new(audio).exists();
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .add_enabled(exists, egui::Button::new(tr("Open recording")))
+                                        .on_hover_text(audio)
+                                        .clicked()
+                                    {
+                                        open_path(audio);
+                                    }
+                                    if ui
+                                        .add_enabled(exists, egui::Button::new(tr("Show in folder")))
+                                        .clicked()
+                                    {
+                                        show_in_folder(audio);
+                                    }
+                                });
+                            }
+                            ui.add(egui::Label::new(entry.text.clone()).wrap(true));
+                            ui.add_space(4.0);
+                            // Pieces appended with the append hotkey are listed
+                            // under the full message, each with its own time and
+                            // copy button.
+                            for (part_index, part) in entry.parts.iter().enumerate() {
+                                ui.push_id(part_index, |ui| {
+                                    ui.add_space(2.0);
+                                    ui.horizontal(|ui| {
+                                        if ui.small_button(tr("Copy")).clicked() {
+                                            copied = Some(part.text.clone());
+                                        }
+                                        ui.weak(trf("appended {at}", &[("at", &part.at)]));
+                                    });
+                                    ui.label(RichText::new(&part.text).weak());
+                                });
+                            }
+                        }
+                        // A hairline keeps the rows readable without the
+                        // vertical padding a separator widget adds.
+                        let bottom = ui.max_rect().bottom() - 1.0;
+                        ui.painter().hline(
+                            ui.max_rect().x_range(),
+                            bottom,
+                            egui::Stroke::new(1.0_f32, ui.visuals().weak_text_color().gamma_multiply(0.25)),
+                        );
                     });
-                }
-            });
+                });
+            }
         });
     if let Some(index) = toggle {
         *expanded = if *expanded == Some(index) {
@@ -3237,6 +3381,7 @@ fn history_body(
         copy_to_clipboard(&text);
     }
 }
+
 
 /// About text: English lines are the keys, translated on each render so a
 /// language switch applies without restarting.
@@ -3259,7 +3404,43 @@ fn about_lines() -> Vec<String> {
         .collect()
 }
 
-fn show_about_modal(ctx: &egui::Context, open: &mut bool, dirs: &AppDirs) {
+/// The microphone in the About title: the holiday head when one is showing, the
+/// brand green on the tile and the stand, exactly like the tray's idle icon.
+fn about_mic(ctx: &egui::Context, holiday_icons: bool) -> Option<egui::TextureHandle> {
+    type Cached = (Option<String>, egui::TextureHandle);
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<Cached>>> = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(None));
+    // The window runs in its own process, so the daemon's published holiday is
+    // not visible here: it is worked out from the same date and language.
+    let holiday = if holiday_icons {
+        crate::holidays::active(
+            chrono::Local::now().date_naive(),
+            &crate::i18n::active_code(),
+        )
+        .map(|id| id.to_string())
+    } else {
+        None
+    };
+    let mut guard = cache.lock().unwrap();
+    if let Some((cached, texture)) = guard.as_ref() {
+        if *cached == holiday {
+            return Some(texture.clone());
+        }
+    }
+    let svg = crate::icons::tray_svg(holiday.as_deref(), [0xc7, 0xf3, 0x6b]);
+    let (rgba, width, height) = crate::icons::render_rgba(&svg, 64)?;
+    let image = egui::ColorImage::from_rgba_unmultiplied([width as usize, height as usize], &rgba);
+    let texture = ctx.load_texture("about-mic", image, egui::TextureOptions::LINEAR);
+    *guard = Some((holiday, texture.clone()));
+    Some(texture)
+}
+
+fn show_about_modal(
+    ctx: &egui::Context,
+    open: &mut bool,
+    dirs: &AppDirs,
+    holiday_icons: bool,
+) {
     let screen = ctx.screen_rect();
     let mut close = false;
     let mut close_clicked = false;
@@ -3282,6 +3463,12 @@ fn show_about_modal(ctx: &egui::Context, open: &mut bool, dirs: &AppDirs) {
             egui::Frame::window(&ctx.style()).show(ui, |ui| {
                 ui.set_max_width(360.0);
                 ui.horizontal(|ui| {
+                    // The microphone sits in front of the name, as tall as the
+                    // heading's letters, and follows the holiday.
+                    if let Some(texture) = about_mic(ctx, holiday_icons) {
+                        let side = ui.text_style_height(&egui::TextStyle::Heading);
+                        ui.add(egui::Image::new((texture.id(), egui::vec2(side, side))));
+                    }
                     ui.heading(format!("Voice Button {}", env!("CARGO_PKG_VERSION")));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button(tr("X")).clicked() {
@@ -3300,10 +3487,6 @@ fn show_about_modal(ctx: &egui::Context, open: &mut bool, dirs: &AppDirs) {
                 ui.hyperlink_to(
                     tr("GitHub: machine202502/voice-button"),
                     "https://github.com/machine202502/voice-button",
-                );
-                ui.hyperlink_to(
-                    tr("MIT License"),
-                    "https://github.com/machine202502/voice-button/blob/master/LICENSE",
                 );
                 ui.separator();
                 if ui.button(tr("Open log folder")).clicked() {
@@ -3339,12 +3522,9 @@ fn bytes_to_mb(v: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{day_header, message_time, selected_text, sync_config_from_disk, visible_history_range, weekday_name};
+    use super::{day_header, message_time, sync_config_from_disk, weekday_name};
     use crate::config::{Backend, Config};
-    use crate::state::{Shared, SiteMessage};
-    use crate::site::monolog::Stage;
-    use std::collections::BTreeSet;
-
+    use crate::state::Shared;
     #[test]
     fn day_headers_read_like_a_chat() {
         let today = chrono::Local::now().date_naive();
@@ -3406,39 +3586,6 @@ mod tests {
         sync_config_from_disk(&mut shared.lock(), disk);
         assert_eq!(shared.lock().config.backend, Backend::Onnx);
         assert_eq!(shared.lock().config.onnx_model, "gigaam-v3-rnnt");
-    }
-
-    #[test]
-    fn history_viewport_only_materializes_visible_rows() {
-        let offsets = (0..=1000).map(|i| i as f32 * 10.0).collect::<Vec<_>>();
-        assert_eq!(visible_history_range(&offsets, 450.0, 460.0), 44..48);
-        assert_eq!(visible_history_range(&offsets, 0.0, 10.0), 0..3);
-        assert_eq!(visible_history_range(&[0.0], 0.0, 100.0), 0..0);
-    }
-
-    fn message(id: u64, text: &str) -> SiteMessage {
-        SiteMessage {
-            id,
-            recorded: "2026-11-12T09:31:00+05:00".to_string(),
-            stage: Stage::Done,
-            text: text.to_string(),
-        }
-    }
-
-    #[test]
-    fn copied_selection_keeps_the_spoken_order_and_skips_empty_takes() {
-        let messages = vec![
-            message(1, "Первая мысль."),
-            message(2, "   "),
-            message(3, "Вторая мысль."),
-            message(4, "Не выбрана."),
-        ];
-        let selected: BTreeSet<u64> = [1, 2, 3].into_iter().collect();
-        assert_eq!(
-            selected_text(&messages, &selected),
-            "Первая мысль.\n\nВторая мысль."
-        );
-        assert_eq!(selected_text(&messages, &BTreeSet::new()), "");
     }
 
     #[test]

@@ -211,8 +211,9 @@ show progress, and can be cancelled; closing the UI does not cancel them.
 
 Data lives in `%APPDATA%\voice-button`:
 
-- `config.json` — applied settings.
-- `history.jsonl` — persistent history, one JSON entry per line.
+- `config.json` — applied settings, the only user JSON the app keeps.
+- `voice-button.sqlite3` — one SQLite database for history, Telegram and the phone's monologs.
+- `telegram.secure` — the bot token, encrypted for this Windows user.
 - `models/` — downloaded models.
 - `recordings/` — audio of the recording in progress; removed once its text is
   saved, kept when the transcription failed.
@@ -220,9 +221,10 @@ Data lives in `%APPDATA%\voice-button`:
 - `log.txt` and rotated copies — application activity; the previous run is kept
   as `log.txt.1`, so a crash is not erased by the restart.
 
-History indexes only timestamps, previews, and byte offsets. Full text is read
-on demand for expansion or copying, and the scrolling list renders only visible
-rows.
+History, Telegram and the phone's monologs live in the same SQLite file as typed
+rows; there is no JSON payload inside it. Every list is read by page, so only
+the rows around the viewport are held in memory, and search runs in SQL over the
+whole table. The window shows no page controls: the list is one endless scroll.
 
 ## Build and test
 

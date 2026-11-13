@@ -436,7 +436,10 @@ pub fn whisper_model_path(models_dir: &Path, name: &str) -> PathBuf {
 
 pub fn start_download(shared: Arc<Shared>, models_dir: PathBuf, id: String) {
     let Some(model) = find_model(&id) else {
-        shared.fail_download(format!("unknown model {id}"));
+        shared.fail_download(crate::i18n::trf(
+            "Unknown model: {model}",
+            &[("model", &id)],
+        ));
         return;
     };
     let root = models_dir
@@ -504,7 +507,13 @@ pub fn start_download(shared: Arc<Shared>, models_dir: PathBuf, id: String) {
                 if count == 0 {
                     drop(out);
                     let _ = std::fs::remove_file(&tmp);
-                    anyhow::bail!("download of {} failed: file is empty", file.rel);
+                    anyhow::bail!(
+                        "{}",
+                        crate::i18n::trf(
+                            "The downloaded file is empty: {file}",
+                            &[("file", file.rel)]
+                        )
+                    );
                 }
                 drop(out);
                 std::fs::rename(&tmp, &dest)?;

@@ -3,8 +3,8 @@
 //   node tests/storage-test.mjs
 //
 // The browser is not here, so a small fake `indexedDB` is: it has the same
-// shape the adapter uses (open → transaction → store → get/put/delete/keys) and
-// answers on the next microtask, like the real one answers later.
+// shape the adapter uses (open → upgrade → transaction → store → get/put/keys,
+// plus cursor and key range for the paged message store).
 
 import { openStorage } from '../src/web/js/storage.mjs';
 import { createOutbox } from '../src/web/js/outbox.mjs';
@@ -22,87 +22,238 @@ function check(condition, message) {
   }
 }
 
-/** Just enough IndexedDB for the adapter, with no browser. */
+// ---------------------------------------------------------------- key order
+
+function rank(value) {
+  if (typeof value === 'number') return 0;
+  if (value instanceof Date) return 1;
+  if (typeof value === 'string') return 2;
+  if (Array.isArray(value)) return 4;
+  return 3;
+}
+
+function compareValues(left, right) {
+  if (Array.isArray(left) && Array.isArray(right)) {
+    const length = Math.min(left.length, right.length);
+    for (let index = 0; index < length; index += 1) {
+      const order = compareValues(left[index], right[index]);
+      if (order !== 0) return order;
+    }
+    return left.length - right.length;
+  }
+  const a = rank(left);
+  const b = rank(right);
+  if (a !== b) return a - b;
+  if (a === 2) return left < right ? -1 : left > right ? 1 : 0;
+  return left - right;
+}
+
+class FakeRange {
+  constructor(lower, upper, lowerOpen, upperOpen) {
+    this.lower = lower;
+    this.upper = upper;
+    this.lowerOpen = lowerOpen;
+    this.upperOpen = upperOpen;
+  }
+
+  static bound(lower, upper, lowerOpen = false, upperOpen = false) {
+    return new FakeRange(lower, upper, lowerOpen, upperOpen);
+  }
+
+  includes(key) {
+    if (this.lower !== undefined) {
+      const order = compareValues(key, this.lower);
+      if (order < 0 || (order === 0 && this.lowerOpen)) return false;
+    }
+    if (this.upper !== undefined) {
+      const order = compareValues(key, this.upper);
+      if (order > 0 || (order === 0 && this.upperOpen)) return false;
+    }
+    return true;
+  }
+}
+
+globalThis.IDBKeyRange = FakeRange;
+
+// ---------------------------------------------------------------- fake IDB
+
+const keyId = (key) => JSON.stringify(key);
+
+function deriveKey(store, value) {
+  if (!store.keyPath) return undefined;
+  if (Array.isArray(store.keyPath)) {
+    return store.keyPath.map((field) => value[field]);
+  }
+  return value[store.keyPath];
+}
+
 function fakeIndexedDB() {
   const databases = new Map();
-  return {
-    databases,
-    open(name, version) {
-      const request = { result: null, error: null };
+
+  function makeStore(name, keyPath) {
+    return { name, keyPath: keyPath ?? null, entries: new Map() };
+  }
+
+  // A transaction completes once every request it started has settled.
+  function makeTransaction(store) {
+    const transaction = {
+      error: null,
+      completed: false,
+      pending: 0,
+      oncomplete: null,
+      onerror: null,
+      onabort: null,
+    };
+    const maybeComplete = () => {
+      if (transaction.pending > 0 || transaction.completed) return;
+      transaction.completed = true;
+      queueMicrotask(() => {
+        if (transaction.oncomplete) transaction.oncomplete();
+      });
+    };
+    const request = (deliver) => {
+      transaction.pending += 1;
+      const handle = { result: undefined, onsuccess: null, onerror: null };
+      queueMicrotask(() => {
+        try {
+          deliver(handle);
+        } catch (error) {
+          transaction.error = error;
+          transaction.pending -= 1;
+          if (transaction.onerror) transaction.onerror();
+          return;
+        }
+        if (handle.onsuccess) handle.onsuccess();
+        transaction.pending -= 1;
+        maybeComplete();
+      });
+      return handle;
+    };
+
+    const api = {
+      get(key) {
+        return request((handle) => {
+          const found = store.entries.get(keyId(key));
+          handle.result = found ? found.value : undefined;
+        });
+      },
+      put(value, key) {
+        const actual = store.keyPath ? deriveKey(store, value) : key;
+        return request((handle) => {
+          store.entries.set(keyId(actual), { key: actual, value });
+          handle.result = actual;
+        });
+      },
+      delete(key) {
+        return request((handle) => {
+          store.entries.delete(keyId(key));
+          handle.result = undefined;
+        });
+      },
+      getAllKeys() {
+        return request((handle) => {
+          handle.result = [...store.entries.values()]
+            .map((entry) => entry.key)
+            .sort(compareValues);
+        });
+      },
+      count(range) {
+        return request((handle) => {
+          let count = 0;
+          for (const entry of store.entries.values()) {
+            if (!range || range.includes(entry.key)) count += 1;
+          }
+          handle.result = count;
+        });
+      },
+      openCursor(range, direction) {
+        const entries = [...store.entries.values()]
+          .filter((entry) => !range || range.includes(entry.key))
+          .sort((left, right) => compareValues(left.key, right.key));
+        if (direction === 'prev') entries.reverse();
+        let index = 0;
+        const handle = {
+          result: undefined,
+          onsuccess: null,
+          onerror: null,
+        };
+        const advance = () => {
+          transaction.pending += 1;
+          queueMicrotask(() => {
+            if (index >= entries.length) {
+              handle.result = null;
+            } else {
+              const entry = entries[index];
+              handle.result = {
+                key: entry.key,
+                value: entry.value,
+                continue() {
+                  index += 1;
+                  advance();
+                },
+              };
+            }
+            if (handle.onsuccess) handle.onsuccess();
+            transaction.pending -= 1;
+            maybeComplete();
+          });
+        };
+        advance();
+        return handle;
+      },
+    };
+    transaction.objectStore = () => api;
+    transaction._maybeComplete = maybeComplete;
+    return transaction;
+  }
+
+  function open(name, version) {
+    const handle = {
+      result: null,
+      error: null,
+      onupgradeneeded: null,
+      onsuccess: null,
+      onerror: null,
+    };
+    queueMicrotask(() => {
       let database = databases.get(name);
-      const created = !database;
+      let upgrade = false;
       if (!database) {
+        upgrade = true;
         database = {
           name,
           version,
           stores: new Map(),
           objectStoreNames: { contains: (store) => database.stores.has(store) },
-          createObjectStore(store) {
-            database.stores.set(store, new Map());
+          createObjectStore(store, options = {}) {
+            database.stores.set(store, makeStore(store, options.keyPath));
             return {};
           },
-          transaction(store, mode) {
-            const data = database.stores.get(store);
-            if (!data) throw new Error('no such store: ' + store);
-            const transaction = { error: null, objectStore: () => api };
-            const settle = (value) => {
-              const pending = Promise.resolve(value);
-              pending.then(() => {
-                if (transaction.oncomplete) transaction.oncomplete();
-              });
-              return { result: undefined, get result() { return undefined; }, ok: true };
-            };
-            const api = {
-              get: (key) => queueResult(data.get(key), transaction),
-              put: (value, key) => {
-                data.set(key, value);
-                return queueResult(undefined, transaction);
-              },
-              delete: (key) => {
-                data.delete(key);
-                return queueResult(undefined, transaction);
-              },
-              getAllKeys: () => queueResult([...data.keys()], transaction),
-            };
-            // The adapter's `update` reads and writes inside one transaction:
-            // the fake does the same, so a lost read-modify-write would show.
-            api.update = (key, change) => {
-              const read = queueResult(data.get(key), transaction);
-              read.onsuccess = () => {
-                const next = change(read.result);
-                if (next !== undefined) data.set(key, next);
-              };
-              return read;
-            };
-            void mode;
-            void settle;
-            return transaction;
+          deleteObjectStore(store) {
+            database.stores.delete(store);
+          },
+          transaction(store) {
+            const found = database.stores.get(store);
+            if (!found) throw new Error('no such store: ' + store);
+            return makeTransaction(found);
           },
         };
         databases.set(name, database);
+      } else if (version > database.version) {
+        upgrade = true;
+        database.version = version;
       }
-      request.result = database;
-      queueMicrotask(() => {
-        if (created && request.onupgradeneeded) request.onupgradeneeded();
-        if (request.onsuccess) request.onsuccess();
-      });
-      return request;
-    },
-  };
+      handle.result = database;
+      if (upgrade && handle.onupgradeneeded) handle.onupgradeneeded({});
+      if (handle.onsuccess) handle.onsuccess();
+    });
+    return handle;
+  }
+
+  return { databases, open };
 }
 
-/** A request whose result arrives after the transaction completes. */
-function queueResult(value, transaction) {
-  const request = { result: undefined };
-  queueMicrotask(() => {
-    request.result = value;
-    if (request.onsuccess) request.onsuccess();
-    queueMicrotask(() => {
-      if (transaction.oncomplete) transaction.oncomplete();
-    });
-  });
-  return request;
-}
+// ---------------------------------------------------------------- tests
 
 console.log('the adapter stores and returns values');
 {
@@ -151,23 +302,84 @@ console.log('opening twice reuses the database');
   check(factory.databases.size === 1, 'one database, not two');
 }
 
-console.log('the cache bags come from the same connection');
+console.log('messages are one record per message, read in pages');
 {
   const factory = fakeIndexedDB();
   const storage = await openStorage(factory);
-  await storage.monologs.put(-1, { id: -1, localId: -1, name: 'Ждёт', serverId: null });
-  await storage.messages.put(-1, [{ id: 1, text: 'старое' }]);
-  const monolog = await storage.monologs.get(-1);
-  const messages = await storage.messages.get(-1);
-  check(monolog && monolog.name === 'Ждёт', 'a local monolog is stored by its negative id');
+  const day = (n) => '2026-11-' + String(10 + n).padStart(2, '0') + 'T10:00:00+05:00';
+  await storage.messages.put([
+    { id: 1, monolog: 4, recorded: day(1), text: 'one' },
+    { id: 2, monolog: 4, recorded: day(2), text: 'two' },
+    { id: 3, monolog: 4, recorded: day(2), text: 'three' },
+    { id: 4, monolog: 4, recorded: day(3), text: 'four' },
+    { id: 5, monolog: 4, recorded: day(4), text: 'five' },
+    { id: 9, monolog: 9, recorded: day(4), text: 'other' },
+  ]);
+  check((await storage.messages.count(4)) === 5, 'count is per monolog');
+
+  const latest = await storage.messages.page(4, { limit: 2 });
   check(
-    Array.isArray(messages) && messages[0].text === 'старое',
-    'messages are stored by the monolog id',
+    latest.messages.map((message) => message.id).join(',') === '4,5',
+    'the newest page is oldest-first: ' + latest.messages.map((message) => message.id),
   );
+  check(latest.hasMore === true, 'one extra row says there is another page');
+
+  const older = await storage.messages.page(4, {
+    before: { recorded: day(3), id: 4 },
+    limit: 2,
+  });
   check(
-    Boolean(storage.store && storage.chunks),
-    'the takes and audio bags are still there for the outbox',
+    older.messages.map((message) => message.id).join(',') === '2,3',
+    'before is exclusive and returns the nearest older rows: ' + older.messages.map((m) => m.id),
   );
+
+  const newer = await storage.messages.page(4, {
+    after: { recorded: day(2), id: 3 },
+    limit: 2,
+  });
+  check(
+    newer.messages.map((message) => message.id).join(',') === '4,5',
+    'after is exclusive and returns newer rows: ' + newer.messages.map((m) => m.id),
+  );
+
+  await storage.messages.remove(4, day(2), 3);
+  check((await storage.messages.count(4)) === 4, 'deleting one message leaves the rest');
+  check((await storage.messages.any()) === true, 'any() sees the other monolog too');
+}
+
+console.log('the version bump drops the old messages store');
+{
+  const factory = fakeIndexedDB();
+  // A phone that still has the old shape: one array per monolog.
+  const old = factory.open('voice-button', 3);
+  await new Promise((resolve) => {
+    old.onupgradeneeded = () => {
+      const db = old.result;
+      for (const name of ['takes', 'audio', 'outbox', 'chunks', 'monologs']) {
+        db.createObjectStore(name);
+      }
+      db.createObjectStore('messages');
+    };
+    old.onsuccess = resolve;
+  });
+  const oldDb = old.result;
+  await new Promise((resolve, reject) => {
+    const transaction = oldDb.transaction('messages', 'readwrite');
+    transaction.objectStore('messages').put([{ id: 1, text: 'old' }], 1);
+    transaction.oncomplete = resolve;
+    transaction.onerror = () => reject(transaction.error);
+  });
+
+  const storage = await openStorage(factory);
+  const database = factory.databases.get('voice-button');
+  check(database.version === 4, 'the database is at version 4');
+  check(
+    Array.isArray(database.stores.get('messages').keyPath) &&
+      database.stores.get('messages').keyPath.join(',') === 'monolog,recorded,id',
+    'messages have the compound key path',
+  );
+  const page = await storage.messages.page(1, { limit: 10 });
+  check(page.messages.length === 0, 'the old array is gone, not migrated');
 }
 
 console.log('');

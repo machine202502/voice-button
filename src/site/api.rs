@@ -112,7 +112,7 @@ fn monolog_json(
 
 /// The API is versioned: the phone checks this and refuses to talk to a
 /// computer it does not understand.
-pub const API_VERSION: u32 = 2;
+pub const API_VERSION: u32 = 3;
 
 pub fn handle(request: &Request, ctx: &Ctx) -> Response {
     let method = request.method.as_str();
@@ -130,13 +130,14 @@ pub fn handle(request: &Request, ctx: &Ctx) -> Response {
 
     match (method, parts.as_slice()) {
         (_, ["site", "api", "me", ..]) => me(ctx),
+        ("GET", ["site", "api", "holiday.svg"]) => holiday_icon(),
         ("GET", ["site", "api", "monologues"]) => list_monologs(ctx, request),
         ("POST", ["site", "api", "monologues"]) => create_monolog(ctx, request),
         ("PATCH", ["site", "api", "monologues", id]) => rename_monolog(ctx, id, request),
         ("POST", ["site", "api", "monologues", id, "archive"]) => {
             archive_monolog(ctx, id, request)
         }
-        ("GET", ["site", "api", "monologues", id, "messages"]) => list_messages(ctx, id),
+        ("GET", ["site", "api", "monologues", id, "messages"]) => list_messages(ctx, id, request),
         ("POST", ["site", "api", "messages"]) => create_message(ctx, request),
         ("GET", ["site", "api", "messages", id]) => show_message(ctx, id),
         ("PATCH", ["site", "api", "messages", id]) => edit_message(ctx, id, request),
@@ -156,41 +157,57 @@ fn me(ctx: &Ctx) -> Response {
             "ok": true,
             "api": API_VERSION,
             "paired": db.data().client.paired,
-            "monologs": db.monologs(false).len(),
+            "monologs": db.monolog_count(false),
+            // The holiday the tray is drawing today, so the page shows the same
+            // microphone. Absent on an ordinary day and when the setting is off.
+            "holiday": crate::holidays::current(),
         }),
     )
 }
 
+/// The holiday microphone as SVG. The stand keeps `currentColor`, so the record
+/// button's colour reaches it, and the head keeps the holiday's own colours —
+/// the same drawing the tray shows.
+fn holiday_icon() -> Response {
+    match crate::holidays::current()
+        .as_deref()
+        .and_then(crate::icons::holiday_page_svg)
+    {
+        Some(svg) => Response::new(200, "image/svg+xml; charset=utf-8", svg.into_bytes())
+            .with_header("Cache-Control", "no-store"),
+        None => Response::new(404, "text/plain; charset=utf-8", b"no holiday today".to_vec()),
+    }
+}
+
 fn list_monologs(ctx: &Ctx, request: &Request) -> Response {
     let archived = crate::http::query_param(&request.query, "archived").as_deref() == Some("1");
+    let limit = crate::http::query_param(&request.query, "limit")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(100)
+        .clamp(1, 500);
+    let offset = crate::http::query_param(&request.query, "offset")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
     let db = ctx.db.lock().unwrap();
-    // `monologs(true)` means "all of them"; the archive view wants only the
-    // archived ones, not every monolog the computer knows.
-    let list: Vec<serde_json::Value> = db
-        .monologs(true)
-        .into_iter()
-        .filter(|monolog| monolog.archived == archived)
+    let (monologs, total) = db.monologs_page(archived, offset, limit);
+    let list: Vec<serde_json::Value> = monologs
+        .iter()
         .map(|monolog| {
-            let busy = db.messages(Some(monolog.id)).iter().any(|message| {
-                !message.deleted
-                    && matches!(
-                        message.stage,
-                        super::monolog::Stage::Draft
-                            | super::monolog::Stage::Uploading
-                            | super::monolog::Stage::Queued
-                            | super::monolog::Stage::Transcribing
-                    )
-            });
-            let messages = db.messages(Some(monolog.id));
-            let last = messages
-                .iter()
-                .rev()
-                .copied()
-                .find(|message| !message.deleted && !message.text.trim().is_empty());
-            monolog_json(&monolog, busy, last)
+            let busy = db.monolog_busy(monolog.id);
+            let last = db.last_text(monolog.id);
+            monolog_json(monolog, busy, last.as_ref())
         })
         .collect();
-    json(200, serde_json::json!({ "ok": true, "monologs": list }))
+    json(
+        200,
+        serde_json::json!({
+            "ok": true,
+            "api": API_VERSION,
+            "monologs": list,
+            "total": total,
+            "has_more": offset + list.len() < total,
+        }),
+    )
 }
 
 fn create_monolog(ctx: &Ctx, request: &Request) -> Response {
@@ -257,7 +274,7 @@ fn archive_monolog(ctx: &Ctx, id: &str, request: &Request) -> Response {
     json(200, serde_json::json!({ "ok": true, "archived": archived }))
 }
 
-fn list_messages(ctx: &Ctx, id: &str) -> Response {
+fn list_messages(ctx: &Ctx, id: &str, request: &Request) -> Response {
     let Ok(id) = id.parse::<u64>() else {
         return error(400, "the monolog id is not a number");
     };
@@ -266,12 +283,37 @@ fn list_messages(ctx: &Ctx, id: &str) -> Response {
     if db.monolog(id).is_none() {
         return error(404, "no such monolog");
     }
+    let limit = crate::http::query_param(&request.query, "limit")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(50)
+        .clamp(1, 500);
+    let cursor = |name: &str| {
+        crate::http::query_param(&request.query, name).and_then(|value| {
+            let (recorded, id) = value.rsplit_once('|')?;
+            Some((recorded.to_string(), id.parse::<u64>().ok()?))
+        })
+    };
+    let before = cursor("before");
+    let after = cursor("after");
     let list: Vec<serde_json::Value> = db
-        .messages(Some(id))
+        .message_page(
+            id,
+            before.as_ref().map(|(recorded, id)| (recorded.as_str(), *id)),
+            after.as_ref().map(|(recorded, id)| (recorded.as_str(), *id)),
+            limit,
+        )
         .iter()
         .map(|message| message_json(message, busy))
         .collect();
-    json(200, serde_json::json!({ "ok": true, "messages": list }))
+    json(
+        200,
+        serde_json::json!({
+            "ok": true,
+            "messages": list,
+            "total": db.message_count(id),
+            "has_more": list.len() >= limit,
+        }),
+    )
 }
 
 fn create_message(ctx: &Ctx, request: &Request) -> Response {
@@ -304,7 +346,7 @@ fn show_message(ctx: &Ctx, id: &str) -> Response {
     match db.message(id) {
         Some(message) => {
             let busy = ctx.engine.busy();
-            json(200, serde_json::json!({ "ok": true, "message": message_json(message, busy) }))
+            json(200, serde_json::json!({ "ok": true, "message": message_json(&message, busy) }))
         }
         None => error(404, "no such message"),
     }
@@ -373,7 +415,7 @@ fn finish(ctx: &Ctx, id: &str) -> Response {
             // take is still open and this `finish` is what ends it.
             Stage::Queued | Stage::Transcribing => db.close_take(id),
             _ => {
-                return json(200, serde_json::json!({ "ok": true, "stage": message.stage.label() }));
+                return json(200, serde_json::json!({ "ok": true, "stage": message.stage.as_storage() }));
             }
         }
         let _ = db.save();
@@ -589,7 +631,16 @@ mod tests {
         assert_eq!(created["monolog"]["count"], 0);
         let renamed = ask(&db, &engine, "PATCH", "/site/api/monologues/2", r#"{"name":"Дом2"}"#.as_bytes());
         assert_eq!(renamed["ok"], true);
-        assert_eq!(ask(&db, &engine, "GET", "/site/api/monologues", b"")["monologs"][1]["name"], "Дом2");
+        let listed = ask(&db, &engine, "GET", "/site/api/monologues", b"");
+        let names: Vec<&str> = listed["monologs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|monolog| monolog["name"].as_str())
+            .collect();
+        assert!(names.contains(&"Работа"), "the first monolog is listed");
+        assert!(names.contains(&"Дом2"), "the renamed monolog is listed");
+        assert_eq!(listed["total"], 2);
     }
 
     #[test]

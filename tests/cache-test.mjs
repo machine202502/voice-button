@@ -46,7 +46,51 @@ function bag() {
   };
 }
 
-function cacheWith(monologs = bag(), messages = bag()) {
+function compareMessages(left, right) {
+  if (left.recorded < right.recorded) return -1;
+  if (left.recorded > right.recorded) return 1;
+  return left.id - right.id;
+}
+
+/** The paged message store, with the same contract storage.mjs implements. */
+function messageStore() {
+  const rows = new Map();
+  const key = (message) => message.monolog + '|' + message.recorded + '|' + message.id;
+  return {
+    rows,
+    async put(list) {
+      for (const message of list) rows.set(key(message), { ...message });
+      return list.length;
+    },
+    async page(monolog, { before = null, after = null, limit = 50 } = {}) {
+      const all = [...rows.values()]
+        .filter((message) => message.monolog === monolog)
+        .sort(compareMessages);
+      if (before) {
+        const older = all.filter((message) => compareMessages(message, before) < 0);
+        const chunk = older.slice(-(limit + 1));
+        return { messages: chunk.slice(-limit), hasMore: chunk.length > limit };
+      }
+      if (after) {
+        const newer = all.filter((message) => compareMessages(message, after) > 0);
+        return { messages: newer.slice(0, limit), hasMore: newer.length > limit };
+      }
+      const chunk = all.slice(-(limit + 1));
+      return { messages: chunk.slice(-limit), hasMore: chunk.length > limit };
+    },
+    async count(monolog) {
+      return [...rows.values()].filter((message) => message.monolog === monolog).length;
+    },
+    async remove(monolog, recorded, id) {
+      rows.delete(monolog + '|' + recorded + '|' + id);
+    },
+    async any() {
+      return rows.size > 0;
+    },
+  };
+}
+
+function cacheWith(monologs = bag(), messages = messageStore()) {
   return createCache({
     monologs,
     messages,
@@ -125,27 +169,86 @@ console.log('server views are cached separately from local monologs');
   const cache = cacheWith(monologs);
   await cache.allocate('Ждёт');
   await cache.putServerMonologs([{ id: 1, name: 'Работа', count: 2 }], false);
-  const open = await cache.serverMonologs(false);
-  check(open.length === 1 && open[0].id === 1, 'the open list is stored');
+  const open = await cache.monologPage(false, 0, 100);
+  check(open.monologs.some((item) => item.id === 1), 'the open list is stored');
   await cache.putServerMonologs([{ id: 1, name: 'Работа', count: 2, archived: true }], true);
-  check((await cache.serverMonologs(false)).length === 0, 'an archived monolog leaves the open view');
-  check((await cache.serverMonologs(true)).length === 1, 'and appears in the archive view');
-  await cache.putServerMonologs([{ id: 3, name: 'Ещё', count: 0 }], false);
   check(
-    (await cache.serverMonologs(false)).map((item) => item.id).join(',') === '3',
-    'a refreshed open list drops what the computer no longer lists',
+    !(await cache.monologPage(false, 0, 100)).monologs.some((item) => item.id === 1),
+    'an archived monolog leaves the open view',
+  );
+  check(
+    (await cache.monologPage(true, 0, 100)).monologs.some((item) => item.id === 1),
+    'and appears in the archive view',
+  );
+  await cache.putServerMonologs([{ id: 3, name: 'Ещё', count: 0 }, { id: 4, name: 'Старое' }], false);
+  await cache.putServerMonologs([{ id: 3, name: 'Ещё', count: 0 }], false, { complete: true });
+  check(
+    (await cache.monologPage(false, 0, 100)).monologs
+      .filter((item) => item.id > 0)
+      .map((item) => item.id)
+      .join(',') === '3',
+    'a complete first page drops what the computer no longer lists',
   );
   check((await cache.localMonologs()).length === 1, 'the local monolog is untouched by a list refresh');
 }
 
-console.log('messages are cached per monolog');
+console.log('the monolog list is read one page at a time');
 {
   const cache = cacheWith();
-  await cache.putMessages(4, [{ id: 1, text: 'привет' }]);
-  const stored = await cache.messages(4);
-  check(stored.length === 1 && stored[0].text === 'привет', 'the messages come back as stored');
-  check((await cache.messages(5)).length === 0, 'a monolog with no cache is empty, not an error');
+  await cache.putServerMonologs(
+    [
+      { id: 1, name: 'one', created: '2026-11-12T10:00:00+05:00' },
+      { id: 2, name: 'two', created: '2026-11-12T11:00:00+05:00' },
+      { id: 3, name: 'three', created: '2026-11-12T12:00:00+05:00' },
+    ],
+    false,
+  );
+  await cache.allocate('local');
+  const first = await cache.monologPage(false, 0, 2);
+  check(
+    first.monologs.map((item) => item.id).join(',') === '-1,3',
+    'the first page is newest first and includes the local one: ' +
+      first.monologs.map((item) => item.id),
+  );
+  check(first.total === 4 && first.hasMore === true, 'the page knows its total and that more exist');
+  const second = await cache.monologPage(false, 2, 2);
+  check(
+    second.monologs.map((item) => item.id).join(',') === '2,1',
+    'the next page continues the same order: ' + second.monologs.map((item) => item.id),
+  );
+  check(second.hasMore === false, 'and the last page says so');
+}
+
+console.log('messages are cached per monolog and read in pages');
+{
+  const cache = cacheWith();
+  const recorded = '2026-11-12T10:00:00+05:00';
+  const later = '2026-11-12T11:00:00+05:00';
+  await cache.putMessages(4, [
+    { id: 1, recorded, text: 'привет' },
+    { id: 2, recorded: later, text: 'ещё' },
+  ]);
+  const latest = await cache.messagePage(4, { limit: 1 });
+  check(
+    latest.messages.length === 1 && latest.messages[0].text === 'ещё',
+    'the newest page comes first',
+  );
+  const older = await cache.messagePage(4, {
+    before: { recorded: later, id: 2 },
+    limit: 5,
+  });
+  check(
+    older.messages.length === 1 && older.messages[0].text === 'привет',
+    'before reads older messages',
+  );
+  check((await cache.messageCount(4)) === 2, 'count sees both');
+  check(
+    (await cache.messagePage(5, { limit: 5 })).messages.length === 0,
+    'a monolog with no cache is empty, not an error',
+  );
   check((await cache.hasData()) === true, 'cached messages count as data for the boot decision');
+  await cache.deleteMessage(4, { recorded: later, id: 2 });
+  check((await cache.messageCount(4)) === 1, 'deleting one message removes only that one');
 }
 
 console.log('a paired phone always keeps the page');
@@ -181,7 +284,8 @@ console.log('a rename never waits for the network');
   await cache.putServerMonologs([{ id: 3, name: 'Серверное' }], false);
   check(await cache.rename(3, 'Правка'), 'a known monolog is renamed locally too');
   check(
-    (await cache.serverMonologs(false))[0].name === 'Правка',
+    (await cache.monologPage(false, 0, 100)).monologs.find((item) => item.id === 3).name ===
+      'Правка',
     'the open list shows the new name before the computer answers',
   );
   const waiting = await cache.dirtyRenames();
@@ -190,7 +294,8 @@ console.log('a rename never waits for the network');
   // A list fetched after the rename must not undo it.
   await cache.putServerMonologs([{ id: 3, name: 'Серверное' }], false);
   check(
-    (await cache.serverMonologs(false))[0].name === 'Правка',
+    (await cache.monologPage(false, 0, 100)).monologs.find((item) => item.id === 3).name ===
+      'Правка',
     'an old server name does not overwrite the pending rename',
   );
 }
@@ -200,12 +305,12 @@ console.log('archiving moves a monolog between the views at once');
   const monologs = bag();
   const cache = cacheWith(monologs);
   await cache.putServerMonologs([{ id: 5, name: 'Работа' }], false);
-  check((await cache.serverMonologs(false)).length === 1, 'the open list has it');
+  check((await cache.monologPage(false, 0, 100)).total === 1, 'the open list has it');
   check(await cache.setArchived(5, true), 'the cache found the record');
-  check((await cache.serverMonologs(false)).length === 0, 'and the open list is empty at once');
-  check((await cache.serverMonologs(true)).length === 1, 'the archive shows it');
+  check((await cache.monologPage(false, 0, 100)).total === 0, 'and the open list is empty at once');
+  check((await cache.monologPage(true, 0, 100)).total === 1, 'the archive shows it');
   await cache.setArchived(5, false);
-  check((await cache.serverMonologs(false)).length === 1, 'unarchiving brings it back');
+  check((await cache.monologPage(false, 0, 100)).total === 1, 'unarchiving brings it back');
 }
 
 console.log('the monolog list has one order');

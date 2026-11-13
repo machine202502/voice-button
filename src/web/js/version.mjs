@@ -7,4 +7,4 @@
 // Bump this together with the service-worker shell version in sw.js. Any change
 // a person can see on the page needs a bump, otherwise the label lies.
 
-export const SITE_VERSION = '1.17.2';
+export const SITE_VERSION = '1.17.4';
