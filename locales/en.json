@@ -241,7 +241,8 @@
     "Files sent to the bot and their transcripts. Read-only: Telegram keeps the originals.": "Files sent to the bot and their transcripts. Read-only: Telegram keeps the originals.",
     "Nothing from Telegram yet.": "Nothing from Telegram yet.",
     "Open in Telegram": "Open in Telegram",
-    "No Telegram messages yet.": "No Telegram messages yet."
+    "No Telegram messages yet.": "No Telegram messages yet.",
+    "Bot settings are in Settings.": "Bot settings are in Settings."
   },
   "Back": "Back",
   "History": "History"

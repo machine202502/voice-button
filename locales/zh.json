@@ -241,7 +241,8 @@
     "Files sent to the bot and their transcripts. Read-only: Telegram keeps the originals.": "发送给机器人的文件及其转写。只读：原件保留在 Telegram 中。",
     "Nothing from Telegram yet.": "还没有来自 Telegram 的内容。",
     "Open in Telegram": "在 Telegram 中打开",
-    "No Telegram messages yet.": "还没有 Telegram 消息。"
+    "No Telegram messages yet.": "还没有 Telegram 消息。",
+    "Bot settings are in Settings.": "机器人设置在“设置”中。"
   },
   "Back": "返回",
   "History": "历史"

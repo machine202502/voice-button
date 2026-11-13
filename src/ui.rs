@@ -16,7 +16,6 @@ pub const WINDOW_TITLE: &str = "Voice Button";
 enum Tab {
     Capture,
     History,
-    Telegram,
     Settings,
     External,
 }
@@ -27,6 +26,7 @@ enum Tab {
 enum ExternalTab {
     LocalServer,
     Phone,
+    Telegram,
 }
 
 /// Which transcriptions the history list shows.
@@ -235,7 +235,7 @@ fn run_ui(config: config::Config, history: state::History, dirs: AppDirs, tab: S
     } else if tab == "api" {
         Tab::External
     } else if tab == "telegram" {
-        Tab::Telegram
+        Tab::External
     } else {
         Tab::Capture
     };
@@ -251,7 +251,11 @@ fn run_ui(config: config::Config, history: state::History, dirs: AppDirs, tab: S
         shared: shared.clone(),
         dirs: dirs.clone(),
         tab: initial_tab,
-        external_tab: ExternalTab::LocalServer,
+        external_tab: if tab == "telegram" {
+            ExternalTab::Telegram
+        } else {
+            ExternalTab::LocalServer
+        },
         show_about: false,
         expanded_history: None,
         history_filter: HistoryFilter::All,
@@ -536,7 +540,8 @@ impl eframe::App for MainWindow {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Keep the UI fresh (e.g. download progress) between events.
         ctx.request_repaint_after(Duration::from_millis(250));
-        if self.tab == Tab::Telegram
+        if self.tab == Tab::External
+            && self.external_tab == ExternalTab::Telegram
             && self.telegram_chat_at.map(|at| at.elapsed() > Duration::from_millis(500)).unwrap_or(true)
         {
             self.telegram_chat = crate::telegram::chat(&self.dirs);
@@ -559,7 +564,6 @@ impl eframe::App for MainWindow {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.tab, Tab::Capture, tr("Capture"));
                 ui.selectable_value(&mut self.tab, Tab::History, tr("History"));
-                ui.selectable_value(&mut self.tab, Tab::Telegram, tr("Telegram"));
                 ui.selectable_value(&mut self.tab, Tab::Settings, tr("Settings"));
                 ui.selectable_value(&mut self.tab, Tab::External, tr("External access"));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -584,7 +588,6 @@ impl eframe::App for MainWindow {
                     &mut self.expanded_history,
                     &mut self.history_filter,
                 ),
-                Tab::Telegram => telegram_body(ui, &self.telegram_chat),
                 Tab::Settings => {
                     // The settings page is taller than the window on small
                     // screens, so keep everything reachable by scrolling.
@@ -604,6 +607,7 @@ impl eframe::App for MainWindow {
                     &mut self.external_tab,
                     &mut self.site_qr,
                     &mut self.phone,
+                    &self.telegram_chat,
                 ),
             }
         });
@@ -969,6 +973,8 @@ fn settings_body(
     dirs: &AppDirs,
     telegram: &mut TelegramForm,
 ) {
+    telegram_settings(ui, data, dirs, telegram);
+    ui.separator();
     ui.heading(tr("Interface language"));
     let locales = crate::i18n::available();
     let selected = if data.config.ui_language.is_empty() {
@@ -1298,8 +1304,6 @@ fn settings_body(
             .color(egui::Color32::from_rgb(230, 170, 60)),
         );
     }
-    ui.separator();
-    telegram_settings(ui, data, dirs, telegram);
     if let Some(err) = &data.last_error {
         ui.label(
             RichText::new(trf("Error: {error}", &[("error", err)])).color(egui::Color32::from_rgb(230, 90, 90)),
@@ -1446,15 +1450,25 @@ fn external_body(
     page: &mut ExternalTab,
     qr: &mut Option<(String, egui::TextureHandle)>,
     phone: &mut PhoneState,
+    telegram_chat: &[crate::telegram::ChatEntry],
 ) {
     ui.horizontal(|ui| {
         ui.selectable_value(page, ExternalTab::LocalServer, tr("Local server"));
         ui.selectable_value(page, ExternalTab::Phone, tr("Phone"));
+        ui.selectable_value(page, ExternalTab::Telegram, tr("Telegram"));
     });
     ui.separator();
     match *page {
         ExternalTab::LocalServer => api_body(ui, data, dirs, ctx, copied_at),
         ExternalTab::Phone => phone_body(ui, data, dirs, ctx, copied_at, qr, phone),
+        ExternalTab::Telegram => {
+            ui.label(
+                RichText::new(tr("Bot settings are in Settings."))
+                    .weak()
+                    .small(),
+            );
+            telegram_body(ui, telegram_chat);
+        }
     }
 }
 
