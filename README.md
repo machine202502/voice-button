@@ -256,10 +256,10 @@ The browser test copies `src/web` to where the daemon serves the page, starts th
 daemon in a temporary profile and drives Chromium over the DevTools protocol. It
 needs the Playwright Chromium and the models in the app's data directory.
 
-To refresh the UI snapshots in `Tests/`:
+To refresh the UI snapshots in `tests/snapshots/`:
 
 ```powershell
-$env:VB_SNAPSHOT = "Tests"
+$env:VB_SNAPSHOT = "tests/snapshots"
 .\target\release\voice-button.exe
 Remove-Item Env:VB_SNAPSHOT
 ```

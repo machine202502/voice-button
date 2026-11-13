@@ -234,7 +234,7 @@ fn run_ui(config: config::Config, history: state::History, dirs: AppDirs, tab: S
         Tab::History
     } else if tab == "api" {
         Tab::External
-    } else if tab == "telegram" {
+    } else if tab == "telegram" || tab == "phone" {
         Tab::External
     } else {
         Tab::Capture
@@ -253,6 +253,8 @@ fn run_ui(config: config::Config, history: state::History, dirs: AppDirs, tab: S
         tab: initial_tab,
         external_tab: if tab == "telegram" {
             ExternalTab::Telegram
+        } else if tab == "phone" {
+            ExternalTab::Phone
         } else {
             ExternalTab::LocalServer
         },
@@ -505,6 +507,7 @@ enum PhoneView {
 struct PhoneState {
     view: PhoneView,
     open: Option<u64>,
+    search: String,
     selected: std::collections::BTreeSet<u64>,
     /// Snapshot mode only: scroll the phone page to the monolog list.
     focus_list: bool,
@@ -547,7 +550,8 @@ impl eframe::App for MainWindow {
             self.telegram_chat = crate::telegram::chat(&self.dirs);
             self.telegram_chat_at = Some(Instant::now());
         }
-        if self.tab == Tab::Settings
+        if self.tab == Tab::External
+            && self.external_tab == ExternalTab::Telegram
             && self
                 .telegram_form
                 .snapshot_at
@@ -594,9 +598,7 @@ impl eframe::App for MainWindow {
                     ScrollArea::vertical()
                         .id_source("settings_scroll")
                         .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            settings_body(ui, &mut data, &self.dirs, &mut self.telegram_form)
-                        });
+                        .show(ui, |ui| settings_body(ui, &mut data, &self.dirs));
                 }
                 Tab::External => external_body(
                     ui,
@@ -608,6 +610,7 @@ impl eframe::App for MainWindow {
                     &mut self.site_qr,
                     &mut self.phone,
                     &self.telegram_chat,
+                    &mut self.telegram_form,
                 ),
             }
         });
@@ -967,14 +970,7 @@ fn apply_settings(data: &mut Data, dirs: &AppDirs) {
     }
 }
 
-fn settings_body(
-    ui: &mut egui::Ui,
-    data: &mut Data,
-    dirs: &AppDirs,
-    telegram: &mut TelegramForm,
-) {
-    telegram_settings(ui, data, dirs, telegram);
-    ui.separator();
+fn settings_body(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs) {
     ui.heading(tr("Interface language"));
     let locales = crate::i18n::available();
     let selected = if data.config.ui_language.is_empty() {
@@ -1348,13 +1344,8 @@ fn telegram_settings(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs, form: &
                 .hint_text(tr("Bot token from @BotFather")),
         );
         if ui.button(tr("Save token")).clicked() {
-            // An empty config proxy means "keep the proxy stored with the
-            // token"; saving a token must not wipe it.
-            let proxy = if data.config.telegram_proxy.trim().is_empty() {
-                crate::telegram::read_secure(dirs).proxy
-            } else {
-                data.config.telegram_proxy.clone()
-            };
+            // The proxy field is exactly what is used; empty means direct.
+            let proxy = data.config.telegram_proxy.clone();
             crate::ipc::request_telegram_token(&dirs.root, &form.token, &proxy);
             form.token.clear();
         }
@@ -1411,7 +1402,7 @@ fn telegram_body(ui: &mut egui::Ui, chat: &[crate::telegram::ChatEntry]) {
                 egui::Frame::group(ui.style()).show(ui, |ui| {
                     let clock = entry.at.get(11..16).unwrap_or("");
                     let seconds = if entry.seconds > 0.0 {
-                        format!(" · {:.0} с", entry.seconds)
+                        format!(" · {:.0} {}", entry.seconds, tr("s"))
                     } else {
                         String::new()
                     };
@@ -1422,12 +1413,31 @@ fn telegram_body(ui: &mut egui::Ui, chat: &[crate::telegram::ChatEntry]) {
                         if entry.file_name.is_empty() { "" } else { " · " },
                         entry.file_name
                     )).small().weak());
-                    ui.label(RichText::new(if entry.text.is_empty() { "—" } else { &entry.text }));
+                    let body = if entry.text.is_empty() { "—" } else { entry.text.as_str() };
+                    if body.chars().count() > 1200 {
+                        // A long transcript keeps its own scrollbar inside a
+                        // fixed-height box instead of pushing the chat away.
+                        let width = ui.available_width();
+                        ui.allocate_ui(egui::vec2(width, 150.0), |ui| {
+                            ScrollArea::vertical()
+                                .id_source(("telegram_text", entry.message_id))
+                                .max_height(150.0)
+                                .auto_shrink([false, true])
+                                .show(ui, |ui| {
+                                    ui.add(
+                                        egui::Label::new(body)
+                                            .wrap(true)
+                                            .sense(egui::Sense::hover()),
+                                    );
+                                });
+                        });
+                    } else {
+                        ui.label(body);
+                    }
                     if let Some(error) = &entry.error {
                         ui.label(RichText::new(error).color(egui::Color32::from_rgb(230, 90, 90)).small());
                     }
                     ui.horizontal(|ui| {
-                        ui.hyperlink_to(tr("Open in Telegram"), entry.link());
                         if !entry.text.is_empty() && ui.small_button(tr("Copy")).clicked() {
                             copy_to_clipboard(&entry.text);
                         }
@@ -1451,6 +1461,7 @@ fn external_body(
     qr: &mut Option<(String, egui::TextureHandle)>,
     phone: &mut PhoneState,
     telegram_chat: &[crate::telegram::ChatEntry],
+    telegram: &mut TelegramForm,
 ) {
     ui.horizontal(|ui| {
         ui.selectable_value(page, ExternalTab::LocalServer, tr("Local server"));
@@ -1462,12 +1473,90 @@ fn external_body(
         ExternalTab::LocalServer => api_body(ui, data, dirs, ctx, copied_at),
         ExternalTab::Phone => phone_body(ui, data, dirs, ctx, copied_at, qr, phone),
         ExternalTab::Telegram => {
-            ui.label(
-                RichText::new(tr("Bot settings are in Settings."))
-                    .weak()
-                    .small(),
-            );
+            source_model_picker(ui, data, dirs, SourceModel::Telegram);
+            ui.separator();
+            telegram_settings(ui, data, dirs, telegram);
+            ui.separator();
             telegram_body(ui, telegram_chat);
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SourceModel {
+    Phone,
+    Telegram,
+}
+
+fn source_model_picker(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs, source: SourceModel) {
+    let (label, id, current, folder) = match source {
+        SourceModel::Phone => (
+            tr("Phone model"),
+            "phone_model",
+            data.config.phone_model.clone(),
+            data.config.phone_model_folder.clone(),
+        ),
+        SourceModel::Telegram => (
+            tr("Telegram model"),
+            "telegram_model",
+            data.config.telegram_model.clone(),
+            data.config.telegram_model_folder.clone(),
+        ),
+    };
+    let mut chosen = current.clone();
+    let selected = if current.is_empty() {
+        tr("Same as Settings")
+    } else if current == "custom" {
+        folder
+            .as_deref()
+            .map(|path| format!("{}: {path}", tr("Custom folder...")))
+            .unwrap_or_else(|| tr("Custom folder..."))
+    } else {
+        current.clone()
+    };
+    ui.label(RichText::new(label).small().weak());
+    egui::ComboBox::from_id_source(id)
+        .selected_text(selected)
+        .show_ui(ui, |ui| {
+            ui.selectable_value(&mut chosen, String::new(), tr("Same as Settings"));
+            for model in model_manager::MODELS {
+                let marker = if model_manager::is_ready(&dirs.models, model.id) {
+                    String::new()
+                } else {
+                    tr(" (not downloaded)")
+                };
+                ui.selectable_value(
+                    &mut chosen,
+                    model.id.to_string(),
+                    format!("{} ({}){marker}", model.id, model.size),
+                );
+            }
+            ui.selectable_value(&mut chosen, "custom".to_string(), tr("Custom folder..."));
+        });
+    if chosen != current || (chosen == "custom" && folder.is_none()) {
+        let next_folder = if chosen == "custom" {
+            let picked = rfd::FileDialog::new()
+                .set_title(tr("Choose the model folder"))
+                .pick_folder();
+            let Some(path) = picked else {
+                return;
+            };
+            Some(path.to_string_lossy().to_string())
+        } else {
+            None
+        };
+        match source {
+            SourceModel::Phone => {
+                data.config.phone_model = chosen;
+                data.config.phone_model_folder = next_folder;
+            }
+            SourceModel::Telegram => {
+                data.config.telegram_model = chosen;
+                data.config.telegram_model_folder = next_folder;
+            }
+        }
+        if let Err(error) = config::save_config(&dirs.root, &data.config) {
+            crate::log::log(&format!("cannot save the source model: {error:#}"));
         }
     }
 }
@@ -1500,6 +1589,8 @@ fn phone_settings(
     qr: &mut Option<(String, egui::TextureHandle)>,
     phone: &mut PhoneState,
 ) {
+    source_model_picker(ui, data, dirs, SourceModel::Phone);
+    ui.separator();
     ui.heading(tr("Phone"));
     ui.label(
         RichText::new(tr(
@@ -1725,13 +1816,54 @@ fn phone_settings(
 }
 
 /// The monologs the phone dictated, with the open one's messages below.
+fn phone_preview(monolog: &state::SiteMonolog) -> String {
+    monolog
+        .messages
+        .iter()
+        .rev()
+        .find(|message| !message.text.trim().is_empty())
+        .map(|message| message.text.chars().take(110).collect())
+        .unwrap_or_default()
+}
+
+fn phone_when(monolog: &state::SiteMonolog) -> String {
+    monolog
+        .messages
+        .iter()
+        .rev()
+        .next()
+        .map(|message| {
+            message
+                .recorded
+                .replace('T', " ")
+                .chars()
+                .take(16)
+                .collect()
+        })
+        .unwrap_or_else(|| {
+            monolog
+                .created
+                .replace('T', " ")
+                .chars()
+                .take(16)
+                .collect()
+        })
+}
+
 fn phone_monologs(
     ui: &mut egui::Ui,
     monologs: &Option<state::SiteMonologs>,
     phone: &mut PhoneState,
     dirs: &AppDirs,
 ) {
-    ui.heading(tr("Monologs"));
+    ui.horizontal(|ui| {
+        ui.heading(tr("Monologs"));
+        ui.add(
+            egui::TextEdit::singleline(&mut phone.search)
+                .hint_text(tr("Search"))
+                .desired_width(180.0),
+        );
+    });
     let Some(site) = monologs else {
         ui.label(RichText::new(tr("No monologs yet.")).weak());
         return;
@@ -1742,8 +1874,6 @@ fn phone_monologs(
     }
     if let Some(open) = phone.open {
         if !site.monologs.iter().any(|monolog| monolog.id == open) {
-            // The phone removed it (or the file was replaced): do not keep a
-            // selection for something that is no longer there.
             phone.open = None;
             phone.selected.clear();
         }
@@ -1752,17 +1882,19 @@ fn phone_monologs(
     // only unarchive the second. One mixed list made neither clear.
     ui.horizontal(|ui| {
         ui.selectable_value(&mut phone.view, PhoneView::Active, tr("Active"));
-        ui.selectable_value(&mut phone.view, PhoneView::Archive, tr("Archive"));
+        ui.selectable_value(&mut phone.view, PhoneView::Archive, tr("Archive section"));
     });
-    if phone.view == PhoneView::Archive {
-        // The archive is a list, not a reader: nothing there can be opened.
-        phone.open = None;
-    }
     let showing_archive = phone.view == PhoneView::Archive;
+    let query = phone.search.trim().to_lowercase();
     let mut list: Vec<&state::SiteMonolog> = site
         .monologs
         .iter()
         .filter(|monolog| monolog.archived == showing_archive)
+        .filter(|monolog| {
+            query.is_empty()
+                || monolog.name.to_lowercase().contains(&query)
+                || phone_preview(monolog).to_lowercase().contains(&query)
+        })
         .collect();
     if list.is_empty() {
         ui.label(
@@ -1783,75 +1915,94 @@ fn phone_monologs(
             .cmp(&left.created)
             .then_with(|| right.id.cmp(&left.id))
     });
+    if phone
+        .open
+        .map(|open| !list.iter().any(|monolog| monolog.id == open))
+        .unwrap_or(true)
+    {
+        phone.open = Some(list[0].id);
+        phone.selected.clear();
+    }
     let mut archive: Option<(u64, bool)> = None;
-    // One monolog on screen at a time: opening it hides the others, and Back
-    // (or clicking it again) returns to the list. The archive stays a list.
-    if !showing_archive {
-        if let Some(open) = phone.open {
-            if let Some(monolog) = list.iter().copied().find(|monolog| monolog.id == open) {
+    let list_height = ui.available_height().max(320.0);
+    ui.horizontal_top(|ui| {
+        ui.allocate_ui_with_layout(
+            egui::vec2(350.0, list_height),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ScrollArea::vertical()
+                    .id_source("phone_monolog_list")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for monolog in &list {
+                            let selected = phone.open == Some(monolog.id);
+                            let preview = phone_preview(monolog);
+                            let when = phone_when(monolog);
+                            let text = format!(
+                                "{}\n{} · {}\n{}",
+                                monolog.name,
+                                when,
+                                trf("Messages: {count}", &[("count", &monolog.count().to_string())]),
+                                preview
+                            );
+                            if ui
+                                .add(egui::SelectableLabel::new(
+                                    selected,
+                                    RichText::new(text).size(14.0),
+                                ))
+                                .clicked()
+                            {
+                                phone.open = Some(monolog.id);
+                                phone.selected.clear();
+                            }
+                            ui.add_space(2.0);
+                        }
+                    });
+            },
+        );
+        ui.separator();
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), list_height),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.set_max_width(ui.available_width());
+                let Some(selected) = list
+                    .iter()
+                    .copied()
+                    .find(|monolog| Some(monolog.id) == phone.open)
+                else {
+                    ui.label(RichText::new(tr("No monologs yet.")).weak());
+                    return;
+                };
                 ui.horizontal(|ui| {
-                    if ui.button(tr("Back")).clicked() {
-                        phone.open = None;
-                        phone.selected.clear();
-                    }
                     ui.label(
-                        RichText::new(format!("{} ({})", monolog.name, monolog.count())).strong(),
+                        RichText::new(format!("{} ({})", selected.name, selected.count())).strong(),
                     );
-                    if ui.small_button(tr("Archive")).clicked() {
-                        archive = Some((monolog.id, true));
+                    if ui
+                        .small_button(if showing_archive {
+                            tr("Unarchive")
+                        } else {
+                            tr("Archive")
+                        })
+                        .clicked()
+                    {
+                        archive = Some((selected.id, !showing_archive));
                     }
                 });
-                ui.indent(("phone_messages", monolog.id), |ui| {
-                    phone_messages(ui, monolog, phone);
-                });
-                if let Some((monolog, archived)) = archive {
-                    crate::ipc::request_site_archive(&dirs.root, monolog, archived);
-                }
-                return;
-            }
-        }
-    }
-    for monolog in list {
-        if showing_archive {
-            ui.horizontal(|ui| {
                 ui.label(
-                    RichText::new(format!("{} ({})", monolog.name, monolog.count())).strong(),
+                    RichText::new(format!("{} · {}", phone_when(selected), phone_preview(selected)))
+                        .small()
+                        .weak(),
                 );
-                if ui.small_button(tr("Unarchive")).clicked() {
-                    archive = Some((monolog.id, false));
-                }
-            });
-            continue;
-        }
-        ui.horizontal(|ui| {
-            let open = phone.open == Some(monolog.id);
-            let title = format!("{} ({})", monolog.name, monolog.count());
-            if ui
-                .selectable_label(open, RichText::new(title).strong())
-                .clicked()
-            {
-                if open {
-                    phone.open = None;
-                } else {
-                    phone.open = Some(monolog.id);
-                    phone.selected.clear();
-                }
-            }
-            if ui.small_button(tr("Archive")).clicked() {
-                archive = Some((monolog.id, true));
-            }
-        });
-        if phone.open == Some(monolog.id) {
-            ui.indent(("phone_messages", monolog.id), |ui| {
-                phone_messages(ui, monolog, phone);
-            });
-        }
-    }
+                ui.separator();
+                phone_messages(ui, selected, phone);
+            },
+        );
+    });
     if let Some((monolog, archived)) = archive {
         crate::ipc::request_site_archive(&dirs.root, monolog, archived);
     }
 }
-
 /// Messages of one open monolog: selection, copy, and the takes themselves.
 fn phone_messages(ui: &mut egui::Ui, monolog: &state::SiteMonolog, phone: &mut PhoneState) {
     let total = monolog.messages.len();
@@ -1859,7 +2010,7 @@ fn phone_messages(ui: &mut egui::Ui, monolog: &state::SiteMonolog, phone: &mut P
         ui.label(RichText::new(tr("No messages from the phone yet.")).weak());
         return;
     }
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         if ui.small_button(tr("Select all")).clicked() {
             for message in &monolog.messages {
                 phone.selected.insert(message.id);

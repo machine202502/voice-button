@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="ru">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
@@ -14,14 +14,14 @@
 
 <div id="app" hidden>
   <header>
-    <button class="icon-button" id="back" hidden aria-label="Назад">←</button>
-    <h1 id="title">Монологи</h1>
+    <button class="icon-button" id="back" hidden aria-label="">←</button>
+    <h1 id="title"></h1>
     <span class="grow"></span>
     <span class="sub" id="sub"></span>
     <button class="update-app" id="update-app" hidden></button>
     <span class="version" id="version" aria-label="site version"></span>
-    <button class="icon-button" id="archive" aria-label="Архив">⌸</button>
-    <button class="icon-button" id="menu" aria-label="Монолог" hidden>⋯</button>
+    <button class="icon-button" id="archive" aria-label="">⌸</button>
+    <button class="icon-button" id="menu" aria-label="" hidden>⋯</button>
   </header>
 
   <!-- The recording is not lost when the monolog is left: this bar follows it
@@ -39,28 +39,28 @@
   <div id="notes" class="notes" role="status" aria-live="polite"></div>
 
   <footer class="about" hidden>
-    <a class="footer-link" id="to-install" href="/install" hidden>Установить приложение</a>
+    <a class="footer-link" id="to-install" href="/install" hidden></a>
     <span class="grow"></span>
-    <button class="action" id="install" hidden>Добавить на главный экран</button>
+    <button class="action" id="install" hidden></button>
   </footer>
 
   <div id="composer" hidden>
-    <button id="record" aria-label="Записать">
+    <button id="record" aria-label="">
       <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
         <path d="M12 15a3.5 3.5 0 0 0 3.5-3.5V6a3.5 3.5 0 1 0-7 0v5.5A3.5 3.5 0 0 0 12 15Z"/>
         <path d="M18 11.5a1 1 0 1 0-2 0 4 4 0 1 1-8 0 1 1 0 0 0-2 0 6 6 0 0 0 5 5.91V20H9a1 1 0 0 0 0 2h6a1 1 0 0 0 0-2h-2v-2.59A6 6 0 0 0 18 11.5Z"/>
       </svg>
     </button>
-    <div class="hint" id="rec-hint"><b id="rec-title">Нажмите, чтобы начать</b><span id="rec-sub">Диктуйте в монолог</span></div>
+    <div class="hint" id="rec-hint"><b id="rec-title"></b><span id="rec-sub"></span></div>
     <span class="timer" id="timer"></span>
   </div>
 </div>
 
 <div id="pair-error" hidden>
   <main>
-    <div class="empty" id="pair-text">Телефон не подключён. Попросите новый QR-код на компьютере.</div>
+    <div class="empty" id="pair-text"></div>
     <p class="empty"><code id="pair-where"></code></p>
-    <p class="empty"><button class="action" id="reload">Обновить</button></p>
+    <p class="empty"><button class="action" id="reload"></button></p>
   </main>
 </div>
 

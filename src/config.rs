@@ -123,6 +123,18 @@ pub struct Config {
     /// Test/override base URL; empty uses the real Bot API.
     #[serde(default)]
     pub telegram_api_base: String,
+    /// Recognizer for the phone; empty uses the model selected in Settings.
+    #[serde(default)]
+    pub phone_model: String,
+    /// Custom folder/file for the phone when `phone_model` is `custom`.
+    #[serde(default)]
+    pub phone_model_folder: Option<String>,
+    /// Recognizer for Telegram; empty uses the model selected in Settings.
+    #[serde(default)]
+    pub telegram_model: String,
+    /// Custom folder/file for Telegram when `telegram_model` is `custom`.
+    #[serde(default)]
+    pub telegram_model_folder: Option<String>,
 }
 
 /// Shortcuts start unbound: the user picks them in Settings.
@@ -184,6 +196,10 @@ impl Default for Config {
             telegram_enabled: false,
             telegram_proxy: String::new(),
             telegram_api_base: String::new(),
+            phone_model: String::new(),
+            phone_model_folder: None,
+            telegram_model: String::new(),
+            telegram_model_folder: None,
         }
     }
 }

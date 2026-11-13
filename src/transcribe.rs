@@ -429,6 +429,35 @@ fn collapse_spaces(input: &str) -> String {
     crate::stitch::collapse(input)
 }
 
+/// A model selected for one source, including a custom folder/file. The
+/// worker understands the `custom:<path>` form, so the path never needs to be
+/// copied into the global Settings.
+pub fn source_model(model: &str, folder: &Option<String>) -> String {
+    if model == "custom" {
+        folder
+            .as_ref()
+            .map(|path| format!("custom:{path}"))
+            .unwrap_or_default()
+    } else {
+        model.to_string()
+    }
+}
+
+pub fn resolve_custom(path: &std::path::Path, dirs: &AppDirs) -> Result<Box<dyn Transcriber>> {
+    let mut cfg = Config::default();
+    cfg.language = "auto".to_string();
+    if path.is_dir() {
+        cfg.backend = Backend::Onnx;
+        cfg.onnx_model = "custom".to_string();
+        cfg.onnx_folder = Some(path.to_string_lossy().to_string());
+    } else {
+        cfg.backend = Backend::Whisper;
+        cfg.whisper_model = "custom".to_string();
+        cfg.whisper_file = Some(path.to_string_lossy().to_string());
+    }
+    resolve(&cfg, dirs)
+}
+
 pub fn resolve(cfg: &Config, dirs: &AppDirs) -> Result<Box<dyn Transcriber>> {
     match cfg.backend {
         Backend::Whisper => {
@@ -508,4 +537,20 @@ pub fn resolve_choice(choice: &ModelChoice, dirs: &AppDirs) -> Result<Box<dyn Tr
     let mut cfg = Config::default();
     choice.apply_to(&mut cfg);
     resolve(&cfg, dirs)
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_custom_source_model_keeps_its_folder() {
+        assert_eq!(
+            source_model("custom", &Some("C:\\models\\my".to_string())),
+            "custom:C:\\models\\my"
+        );
+        assert_eq!(source_model("gigaam-v3-rnnt", &None), "gigaam-v3-rnnt");
+        assert_eq!(source_model("", &None), "");
+    }
 }

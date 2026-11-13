@@ -89,13 +89,21 @@ fn message_json(message: &Message, engine_busy: bool) -> serde_json::Value {
     })
 }
 
-fn monolog_json(monolog: &super::monolog::Monolog, busy: bool) -> serde_json::Value {
+fn monolog_json(
+    monolog: &super::monolog::Monolog,
+    busy: bool,
+    last: Option<&super::db::Message>,
+) -> serde_json::Value {
     serde_json::json!({
         "id": monolog.id,
         "name": monolog.name,
         "archived": monolog.archived,
         "created": monolog.created,
         "count": monolog.count,
+        // The phone list shows the last words and the date without opening the
+        // monolog. Empty for a fresh monolog.
+        "last": last.map(|message| message.text.clone()).unwrap_or_default(),
+        "lastAt": last.map(|message| message.recorded.clone()).unwrap_or_default(),
         // Something is still happening in this monolog: recording or being
         // transcribed. The phone paints the card for it.
         "busy": busy,
@@ -173,7 +181,13 @@ fn list_monologs(ctx: &Ctx, request: &Request) -> Response {
                             | super::monolog::Stage::Transcribing
                     )
             });
-            monolog_json(&monolog, busy)
+            let messages = db.messages(Some(monolog.id));
+            let last = messages
+                .iter()
+                .rev()
+                .copied()
+                .find(|message| !message.deleted && !message.text.trim().is_empty());
+            monolog_json(&monolog, busy, last)
         })
         .collect();
     json(200, serde_json::json!({ "ok": true, "monologs": list }))
@@ -195,7 +209,7 @@ fn create_monolog(ctx: &Ctx, request: &Request) -> Response {
     let mut db = ctx.db.lock().unwrap();
     let monolog = db.create_monolog(&name, ctx.now);
     let _ = db.save();
-    json(200, serde_json::json!({ "ok": true, "monolog": monolog_json(&monolog, false) }))
+    json(200, serde_json::json!({ "ok": true, "monolog": monolog_json(&monolog, false, None) }))
 }
 
 fn rename_monolog(ctx: &Ctx, id: &str, request: &Request) -> Response {

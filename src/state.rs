@@ -309,12 +309,20 @@ pub struct Data {
 pub enum BackgroundJob {
     /// The phone's audio is being received or transcribed.
     Phone,
+    /// A Telegram file is being downloaded, decoded or transcribed.
+    Telegram,
 }
 
 impl Data {
     /// Is any background task running? The violet icon means exactly this.
     pub fn background_active(&self) -> bool {
         !self.background.is_empty()
+    }
+
+    /// Is this particular background task running? Telegram waits for the
+    /// phone, not for its own violet icon.
+    pub fn background_has(&self, job: BackgroundJob) -> bool {
+        self.background.contains(&job)
     }
 }
 

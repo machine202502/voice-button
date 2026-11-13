@@ -23,7 +23,7 @@ import { createLoop } from './loop.mjs';
 import { describe } from './stage.mjs';
 import { applyInstallEntry, installEntry } from './install.mjs';
 import { backTarget, viewState } from './back.mjs';
-import { buildFeed, dayKey } from './chat.mjs';
+import { buildFeed, dayKey, messageExpanded, recordingMessage, swipeDirection } from './chat.mjs';
 import { atBottom, nextScroll } from './scroll.mjs';
 import { SITE_VERSION } from './version.mjs';
 import { Offline } from './offline.mjs';
@@ -44,7 +44,7 @@ if (location.hash.startsWith('#t=')) {
 
 const app = {
   token: localStorage.getItem('vb_token') || '',
-  lang: 'ru',
+  lang: 'en',
   strings: {},
   outbox: null,
   sync: null,
@@ -61,6 +61,7 @@ const app = {
   sheetId: 0,
   chatFirst: false,
   expandedMessage: null,
+  swiping: false,
   recordingMonolog: null,
   listTop: 0,
   archiveTop: 0,
@@ -111,8 +112,23 @@ window.addEventListener('appinstalled', () => {
 // ---------------------------------------------------------------- language
 
 async function loadLanguage() {
-  const preferred = (navigator.language || 'ru').slice(0, 2).toLowerCase();
-  app.lang = ['ru', 'en', 'zh'].includes(preferred) ? preferred : 'en';
+  // The list comes from the lang folder itself, not from a language list in
+  // this file: adding a catalog is enough to make it available.
+  let available = ['en'];
+  try {
+    const index = await fetch('lang/index.json').then((response) => response.json());
+    if (Array.isArray(index.languages) && index.languages.length > 0) {
+      available = index.languages.map((item) => item.code);
+    }
+  } catch (error) {
+    // The English fallback below still opens the page.
+  }
+  const preferred = (navigator.language || 'en').slice(0, 2).toLowerCase();
+  app.lang = available.includes(preferred)
+    ? preferred
+    : available.includes('en')
+      ? 'en'
+      : available[0];
   try {
     app.strings = await fetch('lang/' + app.lang + '.json').then((response) => response.json());
   } catch (error) {
@@ -123,25 +139,40 @@ async function loadLanguage() {
   // page's language: one file per language, picked before the install prompt.
   const manifest = document.getElementById('manifest');
   if (manifest) manifest.href = 'manifest.' + app.lang + '.webmanifest';
+  labelStatic();
+}
+
+/// Labels that live outside the drawn list: icons, the pair error and the
+/// recording hint. Keeping them here means index.html carries no language.
+function labelStatic() {
+  el('back').setAttribute('aria-label', t('back'));
+  el('archive').setAttribute('aria-label', t('archive'));
+  el('menu').setAttribute('aria-label', t('monolog'));
+  el('record').setAttribute('aria-label', t('record'));
+  el('reload').textContent = t('reload');
 }
 
 function t(key, fallback) {
-  return app.strings[key] || fallback || key;
+  return app.strings[key] || key;
 }
 
-/// Message counts need real plural forms in Russian, and two of them in
-/// English. Chinese has one.
+/// Every catalog may provide one/few/many forms; Intl knows which form this
+/// language needs, so no language is named here. A missing form falls back to
+/// `many` for languages with a simpler plural rule.
 function countLabel(count) {
-  const rest10 = count % 10;
-  const rest100 = count % 100;
   let form = 'many';
-  if (app.lang === 'ru') {
-    if (rest10 === 1 && rest100 !== 11) form = 'one';
-    else if (rest10 >= 2 && rest10 <= 4 && (rest100 < 12 || rest100 > 14)) form = 'few';
-  } else if (app.lang === 'en') {
-    form = count === 1 ? 'one' : 'many';
+  try {
+    const chosen = new Intl.PluralRules(app.lang).select(count);
+    if (chosen === 'one' || chosen === 'few' || chosen === 'many') form = chosen;
+  } catch (error) {
+    // An unknown locale means the simple many form.
   }
-  return count + ' ' + t('messages_' + form, 'messages');
+  return count + ' ' + t('messages_' + form);
+}
+
+function cardDate(value) {
+  if (!value) return '';
+  return String(value).replace('T', ' ').slice(0, 16);
 }
 
 // ---------------------------------------------------------------- api
@@ -221,21 +252,21 @@ function fail(text) {
 }
 
 function showPairError() {
-  fail(t('pair_required', 'Телефон не подключён. Попросите новый QR-код на компьютере.'));
+  fail(t('pair_required'));
 }
 
 function reason(error) {
   if (error instanceof Offline) {
-    return t('offline_long', 'Компьютер не отвечает. Проверьте, что он включён и в той же сети.');
+    return t('offline_long');
   }
   const message = String((error && error.message) || error || '');
   if (message.includes('local network')) {
-    return t('lan_blocked', 'Компьютер отклонил подключение: он принимает только из локальной сети.');
+    return t('lan_blocked');
   }
   if (message.includes('pairing required')) {
-    return t('pair_required', 'Телефон не подключён. Попросите новый QR-код на компьютере.');
+    return t('pair_required');
   }
-  return t('cannot_reach', 'Компьютер недоступен.') + (message ? ' · ' + message : '');
+  return t('cannot_reach') + (message ? ' · ' + message : '');
 }
 
 // ---------------------------------------------------------------- time
@@ -271,8 +302,8 @@ function dayLabel(key) {
     date.getFullYear() +
     '-' + String(date.getMonth() + 1).padStart(2, '0') +
     '-' + String(date.getDate()).padStart(2, '0');
-  if (key === localKey(today)) return t('today', 'Сегодня');
-  if (key === localKey(new Date(today.getTime() - 86400000))) return t('yesterday', 'Вчера');
+  if (key === localKey(today)) return t('today');
+  if (key === localKey(new Date(today.getTime() - 86400000))) return t('yesterday');
   const date = new Date(key + 'T00:00:00');
   if (Number.isNaN(date.getTime())) return key;
   return date.toLocaleDateString(app.lang, { weekday: 'short', day: '2-digit', month: '2-digit' });
@@ -344,21 +375,31 @@ function empty(text) {
 /// Draw the list from what is stored. The refresh from the computer is the sync
 /// loop's work, so this never fails on a dead connection.
 function drawMonologs(monologs, pending, top = null) {
+  // The sync loop redraws the list while the finger is still on a card. That
+  // replaced the card under the finger and snapped the swipe back; leave the
+  // list alone until the gesture has finished.
+  if (app.swiping) return;
   app.monologs = monologs;
   const view = document.createDocumentFragment();
   if (monologs.length === 0) {
-    view.append(empty(app.archived ? t('archive_empty', 'В архиве пусто.') : t('no_monologs', 'Пока нет монологов. Создайте первый — и диктуйте в него.')));
+    view.append(empty(app.archived ? t('archive_empty') : t('no_monologs')));
   }
   for (const monolog of monologs) {
-    const card = document.createElement('button');
+    const card = document.createElement('div');
     card.className = 'monolog-card';
+    card.setAttribute('role', 'button');
+    card.tabIndex = 0;
     card.innerHTML =
-      '<div class="top"><strong></strong><span class="when"></span></div>' +
+      '<div class="top"><strong></strong><span class="when"></span>' +
+      '<button class="more" type="button" aria-label="⋯">⋯</button></div>' +
       '<div class="last"></div><div class="count"></div>';
     card.querySelector('strong').textContent = monolog.name;
     if (monolog.local) {
-      card.querySelector('.top').append(chip(t('waiting_link', 'ждёт связи'), 'unsent'));
+      card.querySelector('.top').append(chip(t('waiting_link'), 'unsent'));
     }
+    const when = cardDate(monolog.lastAt || monolog.created);
+    card.querySelector('.when').textContent = when;
+    card.querySelector('.last').textContent = monolog.last || '';
     // Takes that never reached the computer are not in its count yet, so the
     // card has to add them: an offline monolog used to show "0 messages" right
     // after the user dictated into it.
@@ -376,24 +417,138 @@ function drawMonologs(monologs, pending, top = null) {
     ) {
       card.classList.add('active');
     }
-    card.addEventListener('click', () => openMonolog(monolog));
-    view.append(card);
+    card.querySelector('.more').addEventListener('click', (event) => {
+      event.stopPropagation();
+      monologMenuSheet(monolog);
+    });
+    card.addEventListener('click', (event) => {
+      if (event.target.closest('.more')) return;
+      openMonolog(monolog);
+    });
+    const row = document.createElement('div');
+    row.className = 'swipe-row';
+    const action = document.createElement('div');
+    action.className = 'swipe-action' + (app.archived ? ' out' : '');
+    action.textContent = app.archived ? t('unarchive') : t('archive');
+    row.append(action, card);
+    if (!monolog.local) attachSwipe(row, card, action, monolog);
+    view.append(row);
   }
   if (!app.archived) {
     const create = document.createElement('button');
     create.className = 'new-monolog';
-    create.textContent = t('new_monolog', '+ Новый монолог');
+    create.textContent = t('new_monolog');
     create.addEventListener('click', createMonologSheet);
     view.append(create);
   }
   show(view, 'keep', top);
 }
 
+function attachSwipe(row, card, action, monolog) {
+  let startX = 0;
+  let startY = 0;
+  let dx = 0;
+  let dy = 0;
+  let axis = null;
+  let active = false;
+  let suppressClick = false;
+
+  const reset = () => {
+    app.swiping = false;
+    row.classList.remove('dragging', 'leaving');
+    card.style.transform = '';
+    card.style.opacity = '';
+    action.style.opacity = '';
+  };
+
+  card.addEventListener('pointerdown', (event) => {
+    if (event.target.closest('.more')) return;
+    if (event.pointerType === 'mouse' && event.button !== 0) return;
+    if (app.recording && app.recording.take && app.recording.take.monolog === monolog.id) return;
+    active = true;
+    app.swiping = true;
+    axis = null;
+    dx = 0;
+    dy = 0;
+    startX = event.clientX;
+    startY = event.clientY;
+    suppressClick = false;
+    row.classList.add('dragging');
+    try {
+      card.setPointerCapture(event.pointerId);
+    } catch {
+      // Synthetic pointers in tests cannot be captured; the swipe still works.
+    }
+  });
+
+  card.addEventListener('pointermove', (event) => {
+    if (!active) return;
+    dx = event.clientX - startX;
+    dy = event.clientY - startY;
+    if (!axis) {
+      if (Math.abs(dx) < 10 && Math.abs(dy) < 10) return;
+      axis = Math.abs(dx) > Math.abs(dy) ? 'x' : 'y';
+      if (axis === 'y') {
+        reset();
+        return;
+      }
+    }
+    if (axis !== 'x') return;
+    if (event.cancelable) event.preventDefault();
+    card.style.transform = 'translate3d(' + dx + 'px,0,0)';
+    card.style.opacity = String(Math.max(0.35, 1 - Math.abs(dx) / 420));
+    action.style.opacity = String(Math.min(1, Math.abs(dx) / 80));
+    action.style.justifyContent = dx < 0 ? 'flex-end' : 'flex-start';
+  });
+
+  const finish = () => {
+    if (!active) return;
+    active = false;
+    const direction = swipeDirection(dx, dy);
+    if (!direction) {
+      reset();
+      return;
+    }
+    suppressClick = true;
+    app.swiping = false;
+    row.classList.remove('dragging');
+    row.classList.add('leaving');
+    const sign = dx < 0 ? -1 : 1;
+    card.style.transform = 'translate3d(' + sign * 120 + '%,0,0)';
+    card.style.opacity = '0';
+    window.setTimeout(async () => {
+      const archived = !app.archived;
+      try {
+        await call('POST', '/monologues/' + monolog.id + '/archive', { archived });
+        await app.cache.setArchived(monolog.id, archived);
+        await renderMonologs();
+        toast(archived ? t('archive') : t('unarchive'));
+      } catch (error) {
+        toast(t('offline'));
+        await renderMonologs();
+      }
+    }, 190);
+  };
+
+  card.addEventListener('pointerup', finish);
+  card.addEventListener('pointercancel', finish);
+  card.addEventListener(
+    'click',
+    (event) => {
+      if (!suppressClick) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      suppressClick = false;
+    },
+    true,
+  );
+}
+
 async function renderMonologs() {
   app.monolog = null;
   app.sync.show(0);
   app.sync.archive(app.archived);
-  header(app.archived ? t('archive', 'Архив') : t('monologs', 'Монологи'), {
+  header(app.archived ? t('archive') : t('monologs'), {
     hideArchive: app.archived,
   });
   updateComposer();
@@ -446,7 +601,7 @@ function draw(messages, pending) {
     (take) => !take.remote && take.monolog === app.monolog.id
   );
   if (rows.length === 0 && waiting.length === 0) {
-    view.append(empty(t('no_messages', 'Здесь пока пусто. Нажмите микрофон и говорите.')));
+    view.append(empty(t('no_messages')));
   }
   for (const row of rows) {
     if (row.kind === 'day') {
@@ -477,18 +632,22 @@ function messageCard(message) {
   time.className = 'time';
   time.append(document.createTextNode(shortTime(message.recorded)));
   if (info.stage !== 'done') time.append(chip(t(info.label, info.label), info.tone === 'live' ? 'live' : info.tone === 'warning' ? 'failed' : ''));
-  if (waiting) time.append(chip(t('engine_busy', 'движок занят'), 'busy'));
-  if (message.edited) time.append(chip(t('edited', 'изменено'), 'edited'));
+  if (waiting) time.append(chip(t('engine_busy'), 'busy'));
+  if (message.edited) time.append(chip(t('edited'), 'edited'));
   card.append(time);
 
   const long = Boolean(message.text) && message.text.length > 320;
-  const expanded = app.expandedMessage === message.id && !app.recording;
+  // While the microphone is open, the card it is writing into is always fully
+  // expanded: the person must see every word of the take in progress. Other
+  // cards stay closed, and the recording card cannot be collapsed.
+  const inRecording = recordingMessage(app.recording, message.id);
+  const expanded = messageExpanded(app.recording, message.id, app.expandedMessage);
   const text = document.createElement('div');
   text.className = 'text' + (message.text ? '' : ' empty');
   const hint = message.text
     ? ''
     : waiting
-      ? t('busy_hint', 'Движок занят на компьютере — расшифровка продолжится, когда он освободится.')
+      ? t('busy_hint')
       : info.hint
         ? t(info.hint, '')
         : '';
@@ -498,9 +657,9 @@ function messageCard(message) {
       : message.text
     : hint;
   card.append(text);
-  if (long && !app.recording) {
+  if (long && !app.recording && !inRecording) {
     card.append(
-      button(expanded ? t('collapse', 'Свернуть') : t('expand', 'Развернуть'), 'more', () => {
+      button(expanded ? t('collapse') : t('expand'), 'more', () => {
         app.expandedMessage = expanded ? null : message.id;
         draw(app.messages, app.pending);
       }),
@@ -516,13 +675,13 @@ function messageCard(message) {
       continue;
     }
     if (action === 'copy') {
-      actions.append(button(t('copy', 'Копировать'), 'action', () => copy(message.text)));
+      actions.append(button(t('copy'), 'action', () => copy(message.text)));
     } else if (action === 'edit') {
-      actions.append(button(t('edit', 'Изменить'), 'action', () => editSheet(message)));
+      actions.append(button(t('edit'), 'action', () => editSheet(message)));
     } else if (action === 'retry') {
-      actions.append(button(t('retry', 'Повторить'), 'action', () => retryMessage(message)));
+      actions.append(button(t('retry'), 'action', () => retryMessage(message)));
     } else if (action === 'delete') {
-      actions.append(button(t('delete', 'Удалить'), 'action danger', () => deleteSheet(message)));
+      actions.append(button(t('delete'), 'action danger', () => deleteSheet(message)));
     }
   }
   if (actions.childElementCount > 0) card.append(actions);
@@ -535,15 +694,15 @@ function unsentCard(take) {
   const time = document.createElement('div');
   time.className = 'time';
   time.append(document.createTextNode(shortTime(take.recorded)));
-  time.append(chip(t('not_sent', 'Не отправлено'), 'unsent'));
+  time.append(chip(t('not_sent'), 'unsent'));
   card.append(time);
   const text = document.createElement('div');
   text.className = 'text empty';
-  text.textContent = t('waiting_connection', 'Уйдёт, когда появится связь.');
+  text.textContent = t('waiting_connection');
   card.append(text);
   const actions = document.createElement('div');
   actions.className = 'actions';
-  actions.append(button(t('delete', 'Удалить'), 'action danger', () => discardTake(take)));
+  actions.append(button(t('delete'), 'action danger', () => discardTake(take)));
   card.append(actions);
   return card;
 }
@@ -551,9 +710,9 @@ function unsentCard(take) {
 async function copy(text) {
   try {
     await navigator.clipboard.writeText(text);
-    toast(t('copied', 'Скопировано'));
+    toast(t('copied'));
   } catch (error) {
-    toast(t('copy_failed', 'Не удалось скопировать'));
+    toast(t('copy_failed'));
   }
 }
 
@@ -584,7 +743,7 @@ function offlineNote() {
   const now = Date.now();
   if (now - offlineNotedAt < 5000) return;
   offlineNotedAt = now;
-  toast(t('offline_recording', 'Нет связи с компьютером — запись сохранится'));
+  toast(t('offline_recording'));
 }
 
 /// Push a screen onto the browser's history. A phone's back gesture walks it,
@@ -676,10 +835,10 @@ function dismissSheet(backdrop) {
 
 function editSheet(message) {
   const title = document.createElement('h2');
-  title.textContent = t('edit_title', 'Изменить сообщение');
+  title.textContent = t('edit_title');
   const hint = document.createElement('div');
   hint.className = 'hint';
-  hint.textContent = t('edit_hint', 'Оригинал останется в истории приложения');
+  hint.textContent = t('edit_hint');
   const area = document.createElement('textarea');
   area.value = message.text;
   area.autocomplete = 'off';
@@ -688,15 +847,15 @@ function editSheet(message) {
   buttons.className = 'buttons';
   const dialog = sheet([title, hint, area, buttons]);
   const close = () => dismissSheet(dialog);
-  buttons.append(button(t('cancel', 'Отмена'), '', close));
+  buttons.append(button(t('cancel'), '', close));
   buttons.append(
-    button(t('save', 'Сохранить'), 'primary', async () => {
+    button(t('save'), 'primary', async () => {
       try {
         await call('PATCH', '/messages/' + message.id, { text: area.value });
         close();
         await app.sync.tick();
       } catch (error) {
-        toast(t('offline', 'Нет связи с компьютером'));
+        toast(t('offline'));
       }
     })
   );
@@ -705,23 +864,23 @@ function editSheet(message) {
 
 function deleteSheet(message) {
   const title = document.createElement('h2');
-  title.textContent = t('delete_title', 'Удалить сообщение?');
+  title.textContent = t('delete_title');
   const hint = document.createElement('div');
   hint.className = 'hint';
-  hint.textContent = t('delete_hint', 'Оригинал останется в истории приложения.');
+  hint.textContent = t('delete_hint');
   const buttons = document.createElement('div');
   buttons.className = 'buttons';
   const dialog = sheet([title, hint, buttons]);
   const close = () => dismissSheet(dialog);
-  buttons.append(button(t('cancel', 'Отмена'), '', close));
+  buttons.append(button(t('cancel'), '', close));
   buttons.append(
-    button(t('delete', 'Удалить'), 'danger', async () => {
+    button(t('delete'), 'danger', async () => {
       try {
         await call('DELETE', '/messages/' + message.id);
         close();
         await app.sync.tick();
       } catch (error) {
-        toast(t('offline', 'Нет связи с компьютером'));
+        toast(t('offline'));
       }
     })
   );
@@ -734,16 +893,13 @@ function monologMenuSheet(monolog) {
     // Read-only archive: one action, no renaming and no recording.
     const hint = document.createElement('div');
     hint.className = 'hint';
-    hint.textContent = t(
-      'archive_read_only',
-      'В архиве нельзя менять и записывать. Верните монолог, чтобы работать с ним.',
-    );
+    hint.textContent = t('archive_read_only');
     const buttons = document.createElement('div');
     buttons.className = 'buttons';
     const dialog = sheet([title, hint, buttons]);
-    buttons.append(button(t('cancel', 'Отмена'), '', () => dismissSheet(dialog)));
+    buttons.append(button(t('cancel'), '', () => dismissSheet(dialog)));
     buttons.append(
-      button(t('unarchive', 'Из архива'), 'primary', async () => {
+      button(t('unarchive'), 'primary', async () => {
         try {
           await call('POST', '/monologues/' + monolog.id + '/archive', { archived: false });
           await app.cache.setArchived(monolog.id, false);
@@ -753,7 +909,7 @@ function monologMenuSheet(monolog) {
           await renderMonologs();
           if (history.state && history.state.view === 'monolog') history.back();
         } catch (error) {
-          toast(t('offline', 'Нет связи с компьютером'));
+          toast(t('offline'));
         }
       }),
     );
@@ -774,9 +930,9 @@ function monologMenuSheet(monolog) {
   second.className = 'buttons';
   const dialog = sheet([title, input, buttons, second]);
   const close = () => dismissSheet(dialog);
-  buttons.append(button(t('cancel', 'Отмена'), '', close));
+  buttons.append(button(t('cancel'), '', close));
   buttons.append(
-    button(t('save', 'Сохранить'), 'primary', async () => {
+    button(t('save'), 'primary', async () => {
       const name = input.value.trim();
       if (!name || name === monolog.name) {
         close();
@@ -800,7 +956,7 @@ function monologMenuSheet(monolog) {
     // in the archive a monolog can only be pulled out of it.
     const inArchive = app.archived;
     second.append(
-      button(inArchive ? t('unarchive', 'Из архива') : t('archive', 'В архив'), '', async () => {
+      button(inArchive ? t('unarchive') : t('archive'), '', async () => {
         try {
           await call('POST', '/monologues/' + monolog.id + '/archive', {
             archived: !inArchive,
@@ -814,7 +970,7 @@ function monologMenuSheet(monolog) {
           await renderMonologs();
           if (history.state && history.state.view === 'monolog') history.back();
         } catch (error) {
-          toast(t('offline', 'Нет связи с компьютером'));
+          toast(t('offline'));
         }
       })
     );
@@ -823,14 +979,14 @@ function monologMenuSheet(monolog) {
 
 function createMonologSheet() {
   const title = document.createElement('h2');
-  title.textContent = t('new_monolog', '+ Новый монолог');
+  title.textContent = t('new_monolog');
   // A textarea, not an input: Chrome offers the address book, bank cards and
   // passwords over a text input no matter what `autocomplete` says. The edit
   // sheet (a textarea) never showed those buttons — same field here.
   const input = document.createElement('textarea');
   input.rows = 1;
   input.className = 'name';
-  input.placeholder = t('monolog_name', 'Название монолога');
+  input.placeholder = t('monolog_name');
   input.autocomplete = 'off';
   input.spellcheck = false;
   input.setAttribute('autocapitalize', 'sentences');
@@ -839,9 +995,9 @@ function createMonologSheet() {
   buttons.className = 'buttons';
   const dialog = sheet([title, input, buttons]);
   const close = () => dismissSheet(dialog);
-  buttons.append(button(t('cancel', 'Отмена'), '', close));
+  buttons.append(button(t('cancel'), '', close));
   buttons.append(
-    button(t('create', 'Создать'), 'primary', async () => {
+    button(t('create'), 'primary', async () => {
       const name = input.value.trim();
       if (!name) return;
       try {
@@ -869,7 +1025,7 @@ async function retryMessage(message) {
     await call('POST', '/messages/' + message.id + '/retry');
     await app.sync.tick();
   } catch (error) {
-    toast(t('offline', 'Нет связи с компьютером'));
+    toast(t('offline'));
   }
 }
 
@@ -906,8 +1062,8 @@ function updateComposer() {
     const show = Boolean(take) && !here;
     bar.hidden = !show;
     if (show) {
-      el('rec-bar-text').textContent = t('recording', 'Идёт запись');
-      el('rec-bar-open').textContent = t('open', 'Открыть');
+      el('rec-bar-text').textContent = t('recording');
+      el('rec-bar-open').textContent = t('open');
     }
   }
   // Violet means "the computer is getting this". While it cannot be reached
@@ -919,14 +1075,14 @@ function updateComposer() {
   button.disabled = !app.monolog;
   el('rec-title').textContent = recording
     ? app.reachable
-      ? t('recording', 'Идёт запись')
-      : t('recording_offline', 'Запись без связи')
-    : t('start_record', 'Нажмите, чтобы начать');
+      ? t('recording')
+      : t('recording_offline')
+    : t('start_record');
   el('rec-sub').textContent = recording
     ? app.reachable
-      ? t('stop_hint', 'Нажмите, чтобы остановить')
-      : t('record_offline', 'Нет связи — запись сохранится, расшифровка после подключения')
-    : t('dictate_hint', 'Диктуйте в монолог');
+      ? t('stop_hint')
+      : t('record_offline')
+    : t('dictate_hint');
 }
 
 /// The recorder: microphone → 16 kHz mono → PCM16 chunks → IndexedDB → server.
@@ -949,7 +1105,7 @@ async function startRecording() {
     });
   } catch (error) {
     await app.outbox.remove(take.localId);
-    toast(t('mic_denied', 'Нет доступа к микрофону'));
+    toast(t('mic_denied'));
     return;
   }
   const context = new AudioContext();
@@ -1079,7 +1235,7 @@ function tick() {
   el('timer').textContent = clock;
   const barText = el('rec-bar-text');
   if (barText && !el('rec-bar').hidden) {
-    barText.textContent = t('recording', 'Идёт запись') + ' · ' + clock;
+    barText.textContent = t('recording') + ' · ' + clock;
   }
   setTimeout(tick, 500);
 }
@@ -1118,9 +1274,9 @@ function refreshInstallEntry() {
 
 function setupInstall() {
   const link = el('to-install');
-  if (link) link.textContent = t('install_app', 'Установить приложение');
+  if (link) link.textContent = t('install_app');
   const button = el('install');
-  button.textContent = t('install', 'Добавить на главный экран');
+  button.textContent = t('install');
   refreshInstallEntry();
   try {
     const media = window.matchMedia('(display-mode: standalone)');
@@ -1173,7 +1329,7 @@ async function checkForUpdate() {
     button.hidden = true;
     return;
   }
-  button.textContent = t('update_app', 'Обновить');
+  button.textContent = t('update_app');
   button.hidden = false;
   sessionStorage.setItem('vb-seen-version', served);
   const alreadyTried = sessionStorage.getItem('vb-tried-version');
@@ -1372,7 +1528,7 @@ async function boot() {
       checkForUpdate();
     }
   });
-  window.addEventListener('offline', () => toast(t('offline', 'Нет связи с компьютером')));
+  window.addEventListener('offline', () => toast(t('offline')));
   setupInstall();
   app.loop.start();
   if (offline) offlineNote();
@@ -1389,7 +1545,7 @@ setTimeout(() => {
   try {
     if (!el('app').hidden || !el('pair-error').hidden) return;
     trace('boot-watchdog');
-    header(t('monologs', 'Монологи'), {});
+    header(t('monologs'), {});
     drawMonologs([], []);
     offlineNote();
   } catch (error) {
@@ -1408,7 +1564,7 @@ window.addEventListener('unhandledrejection', (event) => {
 });
 // If nothing managed to render at all, say so instead of showing white.
 setTimeout(() => {
-  if (el('app').hidden && el('pair-error').hidden) fail(t('cannot_reach', 'Компьютер недоступен.'));
+  if (el('app').hidden && el('pair-error').hidden) fail(t('cannot_reach'));
 }, 6000);
 
 boot().catch((error) => fail(reason(error)));

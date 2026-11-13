@@ -39,6 +39,32 @@ export function dayKey(recorded) {
  * Nothing is dropped: a message with an unreadable timestamp goes to its own
  * monolog at the end rather than disappearing from the phone.
  */
+/**
+ * Which way a finger is going, once it has gone far enough. A vertical move is
+ * a scroll, not a swipe; a short diagonal move is still a tap.
+ */
+export function swipeDirection(dx, dy, threshold = 72) {
+  if (Math.abs(dx) < threshold || Math.abs(dx) <= Math.abs(dy)) return null;
+  return dx < 0 ? 'left' : 'right';
+}
+
+/** The message the microphone is dictating into right now, if any. */
+export function recordingMessage(recording, messageId) {
+  const remote = recording && recording.take && recording.take.remote;
+  return Boolean(remote) && remote === messageId;
+}
+
+/**
+ * Is this card shown in full? The take being recorded is always open, even
+ * while every other card is closed and even after the person opened a long
+ * older message.
+ */
+export function messageExpanded(recording, messageId, expandedId) {
+  if (recordingMessage(recording, messageId)) return true;
+  if (recording) return false;
+  return expandedId === messageId;
+}
+
 export function buildFeed(messages) {
   const rows = [];
   let current = null;

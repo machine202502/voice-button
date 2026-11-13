@@ -172,6 +172,34 @@ mod tests {
     }
 
     #[test]
+    fn every_source_is_above_telegram() {
+        let now = Instant::now();
+        for priority in [Priority::Phone, Priority::File, Priority::Api, Priority::User] {
+            let state = with_waiters(
+                vec![
+                    waiter(Priority::Telegram, 0, now),
+                    waiter(priority, 1, now),
+                ],
+                0,
+            );
+            assert_eq!(pick(&state, now), Some(1), "{priority:?} must win");
+        }
+    }
+
+    #[test]
+    fn the_phone_is_above_telegram() {
+        let now = Instant::now();
+        let state = with_waiters(
+            vec![
+                waiter(Priority::Telegram, 0, now),
+                waiter(Priority::Phone, 1, now),
+            ],
+            0,
+        );
+        assert_eq!(pick(&state, now), Some(1));
+    }
+
+    #[test]
     fn equal_priorities_keep_their_arrival_order() {
         let now = Instant::now();
         let state = with_waiters(

@@ -50,6 +50,19 @@ pub fn tr(key: &str) -> String {
     }
 }
 
+/// Translate one key in a named catalog, regardless of the active language.
+/// Used for Telegram command descriptions, which are registered for every
+/// supported language at once.
+pub fn tr_lang(code: &str, key: &str) -> String {
+    let guard = catalogs().read().unwrap();
+    guard
+        .iter()
+        .find(|catalog| catalog.code == code)
+        .and_then(|catalog| catalog.strings.get(key))
+        .cloned()
+        .unwrap_or_else(|| key.to_string())
+}
+
 /// Translate and substitute `{name}` placeholders.
 pub fn trf(key: &str, args: &[(&str, &str)]) -> String {
     let mut text = tr(key);
@@ -160,6 +173,23 @@ pub fn active_code() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_named_catalog_can_be_read_without_changing_the_active_one() {
+        let dir = std::env::temp_dir().join(format!("vb-i18n-lang-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("ru.json"),
+            r#"{"code":"ru","name":"Русский","strings":{"Start the bot":"Запустить бота"}}"#,
+        )
+        .unwrap();
+        *catalogs().write().unwrap() = load_catalogs(&[dir.clone()]);
+        assert_eq!(tr_lang("ru", "Start the bot"), "Запустить бота");
+        assert_eq!(tr_lang("en", "Start the bot"), "Start the bot");
+        assert_eq!(tr_lang("ru", "missing"), "missing");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn missing_translations_fall_back_to_the_english_key() {

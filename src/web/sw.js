@@ -5,7 +5,7 @@
 // answered with the HTML page. Returning `index.html` for `js/app.js` made the
 // browser refuse the module ("text/html") and the app showed a black square.
 
-const SHELL = 'voice-button-shell-v24';
+const SHELL = 'voice-button-shell-v30';
 const FILES = [
   './',
   'css/styles.css',
@@ -26,6 +26,10 @@ const FILES = [
   'manifest.en.webmanifest',
   'manifest.ru.webmanifest',
   'manifest.zh.webmanifest',
+  'lang/index.json',
+  'lang/install.en.json',
+  'lang/install.ru.json',
+  'lang/install.zh.json',
   'lang/en.json',
   'lang/ru.json',
   'lang/zh.json',

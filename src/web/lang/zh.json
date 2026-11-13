@@ -70,5 +70,8 @@
   "expand": "展开",
   "collapse": "收起",
   "open": "打开",
-  "archive_read_only": "归档中的独白不能修改或录音，请先移出归档。"
+  "archive_read_only": "归档中的独白不能修改或录音，请先移出归档。",
+  "update_app": "更新",
+  "back": "返回",
+  "record": "录音"
 }

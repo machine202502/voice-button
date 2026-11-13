@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::config::AppDirs;
+use crate::i18n::{tr, trf};
 use crate::state::{Shared, Status};
 
 const MAX_FILE: u64 = 20 * 1024 * 1024;
@@ -351,6 +352,37 @@ impl Client {
         )?;
         Ok(())
     }
+
+    /// Put exactly two commands in Telegram's menu. Each supported interface
+    /// language gets its own descriptions; English is the default for every
+    /// other Telegram language.
+    fn set_commands(&self) -> Result<()> {
+        let commands = |code: &str| {
+            json!([
+                {
+                    "command": "start",
+                    "description": crate::i18n::tr_lang(code, "Start the bot"),
+                },
+                {
+                    "command": "status",
+                    "description": crate::i18n::tr_lang(code, "Status: file, stage and queue"),
+                },
+            ])
+        };
+        self.call("setMyCommands", &json!({ "commands": commands("en") }))?;
+        // Every catalog in `locales/` gets its own description; an unknown
+        // language keeps the English default.
+        for (code, _) in crate::i18n::available() {
+            self.call(
+                "setMyCommands",
+                &json!({
+                    "commands": commands(&code),
+                    "language_code": code,
+                }),
+            )?;
+        }
+        Ok(())
+    }
 }
 
 // -------------------------------------------------------------------- state
@@ -370,15 +402,6 @@ pub struct ChatEntry {
     pub text: String,
     #[serde(default)]
     pub error: Option<String>,
-}
-
-impl ChatEntry {
-    pub fn link(&self) -> String {
-        format!(
-            "tg://openmessage?chat_id={}&message_id={}",
-            self.chat_id, self.message_id
-        )
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -501,12 +524,12 @@ pub fn status_text(dirs: &AppDirs) -> String {
 
 fn status_of(state: &TelegramState) -> String {
     let Some(job) = state.current.as_ref().or_else(|| state.queue.front()) else {
-        return "Очередь пуста.".to_string();
+        return tr("Queue is empty.");
     };
     let place = if state.current.is_some() {
-        "сейчас".to_string()
+        tr("now")
     } else {
-        format!("в очереди: {}", state.queue.len())
+        trf("in queue: {count}", &[("count", &state.queue.len().to_string())])
     };
     let percent = if job.seconds > 0.0 {
         (job.done_seconds / job.seconds * 100.0).clamp(0.0, 100.0)
@@ -521,44 +544,67 @@ fn status_of(state: &TelegramState) -> String {
     let eta = match (started, job.done_seconds) {
         (Some(elapsed), done) if done > 0.5 && elapsed > 0 => {
             let speed = done / elapsed as f32;
-            format!("{:.0} с", remaining / speed.max(0.05))
+            format!("{:.0} {}", remaining / speed.max(0.05), tr("s"))
         }
         _ => "—".to_string(),
     };
-    format!(
-        "Файл: {}\nЭтап: {}\nГотово: {:.1} / {:.1} с ({:.0}%)\nПозиция: {}\nETA: {}\n{}",
-        if job.file_name.is_empty() {
-            "без имени"
-        } else {
-            &job.file_name
-        },
-        if job.stage.is_empty() {
-            "ожидает"
-        } else {
-            &job.stage
-        },
-        job.done_seconds,
-        job.seconds,
-        percent,
-        place,
-        eta,
-        job.error
-            .as_ref()
-            .map(|error| format!("Ошибка: {error}"))
-            .unwrap_or_else(|| "Ошибка: —".to_string())
+    let file = if job.file_name.is_empty() {
+        tr("unnamed")
+    } else {
+        job.file_name.clone()
+    };
+    let stage = if job.stage.is_empty() {
+        tr("queued")
+    } else {
+        tr(&job.stage)
+    };
+    let error = job
+        .error
+        .as_ref()
+        .map(|error| trf("Error: {error}", &[("error", error)]))
+        .unwrap_or_else(|| tr("No error."));
+    trf(
+        "File: {file}\nStage: {stage}\nDone: {done} / {total} s ({percent}%)\nPosition: {place}\nETA: {eta}\n{error}",
+        &[
+            ("file", &file),
+            ("stage", &stage),
+            ("done", &format!("{:.1}", job.done_seconds)),
+            ("total", &format!("{:.1}", job.seconds)),
+            ("percent", &format!("{:.0}", percent)),
+            ("place", &place),
+            ("eta", &eta),
+            ("error", &error),
+        ],
     )
 }
 
 // --------------------------------------------------------------------- bot
 
+/// The tray icon turns violet while Telegram works, exactly like the phone.
+fn set_background(shared: &Arc<Shared>, active: bool) {
+    let mut data = shared.lock();
+    if active {
+        data.background.insert(crate::state::BackgroundJob::Telegram);
+    } else {
+        data.background.remove(&crate::state::BackgroundJob::Telegram);
+    }
+}
+
+fn proxy_setting(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
 fn settings(dirs: &AppDirs, shared: &Arc<Shared>) -> (bool, String, String, String) {
     let config = shared.lock().config.clone();
     let secure = read_secure(dirs);
-    let proxy = if config.telegram_proxy.trim().is_empty() {
-        secure.proxy
-    } else {
-        config.telegram_proxy
-    };
+    // Empty means direct. The old secure-file copy of the proxy is not used:
+    // a stored value must be visible in Settings to be in effect.
+    let proxy = proxy_setting(&config.telegram_proxy).unwrap_or_default();
     let base = if config.telegram_api_base.trim().is_empty() {
         API_REAL.to_string()
     } else {
@@ -577,6 +623,7 @@ pub fn spawn(dirs: AppDirs, shared: Arc<Shared>, asr: Arc<crate::asr_engine::Eng
     let poll_state = state.clone();
     std::thread::spawn(move || {
         let mut last_problem = String::new();
+        let mut commands_for = String::new();
         loop {
             // The settings window cannot write the token itself: it leaves a
             // request, and the daemon stores it encrypted for this user.
@@ -597,6 +644,7 @@ pub fn spawn(dirs: AppDirs, shared: Arc<Shared>, asr: Arc<crate::asr_engine::Eng
                 std::thread::sleep(Duration::from_millis(800));
                 continue;
             }
+            let commands_key = format!("{token}|{}", crate::i18n::active_code());
             let client = match Client::new(token, &proxy, &base) {
                 Ok(client) => client,
                 Err(error) => {
@@ -611,6 +659,14 @@ pub fn spawn(dirs: AppDirs, shared: Arc<Shared>, asr: Arc<crate::asr_engine::Eng
                     continue;
                 }
             };
+            if commands_for != commands_key {
+                match client.set_commands() {
+                    Ok(()) => commands_for = commands_key.clone(),
+                    Err(error) => {
+                        crate::log::log(&format!("telegram: cannot set commands: {error:#}"));
+                    }
+                }
+            }
             let offset = poll_state.lock().unwrap().offset;
             match client.get_updates(offset) {
                 Ok(updates) => {
@@ -676,8 +732,10 @@ pub fn spawn(dirs: AppDirs, shared: Arc<Shared>, asr: Arc<crate::asr_engine::Eng
                 continue;
             }
         };
+        set_background(&shared, true);
         let outcome = process_job(&client, &dirs, &shared, &asr, &state, &job);
         finish_job(&client, &dirs, &state, &job, outcome);
+        set_background(&shared, false);
     });
 }
 
@@ -714,10 +772,10 @@ fn handle_update(
             client.send_text(
                 chat_id,
                 message_id,
-                "Я на связи. Пришлите голосовое, аудио, видео, видеокружок или файл с аудио — верну текст сюда же. /status покажет очередь.",
+                &tr("I am here. Send a voice note, audio, video, video note or a file with audio — I will return the text here. /status shows the queue."),
             )?;
         } else if owner == Some(from) {
-            client.send_text(chat_id, message_id, "Бот уже подключён к вам.")?;
+            client.send_text(chat_id, message_id, &tr("The bot is already connected to you."))?;
         }
         return Ok(());
     }
@@ -736,7 +794,7 @@ fn handle_update(
         client.send_text(
             chat_id,
             message_id,
-            "Пришлите голосовое, аудио, видео, видеокружок или файл с аудио.",
+            &tr("Send a voice note, audio, video, video note or a file with audio."),
         )?;
         return Ok(());
     };
@@ -744,9 +802,9 @@ fn handle_update(
         client.send_text(
             chat_id,
             message_id,
-            &format!(
-                "Файл больше 20 МБ ({} МБ). Telegram отдаёт ботам не больше 20 МБ; пришлите файл короче или разбейте его.",
-                media.size / (1024 * 1024)
+            &trf(
+                "File is larger than 20 MB ({size} MB). Telegram gives bots at most 20 MB; send a shorter file or split it.",
+                &[("size", &(media.size / (1024 * 1024)).to_string())],
             ),
         )?;
         return Ok(());
@@ -807,7 +865,7 @@ fn extract_media(message: &Value) -> Option<Job> {
             size,
             seconds: duration,
             done_seconds: 0.0,
-            stage: "ожидает".to_string(),
+            stage: "queued".to_string(),
             progress: 0.0,
             text: String::new(),
             error: None,
@@ -831,7 +889,7 @@ fn process_job(
     {
         let mut state = state.lock().unwrap();
         if let Some(current) = state.current.as_mut() {
-            current.stage = "скачивание".to_string();
+            current.stage = "downloading".to_string();
         }
         save_state(dirs, &state);
     }
@@ -855,7 +913,7 @@ fn process_job(
         let mut state = state.lock().unwrap();
         if let Some(current) = state.current.as_mut() {
             current.seconds = seconds;
-            current.stage = "расшифровка".to_string();
+            current.stage = "transcribing".to_string();
         }
         save_state(dirs, &state);
     }
@@ -871,19 +929,26 @@ fn process_job(
     let step = (SEGMENT_SECONDS * crate::telegram_media::TARGET_RATE as f32) as usize;
     let mut text = String::new();
     let mut done = 0usize;
+    let model = {
+        let data = shared.lock();
+        crate::transcribe::source_model(
+            data.config.telegram_model.trim(),
+            &data.config.telegram_model_folder,
+        )
+    };
     for chunk in samples.chunks(step.max(1)) {
         wait_for_engine(shared, state, dirs)?;
         {
             let mut state = state.lock().unwrap();
             if let Some(current) = state.current.as_mut() {
-                current.stage = "расшифровка".to_string();
+                current.stage = "transcribing".to_string();
             }
             save_state(dirs, &state);
         }
         let reply = asr
             .decode(
                 crate::asr_engine::Priority::Telegram,
-                "",
+                &model,
                 chunk,
                 crate::telegram_media::TARGET_RATE,
             )
@@ -912,6 +977,22 @@ fn process_job(
     Ok(text)
 }
 
+/// The Telegram worker may take the recognizer only when nobody above it is
+/// using it. Its own violet background mark is not a reason to wait.
+fn telegram_may_decode(data: &crate::state::Data) -> bool {
+    data.config.telegram_enabled
+        && data.status == Status::Idle
+        && data.session.is_none()
+        && data.stream.is_none()
+        && !data.recovering
+        && !data.background_has(crate::state::BackgroundJob::Phone)
+        && data
+            .file
+            .as_ref()
+            .map(|file| !file.running && file.total_seconds > 0.0)
+            .unwrap_or(true)
+}
+
 fn wait_for_engine(
     shared: &Arc<Shared>,
     state: &Arc<Mutex<TelegramState>>,
@@ -920,13 +1001,7 @@ fn wait_for_engine(
     loop {
         {
             let data = shared.lock();
-            if data.config.telegram_enabled
-                && data.status == Status::Idle
-                && data.session.is_none()
-                && data.stream.is_none()
-                && !data.recovering
-                && !data.background_active()
-            {
+            if telegram_may_decode(&data) {
                 return Ok(());
             }
             if !data.config.telegram_enabled {
@@ -936,7 +1011,7 @@ fn wait_for_engine(
         {
             let mut state = state.lock().unwrap();
             if let Some(current) = state.current.as_mut() {
-                current.stage = "движок занят".to_string();
+                current.stage = "engine busy".to_string();
             }
             save_state(dirs, &state);
         }
@@ -954,16 +1029,19 @@ fn finish_job(
     let at = chrono::Local::now().to_rfc3339();
     let (text, error) = match outcome {
         Ok(text) if !text.trim().is_empty() => (text, None),
-        Ok(_) => ("Речь не распознана.".to_string(), None),
+        Ok(_) => (tr("Bot: speech was not recognised."), None),
         Err(error) => (
-            format!("Не удалось расшифровать: {error:#}"),
+            trf("Bot: could not transcribe: {error}", &[("error", &format!("{error:#}"))]),
             Some(format!("{error:#}")),
         ),
     };
     if error.is_none() {
         let config = crate::config::load_config(&dirs.root);
+        let history_at = chrono::DateTime::parse_from_rfc3339(&at)
+            .map(|time| time.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S").to_string())
+            .unwrap_or_else(|_| at.clone());
         let entry = crate::history::HistoryEntry {
-            at: at.clone(),
+            at: history_at,
             text: text.clone(),
             model: crate::transcribe::selected_id(&config),
             parts: Vec::new(),
@@ -1131,7 +1209,7 @@ mod tests {
         handle_update(&api, &dirs, &state, &start(1, 111, "/start")).unwrap();
         handle_update(&api, &dirs, &state, &voice(2, 111, MAX_FILE + 1)).unwrap();
         assert!(state.lock().unwrap().queue.is_empty());
-        assert!(api.sent().iter().any(|text| text.contains("20 МБ")));
+        assert!(api.sent().iter().any(|text| text.contains("20 MB") || text.contains("20 МБ")));
         let _ = std::fs::remove_dir_all(&dirs.root);
     }
 
@@ -1142,9 +1220,9 @@ mod tests {
         let state = Arc::new(Mutex::new(TelegramState::default()));
         handle_update(&api, &dirs, &state, &start(1, 111, "/start")).unwrap();
         handle_update(&api, &dirs, &state, &start(2, 222, "/status")).unwrap();
-        assert!(!api.sent().iter().any(|text| text.contains("Очередь")));
+        assert!(!api.sent().iter().any(|text| text.contains(&tr("Queue is empty."))));
         handle_update(&api, &dirs, &state, &start(3, 111, "/status")).unwrap();
-        assert!(api.sent().iter().any(|text| text.contains("Очередь")));
+        assert!(api.sent().iter().any(|text| text.contains(&tr("Queue is empty."))));
         let _ = std::fs::remove_dir_all(&dirs.root);
     }
 
@@ -1207,6 +1285,36 @@ mod tests {
 
     #[test]
     #[ignore]
+    fn real_bot_api_registers_the_two_commands() {
+        let dirs = crate::config::AppDirs {
+            root: std::env::var_os("APPDATA")
+                .map(std::path::PathBuf::from)
+                .unwrap()
+                .join("voice-button"),
+            models: std::path::PathBuf::new(),
+        };
+        let secure = read_secure(&dirs);
+        crate::i18n::init(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
+            "ru",
+        );
+        assert_ne!(
+            crate::i18n::tr_lang("ru", "Start the bot"),
+            "Start the bot",
+            "the Russian command description must come from the catalog"
+        );
+        let client = Client::new(
+            secure.token,
+            &secure.proxy,
+            "https://api.telegram.org",
+        )
+        .unwrap();
+        client.set_commands().expect("register start/status");
+        println!("commands registered in ru, en and zh");
+    }
+
+    #[test]
+    #[ignore]
     fn real_bot_api_answers_get_me() {
         let dirs = crate::config::AppDirs {
             root: std::env::var_os("APPDATA")
@@ -1257,6 +1365,226 @@ mod tests {
         assert_eq!(loaded.queue[0].file_name, "pending.ogg");
         reset_owner(&dirs.root);
         assert_eq!(load_state(&dirs).owner, None, "the reset clears the owner");
+        let _ = std::fs::remove_dir_all(&dirs.root);
+    }
+
+    #[test]
+    fn every_media_kind_is_recognised_with_its_name() {
+        let kinds = [
+            ("voice", "voice", "voice.ogg"),
+            ("audio", "audio", "audio.mp3"),
+            ("video", "video", "video.mp4"),
+            ("video_note", "video_note", "voice.ogg"),
+            ("document", "document", "report.wav"),
+        ];
+        for (field, kind, fallback) in kinds {
+            let mut item = json!({
+                "file_id": "id",
+                "file_size": 1234,
+                "duration": 7,
+            });
+            if field == "document" {
+                item["file_name"] = json!(fallback);
+            }
+            let message = json!({ field: item });
+            let job = extract_media(&message).expect("media is recognised");
+            assert_eq!(job.kind, kind);
+            assert_eq!(job.file_id, "id");
+            assert_eq!(job.size, 1234);
+            assert_eq!(job.seconds, 7.0);
+            assert_eq!(job.file_name, fallback);
+        }
+        let text = json!({ "message": { "text": "привет" } });
+        assert!(extract_media(&text).is_none(), "plain text is not media");
+    }
+
+    #[test]
+    fn a_failed_file_is_answered_as_an_error_and_marked_in_the_chat() {
+        let dirs = dirs("error");
+        let api = Fake::new(1000);
+        let state = Arc::new(Mutex::new(TelegramState::default()));
+        let job = Job {
+            update_id: 9,
+            chat_id: 1,
+            message_id: 9,
+            file_id: "f".into(),
+            file_name: "broken.ogg".into(),
+            kind: "voice".into(),
+            size: 1,
+            seconds: 0.0,
+            done_seconds: 0.0,
+            stage: "расшифровка".into(),
+            progress: 0.0,
+            text: String::new(),
+            error: None,
+            received_at: String::new(),
+            started_at: String::new(),
+        };
+        state.lock().unwrap().current = Some(job.clone());
+        finish_job(&api, &dirs, &state, &job, Err(anyhow!("broken container")));
+        assert!(api.sent()[0].contains(tr("Bot: could not transcribe: {error}").split("{error}").next().unwrap()));
+        assert_eq!(api.reactions.lock().unwrap()[0], (9, "✅".to_string()));
+        let entry = state.lock().unwrap().chat[0].clone();
+        assert!(entry.error.is_some());
+        assert!(entry.text.contains("broken container"));
+        let _ = std::fs::remove_dir_all(&dirs.root);
+    }
+
+    #[test]
+    fn silence_is_answered_not_left_unanswered() {
+        let dirs = dirs("silence");
+        let api = Fake::new(1000);
+        let state = Arc::new(Mutex::new(TelegramState::default()));
+        let job = Job {
+            update_id: 10,
+            chat_id: 1,
+            message_id: 10,
+            file_id: "f".into(),
+            file_name: "silence.ogg".into(),
+            kind: "voice".into(),
+            size: 1,
+            seconds: 1.0,
+            done_seconds: 1.0,
+            stage: "расшифровка".into(),
+            progress: 100.0,
+            text: String::new(),
+            error: None,
+            received_at: String::new(),
+            started_at: String::new(),
+        };
+        finish_job(&api, &dirs, &state, &job, Ok(String::new()));
+        assert_eq!(api.sent()[0], tr("Bot: speech was not recognised."));
+        let _ = std::fs::remove_dir_all(&dirs.root);
+    }
+
+    #[test]
+    fn the_telegram_background_is_violet_and_does_not_hide_the_phone() {
+        let dirs = dirs("background");
+        let mut config = crate::config::Config::default();
+        config.telegram_enabled = true;
+        let shared = Arc::new(Shared::new(config, Vec::new()));
+        set_background(&shared, true);
+        assert!(shared.lock().background_active(), "the tray must be violet");
+        assert!(
+            shared
+                .lock()
+                .background_has(crate::state::BackgroundJob::Telegram)
+        );
+        shared
+            .lock()
+            .background
+            .insert(crate::state::BackgroundJob::Phone);
+        set_background(&shared, false);
+        assert!(
+            shared.lock().background_active(),
+            "clearing Telegram must not clear the phone"
+        );
+        shared
+            .lock()
+            .background
+            .remove(&crate::state::BackgroundJob::Phone);
+        assert!(!shared.lock().background_active());
+        let _ = std::fs::remove_dir_all(&dirs.root);
+    }
+
+    #[test]
+    fn wait_for_engine_sleeps_through_a_recording_and_resumes() {
+        let dirs = dirs("wait");
+        let mut config = crate::config::Config::default();
+        config.telegram_enabled = true;
+        let shared = Arc::new(Shared::new(config, Vec::new()));
+        shared.lock().status = Status::Recording;
+        let state = Arc::new(Mutex::new(TelegramState::default()));
+        let (done, finished) = std::sync::mpsc::channel();
+        let thread_shared = shared.clone();
+        let thread_state = state.clone();
+        let thread_dirs = dirs.clone();
+        std::thread::spawn(move || {
+            let _ = wait_for_engine(&thread_shared, &thread_state, &thread_dirs);
+            let _ = done.send(());
+        });
+        assert!(
+            finished.recv_timeout(Duration::from_millis(300)).is_err(),
+            "Telegram must wait while the microphone holds the engine"
+        );
+        shared.lock().status = Status::Idle;
+        finished
+            .recv_timeout(Duration::from_secs(3))
+            .expect("Telegram resumes when the engine is free");
+        let _ = std::fs::remove_dir_all(&dirs.root);
+    }
+
+    #[test]
+    fn a_proxy_is_optional() {
+        assert!(proxy_setting("").is_none());
+        assert!(proxy_setting("   ").is_none());
+        assert_eq!(
+            proxy_setting("127.0.0.1:10408").as_deref(),
+            Some("127.0.0.1:10408")
+        );
+    }
+
+    #[test]
+    fn telegram_pauses_when_the_phone_or_the_microphone_needs_the_engine() {
+        let dirs = dirs("pause");
+        let mut config = crate::config::Config::default();
+        config.telegram_enabled = true;
+        let shared = Arc::new(Shared::new(config, Vec::new()));
+        assert!(telegram_may_decode(&shared.lock()), "idle means Telegram may run");
+        for busy in [
+            Status::Recording,
+            Status::Transcribing,
+            Status::File,
+            Status::Recovering,
+            Status::NoModel,
+        ] {
+            shared.lock().status = busy;
+            assert!(
+                !telegram_may_decode(&shared.lock()),
+                "status {busy:?} pauses Telegram"
+            );
+        }
+        shared.lock().status = Status::Idle;
+        shared
+            .lock()
+            .background
+            .insert(crate::state::BackgroundJob::Phone);
+        assert!(!telegram_may_decode(&shared.lock()), "the phone pauses Telegram");
+        shared
+            .lock()
+            .background
+            .remove(&crate::state::BackgroundJob::Phone);
+        shared
+            .lock()
+            .background
+            .insert(crate::state::BackgroundJob::Telegram);
+        assert!(
+            telegram_may_decode(&shared.lock()),
+            "Telegram's own violet mark must not pause itself"
+        );
+        shared.lock().recovering = true;
+        assert!(!telegram_may_decode(&shared.lock()), "recovery pauses Telegram");
+        shared.lock().recovering = false;
+        shared.lock().file = Some(crate::ipc::FileSnapshot {
+            running: true,
+            total_seconds: 120.0,
+            ..Default::default()
+        });
+        assert!(!telegram_may_decode(&shared.lock()), "an imported file pauses Telegram");
+        shared.lock().file = None;
+        shared.lock().stream = Some(crate::state::StreamSession {
+            id: 1,
+            model: None,
+            sample_rate: 16_000,
+            buffer: Arc::new(Mutex::new(Vec::new())),
+            received_samples: 0,
+            live_text: String::new(),
+            stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
+        assert!(!telegram_may_decode(&shared.lock()), "an API stream pauses Telegram");
+        shared.lock().stream = None;
+        shared.lock().config.telegram_enabled = false;
+        assert!(!telegram_may_decode(&shared.lock()), "a disabled bot does nothing");
         let _ = std::fs::remove_dir_all(&dirs.root);
     }
 

@@ -130,6 +130,13 @@ fn build(model: &str, dirs: &config::AppDirs) -> anyhow::Result<Box<dyn Transcri
         let cfg = config::load_config(&dirs.root);
         return transcribe::resolve(&cfg, dirs);
     }
+    if let Some(path) = model.strip_prefix("custom:") {
+        let path = std::path::Path::new(path);
+        if !path.exists() {
+            anyhow::bail!("custom model path does not exist: {}", path.display());
+        }
+        return transcribe::resolve_custom(path, dirs);
+    }
     let choice = ModelChoice::parse(model)
         .ok_or_else(|| anyhow::anyhow!("unknown model id '{model}'"))?;
     transcribe::resolve_choice(&choice, dirs)

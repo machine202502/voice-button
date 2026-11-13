@@ -6,7 +6,7 @@
 // against the cases that happen in real life: a late upload from an offline
 // phone, two takes in the same minute, and a message with a broken timestamp.
 
-import { sortAscending, dayKey, buildFeed } from '../src/web/js/chat.mjs';
+import { sortAscending, dayKey, buildFeed, swipeDirection, recordingMessage, messageExpanded } from '../src/web/js/chat.mjs';
 
 let failures = 0;
 let checks = 0;
@@ -72,6 +72,36 @@ check(dayKey('2026-11-12T10:00:00+05:00') === '2026-11-12', 'the day is taken fr
 
 console.log('an empty list stays empty');
 check(buildFeed([]).length === 0, 'no rows for no messages');
+
+// Swiping: far enough horizontally, and never a vertical scroll.
+check(swipeDirection(-90, 4) === 'left', 'a left swipe is recognised');
+check(swipeDirection(90, 4) === 'right', 'a right swipe is recognised');
+check(swipeDirection(-40, 2) === null, 'a short move stays a tap');
+check(swipeDirection(-90, 120) === null, 'a vertical scroll is not a swipe');
+check(swipeDirection(4, 90) === null, 'a downward scroll is not a swipe');
+
+// The message being dictated into is always the fully expanded one.
+check(
+  recordingMessage({ take: { remote: 21 } }, 21),
+  'the live message is recognised while recording',
+);
+check(!recordingMessage({ take: { remote: 21 } }, 22), 'another message is not live');
+check(!recordingMessage({ take: {} }, 21), 'a take without a remote message is not live');
+check(!recordingMessage(null, 21), 'no recording means no live message');
+check(
+  messageExpanded({ take: { remote: 21 } }, 21, null),
+  'the recording card is expanded even if another card was open',
+);
+check(
+  messageExpanded({ take: { remote: 21 } }, 21, 99),
+  'the recording card stays expanded when a different card was open',
+);
+check(
+  !messageExpanded({ take: { remote: 21 } }, 22, 22),
+  'another card stays closed while recording',
+);
+check(messageExpanded(null, 21, 21), 'without recording the opened card stays open');
+check(!messageExpanded(null, 21, 22), 'only the chosen message opens');
 
 console.log('equal timestamps keep a stable order');
 const tied = buildFeed([

@@ -100,9 +100,15 @@ impl HistoryRow {
             .collect()
     }
 
+    fn display_at(at: &str) -> String {
+        chrono::DateTime::parse_from_rfc3339(at)
+            .map(|time| time.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S").to_string())
+            .unwrap_or_else(|_| at.to_string())
+    }
+
     fn new(entry: &HistoryEntry, offset: u64, len: usize) -> Self {
         Self {
-            at: entry.at.clone(),
+            at: Self::display_at(&entry.at),
             preview: Self::preview_of(&entry.text),
             model: entry.model.clone(),
             offset,
@@ -119,7 +125,7 @@ impl HistoryRow {
     fn inline(entry: HistoryEntry) -> Self {
         Self {
             preview: Self::preview_of(&entry.text),
-            at: entry.at.clone(),
+            at: Self::display_at(&entry.at),
             model: entry.model.clone(),
             offset: 0,
             len: 0,
@@ -377,6 +383,16 @@ pub fn clear(root: &Path) {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn an_rfc_timestamp_is_shown_like_the_other_history_rows() {
+        let shown = HistoryRow::display_at("2026-11-13T13:54:10.530631300+05:00");
+        assert_eq!(shown.len(), 19, "YYYY-MM-DD HH:MM:SS");
+        assert!(shown.starts_with("2026-11-13 "));
+        assert!(!shown.contains('T'));
+    }
+
     use super::{append, clear, history_path, History, HistoryEntry};
     use std::path::PathBuf;
 

@@ -269,6 +269,9 @@ fn status_json(shared: &Shared) -> serde_json::Value {
         "receivedMs": received_ms,
         "sampleRate": stream.map(|s| s.sample_rate),
         "liveText": live_text,
+        // The same flag that paints the tray violet: a phone, a Telegram file
+        // or another background task is working right now.
+        "background": data.background_active(),
     })
 }
 

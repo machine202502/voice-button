@@ -19,13 +19,15 @@ use crate::state::{Shared, Status};
 
 pub struct AsrDecoder {
     client: Arc<crate::asr_engine::Engine>,
+    shared: Arc<Shared>,
     failures_before_reset: usize,
 }
 
 impl AsrDecoder {
-    pub fn new(client: Arc<crate::asr_engine::Engine>) -> Self {
+    pub fn new(client: Arc<crate::asr_engine::Engine>, shared: Arc<Shared>) -> Self {
         Self {
             client,
+            shared,
             failures_before_reset: 0,
         }
     }
@@ -33,11 +35,18 @@ impl AsrDecoder {
 
 impl Decoder for AsrDecoder {
     fn decode(&mut self, samples: &[f32]) -> Result<Outcome, String> {
+        let model = {
+            let data = self.shared.lock();
+            crate::transcribe::source_model(
+                data.config.phone_model.trim(),
+                &data.config.phone_model_folder,
+            )
+        };
         let reply = self
             .client
             .decode(
                 crate::asr_engine::Priority::Phone,
-                "",
+                &model,
                 samples,
                 crate::session::SAMPLE_RATE,
             )
@@ -115,7 +124,11 @@ mod tests {
         let client = Arc::new(crate::asr_engine::Engine::new(
             std::env::temp_dir().join("vb-no-such-worker.exe"),
         ));
-        let mut decoder = AsrDecoder::new(client);
+        let shared = Arc::new(crate::state::Shared::new(
+            crate::config::Config::default(),
+            Vec::new(),
+        ));
+        let mut decoder = AsrDecoder::new(client, shared);
         let result = decoder.decode(&vec![0.0; 1600]);
         assert!(result.is_err(), "a broken worker must not look like silence");
     }

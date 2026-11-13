@@ -70,5 +70,8 @@
   "expand": "Show all",
   "collapse": "Collapse",
   "open": "Open",
-  "archive_read_only": "An archived monolog cannot be changed or recorded into. Take it out of the archive first."
+  "archive_read_only": "An archived monolog cannot be changed or recorded into. Take it out of the archive first.",
+  "update_app": "Update",
+  "back": "Back",
+  "record": "Record"
 }

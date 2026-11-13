@@ -208,7 +208,7 @@ impl PhoneRuntime {
         let pump_shared = shared;
         let history_root = root.to_path_buf();
         let pump = std::thread::spawn(move || {
-            let mut decoder = AsrDecoder::new(asr);
+            let mut decoder = AsrDecoder::new(asr, pump_shared.clone());
             while flag.load(Ordering::SeqCst) {
                 // Violet means "the engine is decoding the phone's audio", not
                 // "the phone has a take somewhere". While the user at the

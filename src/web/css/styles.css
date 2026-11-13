@@ -115,6 +115,9 @@ header .sub {
 main {
   flex: 1;
   overflow-y: auto;
+  /* A swiped card must not add horizontal overflow: that shows up as a
+     scrollbar stripe at the bottom of the phone. */
+  overflow-x: hidden;
   -webkit-overflow-scrolling: touch;
   padding: 14px 16px 8px;
   display: flex;
@@ -167,7 +170,44 @@ main {
   font-size: 12.5px;
 }
 
+.swipe-row {
+  position: relative;
+  /* No border radius or clipping here: the card keeps its own shadow and its
+     exact previous size. Only the gesture is new. */
+  touch-action: pan-y;
+}
+.swipe-action {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  padding: 0 20px;
+  border-radius: 18px;
+  background: #3a2433;
+  color: #ffb4b4;
+  font-size: 13px;
+  font-weight: 600;
+  opacity: 0;
+  pointer-events: none;
+}
+.swipe-action.out {
+  background: #26361f;
+  color: var(--lime);
+}
+.swipe-row.dragging .monolog-card,
+.swipe-row.leaving .monolog-card {
+  transition: none;
+}
+.swipe-row.leaving .monolog-card {
+  transition: transform .19s ease-out, opacity .19s ease-out;
+}
+.swipe-row .monolog-card {
+  position: relative;
+  width: 100%;
+  will-change: transform;
+}
 .monolog-card {
+  cursor: pointer;
   background: var(--panel);
   border: 1px solid var(--line);
   border-radius: 18px;
@@ -180,13 +220,25 @@ main {
 .monolog-card strong { font-size: 16.5px; font-weight: 600; }
 .monolog-card .when { margin-left: auto; font-size: 12px; color: var(--muted); }
 .monolog-card .last {
-  margin-top: 4px;
-  font-size: 13.5px;
-  color: var(--muted);
+  margin-top: 5px;
+  font-size: 13px;
+  color: #aebcac;
   overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  min-height: 2.9em;
 }
+.monolog-card .more {
+  width: 28px;
+  height: 28px;
+  margin: -4px -6px -4px 4px;
+  border-radius: 8px;
+  color: #91a18e;
+  font-size: 17px;
+  line-height: 1;
+}
+.monolog-card .more:hover { background: rgba(255,255,255,.08); color: var(--ink); }
 .monolog-card .count { font-size: 11.5px; color: #6f7c6c; margin-top: 2px; }
 
 .new-monolog {
@@ -389,7 +441,7 @@ main {
   display: flex;
   flex-direction: column;
   gap: 8px;
-  padding: 8px 16px 0;
+  padding: 8px 16px 8px;
 }
 .notes:empty { display: none; }
 

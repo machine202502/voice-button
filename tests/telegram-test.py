@@ -94,6 +94,11 @@ class FakeBot(BaseHTTPRequestHandler):
             self.server.documents.append(len(body))
             self._json({"ok": True, "result": {"message_id": 1}})
             return
+        if path.endswith("/setMyCommands"):
+            parsed = json.loads(body.decode("utf-8"))
+            self.server.commands.append(parsed)
+            self._json({"ok": True, "result": True})
+            return
         if path.endswith("/setMessageReaction"):
             parsed = json.loads(body.decode("utf-8"))
             self.server.reactions.append(parsed)
@@ -120,6 +125,23 @@ class FakeBot(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
 
+def voice_update(update_id, owner, media):
+    return {
+        "update_id": update_id,
+        "message": {
+            "message_id": update_id,
+            "chat": {"id": owner, "type": "private"},
+            "from": {"id": owner, "is_bot": False},
+            "voice": {
+                "file_id": "voice-%d" % update_id,
+                "file_size": len(media),
+                "duration": 8,
+                "mime_type": "audio/ogg",
+            },
+        },
+    }
+
+
 def read_json(path, attempts=40):
     """The daemon replaces the file atomically; a reader can catch the gap."""
     last = None
@@ -138,6 +160,7 @@ def main():
     server.sent = []
     server.reactions = []
     server.documents = []
+    server.commands = []
     server.media = open(os.path.join(ROOT, "tests", "assets", "voice.opus"), "rb").read()
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -225,6 +248,116 @@ def main():
             any(entry.get("source") == "telegram" for entry in entries),
             "the result is in History with the telegram source",
         )
+
+        e2e.wait_for(
+            lambda: not daemon.local("/api/status").get("background"),
+            timeout=20,
+            what="the violet background to clear after the reply",
+        )
+        check(True, "the tray background clears when Telegram is done")
+
+        # /status answers only the owner and names the queue.
+        server.updates = [
+            {
+                "update_id": 30,
+                "message": {
+                    "message_id": 30,
+                    "chat": {"id": owner, "type": "private"},
+                    "from": {"id": owner, "is_bot": False},
+                    "text": "/status",
+                },
+            }
+        ]
+        e2e.wait_for(
+            lambda: any(item.get("reply_to_message_id") == 30 for item in server.sent),
+            timeout=30,
+            what="the /status reply",
+        )
+        status_reply = [item for item in server.sent if item.get("reply_to_message_id") == 30][-1]
+        status_text = status_reply.get("text", "")
+        print("  status reply:", status_text.replace("\n", " | "))
+        check(
+            any(
+                word in status_text
+                for word in ("Queue", "Очередь", "队列", "File", "Файл", "文件")
+            ),
+            "the /status answer describes the queue",
+        )
+
+        e2e.wait_for(
+            lambda: len(server.commands) >= 4,
+            timeout=20,
+            what="the command menu",
+        )
+        default_menu = server.commands[0]
+        check(
+            [item["command"] for item in default_menu["commands"]] == ["start", "status"],
+            "the bot menu has exactly start and status",
+        )
+        described = {
+            item.get("language_code")
+            for item in server.commands
+            if item.get("language_code")
+        }
+        check(
+            {"ru", "en", "zh"}.issubset(described),
+            "the command menu has descriptions in ru, en and zh",
+        )
+        check(
+            all(
+                len(item["commands"]) == 2
+                and all(command.get("description") for command in item["commands"])
+                for item in server.commands
+            ),
+            "every command has a description",
+        )
+
+        # A recording at the computer pauses Telegram at the segment boundary.
+        session = daemon.take_engine()
+        check(session is not None, "the computer took the engine")
+        server.updates = [voice_update(40, owner, server.media)]
+        e2e.wait_for(
+            lambda: (read_json(state_path).get("current") or {}).get("stage")
+            in ("engine busy", "движок занят"),
+            timeout=30,
+            what="Telegram to report the paused engine",
+        )
+        check(
+            daemon.local("/api/status").get("background") is True,
+            "the violet background is on while Telegram waits",
+        )
+        check(
+            not any(item.get("reply_to_message_id") == 40 for item in server.sent),
+            "nothing is sent while the engine is taken",
+        )
+        daemon.free_engine(session)
+        e2e.wait_for(
+            lambda: any(item.get("reply_to_message_id") == 40 for item in server.sent),
+            timeout=120,
+            what="Telegram to resume after the engine is free",
+        )
+        check(True, "Telegram resumes the paused file")
+        e2e.wait_for(
+            lambda: not daemon.local("/api/status").get("background"),
+            timeout=20,
+            what="the background to clear after the paused file",
+        )
+        check(True, "the violet background clears after the resumed file")
+
+        # An album is several messages: each file is its own job and reply.
+        server.updates = [
+            voice_update(50, owner, server.media),
+            voice_update(51, owner, server.media),
+        ]
+        e2e.wait_for(
+            lambda: all(
+                any(item.get("reply_to_message_id") == message for item in server.sent)
+                for message in (50, 51)
+            ),
+            timeout=180,
+            what="both album files to be answered",
+        )
+        check(True, "an album becomes one job and one reply per file")
     finally:
         daemon.stop()
         server.shutdown()
