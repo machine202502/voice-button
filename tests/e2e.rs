@@ -351,6 +351,8 @@ fn the_api_server_transcribes_the_recording_over_http() {
                     source: Source::Server,
                     state,
                     audio: None,
+                    group: None,
+                    message: None,
                 };
                 if let Ok(row) = voice_button::history::append(&dirs.root, &entry) {
                     shared.lock().history.push_row(row);

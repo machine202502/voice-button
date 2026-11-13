@@ -23,6 +23,9 @@ pub enum Source {
     Server,
     /// An audio file imported by the user.
     File,
+    /// Dictated from the phone: the original text never changes here, the
+    /// phone keeps its own editable copy.
+    Site,
 }
 
 /// Whether the recording behind an entry was transcribed completely.
@@ -62,6 +65,12 @@ pub struct HistoryEntry {
     /// An absolute path to the file that belongs to this entry.
     #[serde(default)]
     pub audio: Option<String>,
+    /// Group of a message dictated from the phone, as it was named then.
+    #[serde(default)]
+    pub group: Option<String>,
+    /// Id of the phone message this entry came from.
+    #[serde(default)]
+    pub message: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -75,6 +84,7 @@ pub struct HistoryRow {
     source: Source,
     state: EntryState,
     audio: Option<String>,
+    group: Option<String>,
     inline_entry: Option<HistoryEntry>,
 }
 
@@ -99,6 +109,7 @@ impl HistoryRow {
             source: entry.source,
             state: entry.state,
             audio: entry.audio.clone(),
+            group: entry.group.clone(),
             inline_entry: None,
         }
     }
@@ -114,6 +125,7 @@ impl HistoryRow {
             source: entry.source,
             state: entry.state,
             audio: entry.audio.clone(),
+            group: entry.group.clone(),
             inline_entry: Some(entry),
         }
     }
@@ -152,6 +164,11 @@ impl HistoryRow {
     /// Audio the user may open because the text is not guaranteed.
     pub fn audio(&self) -> Option<&str> {
         self.audio.as_deref()
+    }
+
+    /// Group of a message dictated from the phone.
+    pub fn group(&self) -> Option<&str> {
+        self.group.as_deref()
     }
 }
 
@@ -383,7 +400,41 @@ mod tests {
             source: super::Source::User,
             state: super::EntryState::Complete,
             audio: None,
+            group: None,
+            message: None,
         }
+    }
+
+    #[test]
+    fn a_phone_message_keeps_its_group_and_original_text() {
+        let root = test_root("history-phone");
+        let mut site = entry(1);
+        site.source = super::Source::Site;
+        site.group = Some("Работа".to_string());
+        site.message = Some(7);
+        append(&root, &site).unwrap();
+        let loaded = History::load(&root);
+        let row = loaded.row(0).expect("one row");
+        assert_eq!(row.source(), super::Source::Site);
+        assert_eq!(row.group(), Some("Работа"));
+        let stored = loaded.entry(0).unwrap();
+        assert_eq!(stored.message, Some(7));
+        assert_eq!(stored.text, site.text);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn entries_without_the_phone_fields_still_load() {
+        let root = test_root("history-legacy");
+        // A line written by 0.5.0: no source override, no group, no message id.
+        let line = r#"{"at":"2026-11-06 00:00:0001","text":"Старая запись","model":"model-1","parts":[],"state":"complete","audio":null}"#;
+        std::fs::write(super::history_path(&root), format!("{line}\n")).unwrap();
+        let loaded = History::load(&root);
+        let row = loaded.row(0).expect("one row");
+        assert_eq!(row.source(), super::Source::User);
+        assert_eq!(row.group(), None);
+        assert_eq!(loaded.entry(0).unwrap().message, None);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

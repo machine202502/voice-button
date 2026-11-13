@@ -19,11 +19,20 @@ fn ui_snapshots_render() {
     let _ = std::fs::remove_dir_all(&out);
     std::fs::create_dir_all(&out).unwrap();
 
-    let status = std::process::Command::new(exe)
+    // Keep the output: when the generator writes nothing, its own words are the
+    // only clue (a missing library, a busy desktop, a data directory that cannot
+    // be opened).
+    let run = std::process::Command::new(exe)
         .env("VB_SNAPSHOT", &out)
-        .status()
+        .output()
         .expect("failed to run voice-button in snapshot mode");
-    assert!(status.success(), "snapshot run exited with {status}");
+    assert!(
+        run.status.success(),
+        "snapshot run exited with {}\nstdout:\n{}\nstderr:\n{}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
 
     for name in [
         "settings.png",
@@ -33,6 +42,8 @@ fn ui_snapshots_render() {
         "about.png",
         "download-progress.png",
         "capture-recording.png",
+        "record.png",
+        "phone.png",
     ] {
         let path = out.join(name);
         let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("missing snapshot {name}: {e}"));

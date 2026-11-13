@@ -200,6 +200,12 @@ if ($MyInvocation.InvocationName -ne '.') {
     # Interface translations are plain files so a language can be added or
     # fixed without rebuilding.
     Copy-Item (Join-Path $Root 'locales') (Join-Path $stage 'locales') -Recurse
+    # The phone page and the network script are part of the product: without
+    # them the phone section has nothing to serve and nothing to open ports. The
+    # sources live in src/web; the installer and the portable build ship them as
+    # site-app, which is where the daemon looks next to its executable.
+    Copy-Item (Join-Path $Root 'src\web') (Join-Path $stage 'site-app') -Recurse
+    Copy-Item (Join-Path $Root 'scripts\net.ps1') (Join-Path $stage 'net.ps1')
     foreach ($dll in @('sherpa-onnx-c-api.dll', 'sherpa-onnx-cxx-api.dll', 'onnxruntime.dll')) {
         Copy-Item (Join-Path $TargetDir "release\$dll") (Join-Path $stage $dll)
     }

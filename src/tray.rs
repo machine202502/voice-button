@@ -21,6 +21,7 @@ pub enum TrayAction {
     /// window that was active when recording started.
     RecordPaste,
     OpenSettings,
+    OpenHistory,
     OpenCapture,
     CopyLast,
     OpenModelsFolder,
@@ -29,6 +30,8 @@ pub enum TrayAction {
 
 pub enum TrayCommand {
     SetStatus(Status),
+    /// A background task is running: the icon is violet and no sound is played.
+    SetBackground(bool),
     /// Replace the tray tooltip with a one-off message.
     Notify(String),
     /// Apply a new global shortcut; `None` disables it.
@@ -174,6 +177,7 @@ fn apply_hotkey(
 /// Menu entries and their ids, rebuilt when the interface language changes.
 struct MenuIds {
     settings: MenuId,
+    history: MenuId,
     capture: MenuId,
     copy_last: MenuId,
     open_folder: MenuId,
@@ -182,16 +186,20 @@ struct MenuIds {
 
 fn build_menu() -> (Menu, MenuIds) {
     let menu = Menu::new();
+    // Everything that was there stays, in this order: the last transcription
+    // first, the folder last, the three everyday actions between them.
     let copy_last = MenuItem::new(tr("Copy last transcription"), true, None);
-    let settings = MenuItem::new(tr("Settings"), true, None);
     let capture = MenuItem::new(tr("Capture"), true, None);
+    let history = MenuItem::new(tr("History"), true, None);
+    let settings = MenuItem::new(tr("Settings"), true, None);
     let open_folder = MenuItem::new(tr("Open models folder"), true, None);
     let separator = PredefinedMenuItem::separator();
     let quit = MenuItem::new(tr("Quit"), true, None);
     menu.append_items(&[
         &copy_last,
-        &settings,
         &capture,
+        &history,
+        &settings,
         &open_folder,
         &separator,
         &quit,
@@ -199,12 +207,54 @@ fn build_menu() -> (Menu, MenuIds) {
     .expect("failed to build tray menu");
     let ids = MenuIds {
         settings: settings.id().clone(),
+        history: history.id().clone(),
         capture: capture.id().clone(),
         copy_last: copy_last.id().clone(),
         open_folder: open_folder.id().clone(),
         quit: quit.id().clone(),
     };
     (menu, ids)
+}
+
+/// Which icon a status asks for. Idle plus background work is a background task
+/// transcribed; anything the user does outranks that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IconKind {
+    Idle,
+    Background,
+    Recording,
+    Transcribing,
+    Recovering,
+    File,
+    Disabled,
+}
+
+fn icon_choice(status: Status, background: bool) -> IconKind {
+    match status {
+        Status::Idle if background => IconKind::Background,
+        Status::Idle => IconKind::Idle,
+        Status::Recording => IconKind::Recording,
+        Status::Transcribing => IconKind::Transcribing,
+        Status::Recovering => IconKind::Recovering,
+        Status::File => IconKind::File,
+        Status::NoModel => IconKind::Disabled,
+    }
+}
+
+fn icon_for(kind: IconKind) -> tray_icon::Icon {
+    match kind {
+        IconKind::Idle => icons::icon_idle(),
+        IconKind::Background => icons::icon_background(),
+        IconKind::Recording => icons::icon_recording(),
+        IconKind::Transcribing => icons::icon_transcribing(),
+        IconKind::Recovering => icons::icon_recovering(),
+        IconKind::File => icons::icon_file(),
+        IconKind::Disabled => icons::icon_disabled(),
+    }
+}
+
+fn status_icon(status: Status, background: bool) -> tray_icon::Icon {
+    icon_for(icon_choice(status, background))
 }
 
 fn tooltip(swap_mouse_buttons: bool) -> String {
@@ -239,6 +289,7 @@ fn run(
     // Blinking blue icon while a crash-interrupted recording is transcribed:
     // a static icon is easy to miss.
     let mut current_status = Status::Idle;
+    let mut background = false;
     let mut blink_at = std::time::Instant::now();
     let mut blink_bright = true;
     apply_hotkey(hotkey_window, HOTKEY_ID, &mut registered, hotkey, "record");
@@ -288,14 +339,7 @@ fn run(
                     current_status = status;
                     blink_at = std::time::Instant::now();
                     blink_bright = true;
-                    let icon = match status {
-                        Status::Idle => icons::icon_idle(),
-                        Status::Recording => icons::icon_recording(),
-                        Status::Transcribing => icons::icon_transcribing(),
-                        Status::Recovering => icons::icon_recovering(),
-                        Status::File => icons::icon_file(),
-                        Status::NoModel => icons::icon_disabled(),
-                    };
+                    let icon = status_icon(status, background);
                     let _ = tray.set_icon(Some(icon));
                     let hint = match status {
                         Status::Recovering => tr("Voice Button - recovering a recording"),
@@ -303,6 +347,11 @@ fn run(
                         _ => tooltip(swap_mouse_buttons),
                     };
                     let _ = tray.set_tooltip(Some(hint));
+                }
+                TrayCommand::SetBackground(active) => {
+                    background = active;
+                    let icon = status_icon(current_status, background);
+                    let _ = tray.set_icon(Some(icon));
                 }
                 TrayCommand::Notify(text) => {
                     let _ = tray.set_tooltip(Some(text));
@@ -389,12 +438,14 @@ fn run(
             }
         }
         for id in poll_menu_ids() {
-            let action = if id == ids.settings {
-                Some(TrayAction::OpenSettings)
+            let action = if id == ids.copy_last {
+                Some(TrayAction::CopyLast)
             } else if id == ids.capture {
                 Some(TrayAction::OpenCapture)
-            } else if id == ids.copy_last {
-                Some(TrayAction::CopyLast)
+            } else if id == ids.history {
+                Some(TrayAction::OpenHistory)
+            } else if id == ids.settings {
+                Some(TrayAction::OpenSettings)
             } else if id == ids.open_folder {
                 Some(TrayAction::OpenModelsFolder)
             } else if id == ids.quit {
@@ -458,4 +509,32 @@ fn poll_menu_ids() -> Vec<MenuId> {
         ids.push(event.id.clone());
     }
     ids
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn background_work_turns_the_icon_violet_only_when_nothing_else_happens() {
+        assert_eq!(icon_choice(Status::Idle, false), IconKind::Idle);
+        assert_eq!(icon_choice(Status::Idle, true), IconKind::Background);
+    }
+
+    #[test]
+    fn a_user_dication_outranks_the_phone() {
+        for status in [
+            Status::Recording,
+            Status::Transcribing,
+            Status::Recovering,
+            Status::File,
+            Status::NoModel,
+        ] {
+            assert_ne!(
+                icon_choice(status, true),
+                IconKind::Background,
+                "{status:?} must keep its own icon while the phone is transcribed"
+            );
+        }
+    }
 }

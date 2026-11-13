@@ -97,6 +97,23 @@ pub struct Config {
     /// language (or English when there is no matching catalog).
     #[serde(default)]
     pub ui_language: String,
+    /// Whether the phone server listens at all.
+    #[serde(default)]
+    pub site_enabled: bool,
+    /// Port the phone connects to.
+    #[serde(default = "default_site_port")]
+    pub site_port: u16,
+    /// Address written into the QR code for use outside the home network; empty
+    /// means "local network only".
+    #[serde(default)]
+    pub site_public_url: String,
+    /// Refuse connections that do not come from the local network.
+    #[serde(default = "default_true")]
+    pub site_lan_only: bool,
+    /// Longest segment the phone's audio is cut into. Shorter segments make the
+    /// microphone answer faster when the owner takes it back.
+    #[serde(default = "default_site_segment_seconds")]
+    pub site_segment_seconds: f32,
 }
 
 /// Shortcuts start unbound: the user picks them in Settings.
@@ -114,6 +131,14 @@ fn default_vad_sensitivity() -> f32 {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_site_port() -> u16 {
+    crate::site::gate::DEFAULT_SITE_PORT
+}
+
+fn default_site_segment_seconds() -> f32 {
+    15.0
 }
 
 impl Default for Config {
@@ -142,6 +167,11 @@ impl Default for Config {
             api_host: default_api_host(),
             api_port: default_api_port(),
             ui_language: String::new(),
+            site_enabled: false,
+            site_port: default_site_port(),
+            site_public_url: String::new(),
+            site_lan_only: true,
+            site_segment_seconds: default_site_segment_seconds(),
         }
     }
 }
@@ -216,7 +246,10 @@ pub struct AppDirs {
 
 pub fn app_dirs() -> AppDirs {
     // Snapshot test runs must not touch the real data directory.
-    let root = if std::env::var("VB_SNAPSHOT").is_ok() {
+    // Tests and the e2e suite point the whole app at a throwaway directory.
+    let root = if let Some(dir) = std::env::var_os("VB_DATA_DIR") {
+        PathBuf::from(dir)
+    } else if std::env::var("VB_SNAPSHOT").is_ok() {
         std::env::temp_dir().join("voice-button-snapshot")
     } else {
         dirs::data_dir()

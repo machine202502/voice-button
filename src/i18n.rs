@@ -151,6 +151,12 @@ pub fn active_name() -> String {
     active().read().unwrap().name.clone()
 }
 
+/// Code of the active catalog ("ru", "en", "zh"). The phone app takes its
+/// language from here: one setting, no second picker.
+pub fn active_code() -> String {
+    active().read().unwrap().code.clone()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

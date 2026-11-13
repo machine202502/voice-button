@@ -55,6 +55,10 @@ Source: "..\NOTICE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\AISOFTWARE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\assets\CREDITS.md"; DestName: "CREDITS.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\locales\*.json"; DestDir: "{app}\locales"; Flags: ignoreversion
+; The phone page and the network script ship with the app: the phone opens the
+; page from this folder, and the script opens the port for it.
+Source: "..\src\web\*"; DestDir: "{app}\site-app"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\scripts\net.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#ThirdParty}"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
@@ -64,6 +68,11 @@ Name: "{autodesktop}\Voice Button"; Filename: "{app}\voice-button.exe"; Paramete
 [Run]
 Filename: "{tmp}\vc_redist.x64.exe"; Parameters: "/install /quiet /norestart"; StatusMsg: "Installing Microsoft Visual C++ Runtime..."; Flags: waituntilterminated; Check: NeedsVCRedist
 Filename: "{app}\voice-button.exe"; Parameters: "--guard"; Description: "Launch Voice Button"; Flags: nowait postinstall skipifsilent
+
+[UninstallRun]
+; Nothing may be left open behind the app: the firewall rule and, if it was
+; created, the router mapping are removed with it.
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\net.ps1"" -Action disable"; Flags: waituntilterminated runhidden; RunOnceId: "RemovePhoneAccess"
 
 [Code]
 function NeedsVCRedist: Boolean;

@@ -395,6 +395,7 @@ fn run(
             _ => crate::history::Source::User,
         },
         audio: None,
+        at: None,
     });
 }
 
@@ -636,6 +637,7 @@ fn run_file(
         dir: None,
         source: crate::history::Source::File,
         audio: Some(path.display().to_string()),
+        at: None,
     });
 }
 

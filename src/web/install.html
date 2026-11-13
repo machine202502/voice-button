@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#111713">
+<title>Voice Button — приложение на телефоне</title>
+<link rel="stylesheet" href="css/styles.css">
+<style>
+  main.sheet-page { max-width: 560px; margin: 0 auto; padding: 18px 16px 40px; }
+  main.sheet-page h1 { font-size: 1.35em; margin-bottom: .5em; }
+  main.sheet-page h2 { font-size: 1.05em; margin: 1.2em 0 .4em; }
+  main.sheet-page p, main.sheet-page li { color: #cfe0c6; line-height: 1.55; }
+  main.sheet-page ol { padding-left: 1.2em; }
+  main.sheet-page li { margin-bottom: .45em; }
+  main.sheet-page code { color: #c7f36b; word-break: break-all; }
+  .big { display: block; text-align: center; background: #c7f36b; color: #17200f; font-weight: 600;
+         border-radius: 14px; padding: 14px; margin: 18px 0; text-decoration: none; }
+  .note { border: 1px solid rgba(255, 189, 98, .4); background: rgba(255, 189, 98, .08);
+          border-radius: 14px; padding: 12px 14px; font-size: 13.5px; color: #ffd39b; }
+  .lang { display: none; }
+  .lang.on { display: block; }
+</style>
+</head>
+<body>
+<main class="sheet-page">
+
+  <div class="lang on" data-lang="ru">
+    <h1>Voice Button как приложение</h1>
+    <p>Один раз установите сертификат на телефон — и страница перестанет ругаться, а браузер позволит поставить её как приложение с иконкой.</p>
+    <a class="big" href="ca.crt" id="download-ru" target="_blank" rel="noopener">Скачать сертификат</a>
+    <p class="note" id="brave-note" hidden>Этот браузер не начинает загрузку сертификата: он блокирует такие файлы. Откройте эту страницу в <b>Chrome</b> — там файл скачивается сразу.</p>
+    <h2>Android</h2>
+    <ol>
+      <li>Скачайте сертификат по кнопке выше — файл окажется в «Загрузках».</li>
+      <li>Настройки → Безопасность → Шифрование и учётные данные → Установить сертификат → <b>Сертификат CA</b> (на Android 12+: Настройки → Безопасность → Другие настройки безопасности → Установка сертификата → Сертификат CA).</li>
+      <li>Выберите скачанный <code>voice-button-ca.crt</code> и подтвердите. Система попросит разблокировку экрана.</li>
+      <li>Вернитесь на эту страницу — предупреждение о сертификате больше не появится. В меню Chrome появится «Установить приложение».</li>
+    </ol>
+    <h2>iPhone</h2>
+    <ol>
+      <li>Нажмите «Скачать сертификат» и разрешите установку профиля.</li>
+      <li>Настройки → Профиль загружен → Установить → введите код.</li>
+      <li>Настройки → Основные → Об этом устройстве → Доверие сертификатам → включите полное доверие для «Voice Button».</li>
+      <li>Откройте страницу в Safari → «Поделиться» → «На экран «Домой»».</li>
+    </ol>
+    <p class="note">Если браузер не начинает скачивание: на предупреждении о сертификате нажмите <b>«Дополнительно» → «Перейти на сайт»</b>, вернитесь на эту страницу и нажмите кнопку ещё раз. Brave такие загрузки блокирует совсем — откройте страницу в Chrome.</p>
+    <p class="note">Сертификат выпущен этим компьютером и подписывает только адресный сертификат сайта. Храните его ключ при себе: кто получит ключ, сможет подписывать сертификаты, которым телефон будет верить.</p>
+    <p><a href="./">&larr; На главную</a></p>
+  </div>
+
+  <div class="lang" data-lang="en">
+    <h1>Voice Button as an app</h1>
+    <p>Install the certificate on the phone once — the warning stops and the browser lets the page install as an app with its own icon.</p>
+    <a class="big" href="ca.crt" id="download-en" target="_blank" rel="noopener">Download the certificate</a>
+    <h2>Android</h2>
+    <ol>
+      <li>Download the certificate; it lands in “Downloads”.</li>
+      <li>Settings → Security → Encryption &amp; credentials → Install a certificate → <b>CA certificate</b>.</li>
+      <li>Pick the downloaded <code>voice-button-ca.crt</code> and confirm.</li>
+      <li>Return here: the warning is gone, and Chrome offers “Install app”.</li>
+    </ol>
+    <h2>iPhone</h2>
+    <ol>
+      <li>Tap “Download the certificate” and allow the profile.</li>
+      <li>Settings → Profile Downloaded → Install.</li>
+      <li>Settings → General → About → Certificate Trust Settings → enable full trust for “Voice Button”.</li>
+      <li>Open the page in Safari → Share → “Add to Home Screen”.</li>
+    </ol>
+    <p class="note">If the download does not start: on the certificate warning tap <b>Advanced → Proceed</b>, come back to this page and press the button again. Brave blocks such downloads entirely — open this page in Chrome.</p>
+    <p class="note">The certificate was issued by this computer and signs only the site's address. Keep its key to yourself.</p>
+    <p><a href="./">&larr; Back</a></p>
+  </div>
+
+  <div class="lang" data-lang="zh">
+    <h1>把 Voice Button 当成应用</h1>
+    <p>在手机上安装一次证书：警告消失，浏览器就能把这个页面装成带图标的应用。</p>
+    <a class="big" href="ca.crt" id="download-zh" target="_blank" rel="noopener">下载证书</a>
+    <h2>Android</h2>
+    <ol>
+      <li>下载证书，文件会存到“下载”。</li>
+      <li>设置 → 安全 → 加密与凭据 → 安装证书 → <b>CA 证书</b>。</li>
+      <li>选择 <code>voice-button-ca.crt</code> 并确认。</li>
+      <li>返回这里：警告消失，Chrome 会提供“安装应用”。</li>
+    </ol>
+    <h2>iPhone</h2>
+    <ol>
+      <li>点“下载证书”并允许安装描述文件。</li>
+      <li>设置 → 已下载描述文件 → 安装。</li>
+      <li>设置 → 通用 → 关于本机 → 证书信任设置 → 为 Voice Button 打开完全信任。</li>
+      <li>在 Safari 中打开页面 → 分享 → “添加到主屏幕”。</li>
+    </ol>
+    <p class="note">如果下载没有开始：在证书警告上点 <b>“高级” → “继续前往”</b>，回到本页再按一次按钮。Brave 会完全阻止此类下载 — 请用 Chrome 打开。</p>
+    <p class="note">证书由这台电脑签发，仅用于该站点的地址。请保管好它的密钥。</p>
+    <p><a href="./">&larr; 返回</a></p>
+  </div>
+
+</main>
+<script>
+  // The page speaks the language of the app, like the rest of the site.
+  fetch('/site/api/ping')
+    .then((response) => response.json())
+    .then((info) => {
+      const ua = navigator.userAgent;
+      const brave = /Brave/i.test(ua);
+      const note = document.getElementById('brave-note');
+      if (brave && note) note.hidden = false;
+      const lang = (info && info.lang) || 'ru';
+      document.documentElement.lang = lang;
+      document.querySelectorAll('.lang').forEach((node) => {
+        node.classList.toggle('on', node.dataset.lang === lang);
+      });
+    })
+    .catch(() => {});
+</script>
+</body>
+</html>

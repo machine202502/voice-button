@@ -15,9 +15,17 @@ pub const WINDOW_TITLE: &str = "Voice Button";
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Capture,
-    File,
+    History,
     Settings,
-    Api,
+    External,
+}
+
+/// Page of the "External access" tab: the local server for scripts, or the
+/// phone that dictates into monologs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExternalTab {
+    LocalServer,
+    Phone,
 }
 
 /// Which transcriptions the history list shows.
@@ -27,6 +35,7 @@ enum HistoryFilter {
     User,
     Server,
     File,
+    Phone,
 }
 
 impl HistoryFilter {
@@ -36,6 +45,7 @@ impl HistoryFilter {
             HistoryFilter::User => source == state::Source::User,
             HistoryFilter::Server => source == state::Source::Server,
             HistoryFilter::File => source == state::Source::File,
+            HistoryFilter::Phone => source == state::Source::Site,
         }
     }
 }
@@ -88,6 +98,8 @@ pub fn run_from_args() {
                 source: state::Source::User,
                 state: crate::history::EntryState::Complete,
                 audio: None,
+                group: None,
+                message: None,
             },
             state::HistoryEntry {
                 at: "2026-11-05 11:02:17".to_string(),
@@ -97,6 +109,8 @@ pub fn run_from_args() {
                 source: state::Source::User,
                 state: crate::history::EntryState::Complete,
                 audio: None,
+                group: None,
+                message: None,
             },
             state::HistoryEntry {
                 at: "2026-11-04 18:45:03".to_string(),
@@ -106,17 +120,55 @@ pub fn run_from_args() {
                 source: state::Source::User,
                 state: crate::history::EntryState::Complete,
                 audio: None,
+                group: None,
+                message: None,
             },
             state::HistoryEntry {
                 at: "2026-11-04 15:20:44".to_string(),
                 text: "Translate the sentence into English: I would be glad to see you at the exhibition on Thursday.".to_string(),
                 model: "multi-gigaam-ctc".to_string(),
                 parts: Vec::new(),
-                source: state::Source::User,
+                source: state::Source::Site,
                 state: crate::history::EntryState::Complete,
                 audio: None,
+                group: Some("Work".to_string()),
+                message: Some(42),
             },
         ]);
+        // The Phone tab lists what the daemon stores in `site/db.json`. The
+        // snapshot has no daemon, so seed that file the way the daemon would:
+        // one monolog with two finished takes. The real file poller then picks
+        // it up, exactly as it does in the running app.
+        let db_path = crate::site::db::Db::path(&dirs.root);
+        let _ = std::fs::remove_file(&db_path);
+        match crate::site::db::Db::open(&dirs.root) {
+            Ok(mut db) => {
+                let monolog = db.create_monolog("Work", "2026-11-12T09:30:00+05:00");
+                for (clock, seconds, text) in [
+                    (
+                        "2026-11-12T09:31:00+05:00",
+                        4.2,
+                        "Remind me to send the invoice to Anna before Friday.",
+                    ),
+                    (
+                        "2026-11-12T09:34:00+05:00",
+                        3.1,
+                        "Also book a courier for the documents on Thursday morning.",
+                    ),
+                ] {
+                    let message = db.add_message(monolog.id, clock, clock);
+                    db.add_seconds(message.id, seconds);
+                    db.set_stage(message.id, crate::site::monolog::Stage::Queued);
+                    db.set_stage(message.id, crate::site::monolog::Stage::Transcribing);
+                    db.set_progress(message.id, text, 1);
+                    db.set_stage(message.id, crate::site::monolog::Stage::Done);
+                }
+                if let Err(e) = db.save() {
+                    crate::log::log(&format!("snapshot: cannot seed the phone database: {e:#}"));
+                }
+            }
+            Err(e) => crate::log::log(&format!("snapshot: cannot open the phone database: {e:#}")),
+        }
         // Simulate a UI process opened while the daemon is already recording.
         // The snapshot must come through the real initial file-poller read.
         crate::ipc::write_status(&dirs.root, crate::state::Status::Recording);
@@ -175,10 +227,10 @@ fn run_ui(config: config::Config, history: state::History, dirs: AppDirs, tab: S
     spawn_file_poller(shared.clone(), dirs.clone());
     let initial_tab = if tab == "settings" {
         Tab::Settings
+    } else if tab == "history" {
+        Tab::History
     } else if tab == "api" {
-        Tab::Api
-    } else if tab == "file" {
-        Tab::File
+        Tab::External
     } else {
         Tab::Capture
     };
@@ -194,11 +246,14 @@ fn run_ui(config: config::Config, history: state::History, dirs: AppDirs, tab: S
         shared: shared.clone(),
         dirs: dirs.clone(),
         tab: initial_tab,
+        external_tab: ExternalTab::LocalServer,
         show_about: false,
         expanded_history: None,
         history_filter: HistoryFilter::All,
         download_done_seen: false,
         api_copied_at: 0.0,
+        site_qr: None,
+        phone: PhoneState::default(),
         snapshot_dir: std::env::var("VB_SNAPSHOT").ok().map(PathBuf::from),
         snapshot_frame: 0,
     };
@@ -299,6 +354,9 @@ fn spawn_file_poller(shared: Arc<Shared>, dirs: AppDirs) {
         let status_path = dirs.root.join("status.txt");
         let live_path = dirs.root.join("live.json");
         let api_path = dirs.root.join("api.state.json");
+        let site_path = dirs.root.join("site.state.json");
+        let site_db_path = crate::site::db::Db::path(&dirs.root);
+        let network_path = crate::site::network::state_path(&dirs.root);
         let session_path = dirs.root.join("session.json");
         let mut config_meta = meta_key(&std::fs::metadata(&config_path).ok());
         let mut history_meta = meta_key(&std::fs::metadata(&history_path).ok());
@@ -308,6 +366,9 @@ fn spawn_file_poller(shared: Arc<Shared>, dirs: AppDirs) {
         let mut status_meta = None;
         let mut live_meta = None;
         let mut api_meta = None;
+        let mut site_meta = None;
+        let mut site_db_meta = None;
+        let mut network_meta = None;
         let mut session_meta = None;
         loop {
             std::thread::sleep(Duration::from_millis(300));
@@ -373,6 +434,41 @@ fn spawn_file_poller(shared: Arc<Shared>, dirs: AppDirs) {
                     shared.lock().api = Some(state.into());
                 }
             }
+            let m = meta_key(&std::fs::metadata(&site_path).ok());
+            if m != site_meta {
+                site_meta = m;
+                shared.lock().site = crate::ipc::read_site_state(&dirs.root);
+            }
+            // The daemon owns `site/db.json`; the window mirrors the pairing
+            // record (for the QR code) and the monologs (for the phone list).
+            let m = meta_key(&std::fs::metadata(&site_db_path).ok());
+            if m != site_db_meta {
+                site_db_meta = m;
+                let (pairing, monologs) = match crate::site::db::Db::open(&dirs.root) {
+                    Ok(db) => {
+                        let client = &db.data().client;
+                        let pairing = if client.paired || client.token.is_empty() {
+                            None
+                        } else {
+                            Some(state::SitePairing {
+                                token: client.token.clone(),
+                                until: client.expires.clone(),
+                            })
+                        };
+                        (pairing, Some(state::SiteMonologs::from_db(&db)))
+                    }
+                    Err(_) => (None, None),
+                };
+                let mut data = shared.lock();
+                data.site_pairing = pairing;
+                data.site_monologs = monologs;
+            }
+            let m = meta_key(&std::fs::metadata(&network_path).ok());
+            if m != network_meta {
+                network_meta = m;
+                shared.lock().site_network = crate::site::network::read(&dirs.root);
+            }
+            shared.lock().site_network_busy = crate::ipc::site_network_busy(&dirs.root);
             let m = meta_key(&std::fs::metadata(&session_path).ok());
             if m != session_meta {
                 session_meta = m;
@@ -383,10 +479,34 @@ fn spawn_file_poller(shared: Arc<Shared>, dirs: AppDirs) {
     });
 }
 
+/// Which half of the phone list is on screen: active monologs or the archive.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum PhoneView {
+    #[default]
+    Active,
+    Archive,
+}
+
+/// Window-side state of the phone list. It does not survive a restart: the
+/// daemon owns the monologs, this only remembers what is open and selected.
+#[derive(Default)]
+struct PhoneState {
+    view: PhoneView,
+    open: Option<u64>,
+    selected: std::collections::BTreeSet<u64>,
+    /// Snapshot mode only: scroll the phone page to the monolog list.
+    focus_list: bool,
+}
+
+/// Messages drawn per frame. A phone can collect thousands of takes; drawing
+/// all of them would make the window crawl. The newest ones are shown first.
+const PHONE_MESSAGE_CAP: usize = 200;
+
 pub struct MainWindow {
     shared: Arc<Shared>,
     dirs: AppDirs,
     tab: Tab,
+    external_tab: ExternalTab,
     show_about: bool,
     expanded_history: Option<usize>,
     history_filter: HistoryFilter,
@@ -394,6 +514,9 @@ pub struct MainWindow {
     /// egui timestamp of the last "Copy" click on the API address; drives the
     /// transient "Copied!" feedback in the API tab.
     api_copied_at: f64,
+    /// The QR code of the current pairing link, cached by its text.
+    site_qr: Option<(String, egui::TextureHandle)>,
+    phone: PhoneState,
     snapshot_dir: Option<PathBuf>,
     snapshot_frame: u32,
 }
@@ -408,9 +531,9 @@ impl eframe::App for MainWindow {
             show_download_banner(ui, &mut data, &self.dirs);
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.tab, Tab::Capture, tr("Capture"));
-                ui.selectable_value(&mut self.tab, Tab::File, tr("File"));
+                ui.selectable_value(&mut self.tab, Tab::History, tr("History"));
                 ui.selectable_value(&mut self.tab, Tab::Settings, tr("Settings"));
-                ui.selectable_value(&mut self.tab, Tab::Api, tr("API"));
+                ui.selectable_value(&mut self.tab, Tab::External, tr("External access"));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button(tr("About")).clicked() {
                         self.show_about = true;
@@ -419,10 +542,17 @@ impl eframe::App for MainWindow {
             });
             ui.separator();
             match self.tab {
-                Tab::Capture => capture_body(
+                Tab::Capture => {
+                    // The page can outgrow a small window once a file is being
+                    // transcribed, so the whole tab scrolls.
+                    ScrollArea::vertical()
+                        .id_source("capture_scroll")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| capture_body(ui, &mut data, &self.dirs));
+                }
+                Tab::History => history_body(
                     ui,
                     &mut data,
-                    &self.dirs,
                     &mut self.expanded_history,
                     &mut self.history_filter,
                 ),
@@ -434,8 +564,16 @@ impl eframe::App for MainWindow {
                         .auto_shrink([false, false])
                         .show(ui, |ui| settings_body(ui, &mut data, &self.dirs));
                 }
-                Tab::File => file_body(ui, &mut data, &self.dirs),
-                Tab::Api => api_body(ui, &mut data, &self.dirs, ctx, &mut self.api_copied_at),
+                Tab::External => external_body(
+                    ui,
+                    &mut data,
+                    &self.dirs,
+                    ctx,
+                    &mut self.api_copied_at,
+                    &mut self.external_tab,
+                    &mut self.site_qr,
+                    &mut self.phone,
+                ),
             }
         });
         // A finished download may make a pending model selection applicable.
@@ -488,14 +626,15 @@ impl MainWindow {
                     port: 8931,
                     error: None,
                 });
-                self.tab = Tab::Api;
+                self.tab = Tab::External;
+                self.external_tab = ExternalTab::LocalServer;
             }
             13 => self.capture(&dir.join("api.png")),
             14 => {
                 let mut data = self.shared.lock();
                 data.config.api_enabled = false;
                 data.api = None;
-                self.tab = Tab::Capture;
+                self.tab = Tab::History;
             }
             18 => self.capture(&dir.join("history.png")),
             19 => self.expanded_history = Some(0),
@@ -507,6 +646,17 @@ impl MainWindow {
             }
             31 => self.capture(&dir.join("about.png")),
             33 => {
+                // The idle "Record" page: the microphone, the live box and the
+                // file section that used to live on its own tab.
+                self.show_about = false;
+                let mut data = self.shared.lock();
+                data.status = crate::state::Status::Idle;
+                data.live_text.clear();
+                data.file = None;
+                self.tab = Tab::Capture;
+            }
+            36 => self.capture(&dir.join("record.png")),
+            38 => {
                 self.show_about = false;
                 let mut data = self.shared.lock();
                 data.download = Some(state::DownloadProgress {
@@ -522,8 +672,45 @@ impl MainWindow {
                     cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 });
             }
-            39 => self.capture(&dir.join("download-progress.png")),
-            41 => std::process::exit(0),
+            41 => self.capture(&dir.join("download-progress.png")),
+            43 => {
+                // The phone page with an illustrative paired state: the server
+                // is on, an address is shown and a pairing link is waiting.
+                self.tab = Tab::External;
+                self.external_tab = ExternalTab::Phone;
+                // The seeded database holds one monolog with two messages:
+                // open it and scroll to the list so the snapshot shows it.
+                self.phone.open = Some(1);
+                self.phone.selected.insert(2);
+                self.phone.focus_list = true;
+                let mut data = self.shared.lock();
+                data.download = None;
+                data.config.site_enabled = true;
+                data.site = Some(crate::ipc::SiteSnapshot {
+                    running: true,
+                    port: 8443,
+                    url: "https://192.168.1.10:8443/".to_string(),
+                    paired: false,
+                });
+                data.site_pairing = Some(state::SitePairing {
+                    token: "7f3c9a2e5b41d0c8".to_string(),
+                    until: (chrono::Local::now() + chrono::Duration::minutes(5)).to_rfc3339(),
+                });
+                data.site_network = Some(crate::site::network::State {
+                    port: 8443,
+                    enabled: true,
+                    firewall_rule: "Voice Button Site".to_string(),
+                    firewall_created: "2026-11-12T10:00:00".to_string(),
+                    upnp: None,
+                    error: None,
+                    updated: "2026-11-12T10:00:01".to_string(),
+                });
+                data.site_network_busy = false;
+            }
+            // Several frames let the scroll animation settle before the shot;
+            // the target is set on the first frame that draws the list.
+            70 => self.capture(&dir.join("phone.png")),
+            72 => std::process::exit(0),
             _ => {}
         }
     }
@@ -536,26 +723,45 @@ impl MainWindow {
     }
 }
 
-/// Locate our own window by title and verify it belongs to this process.
+/// Locate our own window.
+///
+/// Not by title alone: the installed copy may be running at the same time and
+/// `FindWindowW` would return *its* window, belonging to another process. The
+/// snapshot then silently captured nothing. The process id is the filter.
 fn find_own_window() -> isize {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{FindWindowW, GetWindowThreadProcessId};
-    let mut title: Vec<u16> = WINDOW_TITLE.encode_utf16().collect();
-    title.push(0);
-    // SAFETY: title is a valid NUL-terminated UTF-16 string.
-    let hwnd = unsafe { FindWindowW(std::ptr::null(), title.as_ptr()) };
-    if hwnd.is_null() {
-        return 0;
+    use windows_sys::core::BOOL;
+    use windows_sys::Win32::Foundation::{HWND, LPARAM};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindowThreadProcessId, IsWindowVisible,
+    };
+
+    struct Search {
+        pid: u32,
+        found: isize,
     }
-    let mut pid: u32 = 0;
-    // SAFETY: hwnd is valid; pid is a writable out-pointer.
-    unsafe {
+
+    unsafe extern "system" fn visit(hwnd: HWND, param: LPARAM) -> BOOL {
+        // SAFETY: `param` is the `&mut Search` passed below and outlives the call.
+        let search = &mut *(param as *mut Search);
+        let mut pid: u32 = 0;
         GetWindowThreadProcessId(hwnd, &mut pid);
+        if pid == search.pid && IsWindowVisible(hwnd) != 0 {
+            search.found = hwnd as isize;
+            return 0;
+        }
+        1
     }
-    if pid == std::process::id() {
-        hwnd as isize
-    } else {
-        0
+
+    let mut search = Search {
+        pid: std::process::id(),
+        found: 0,
+    };
+    // SAFETY: `visit` matches the callback signature; the pointer stays valid
+    // for the duration of EnumWindows.
+    unsafe {
+        EnumWindows(Some(visit), &mut search as *mut Search as LPARAM);
     }
+    search.found
 }
 
 /// Capture a window (by HWND) into a PNG file using PrintWindow with
@@ -1063,8 +1269,559 @@ fn settings_body(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs) {
     }
 }
 
-/// API tab: switch the local server on or off, pick where it listens, and open
-/// the bundled test page with a microphone.
+/// "External access": the local server for scripts and pages, and the phone
+/// that dictates into monologs.
+#[allow(clippy::too_many_arguments)]
+fn external_body(
+    ui: &mut egui::Ui,
+    data: &mut Data,
+    dirs: &AppDirs,
+    ctx: &egui::Context,
+    copied_at: &mut f64,
+    page: &mut ExternalTab,
+    qr: &mut Option<(String, egui::TextureHandle)>,
+    phone: &mut PhoneState,
+) {
+    ui.horizontal(|ui| {
+        ui.selectable_value(page, ExternalTab::LocalServer, tr("Local server"));
+        ui.selectable_value(page, ExternalTab::Phone, tr("Phone"));
+    });
+    ui.separator();
+    match *page {
+        ExternalTab::LocalServer => api_body(ui, data, dirs, ctx, copied_at),
+        ExternalTab::Phone => phone_body(ui, data, dirs, ctx, copied_at, qr, phone),
+    }
+}
+
+/// "Phone": switch the HTTPS server on, pair the one phone, show where the QR
+/// code points, and list the monologs the phone has dictated.
+fn phone_body(
+    ui: &mut egui::Ui,
+    data: &mut Data,
+    dirs: &AppDirs,
+    ctx: &egui::Context,
+    copied_at: &mut f64,
+    qr: &mut Option<(String, egui::TextureHandle)>,
+    phone: &mut PhoneState,
+) {
+    ScrollArea::vertical()
+        .id_source("phone_scroll")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            phone_settings(ui, data, dirs, ctx, copied_at, qr, phone);
+        });
+}
+
+fn phone_settings(
+    ui: &mut egui::Ui,
+    data: &mut Data,
+    dirs: &AppDirs,
+    ctx: &egui::Context,
+    copied_at: &mut f64,
+    qr: &mut Option<(String, egui::TextureHandle)>,
+    phone: &mut PhoneState,
+) {
+    ui.heading(tr("Phone"));
+    ui.label(
+        RichText::new(tr(
+            "Dictation from the phone goes into monologs; the text is transcribed here, in the background.",
+        ))
+        .weak(),
+    );
+    ui.add_space(6.0);
+    let mut commit = ui
+        .checkbox(
+            &mut data.config.site_enabled,
+            tr("Accept connections from the phone"),
+        )
+        .changed();
+    ui.add_enabled_ui(data.config.site_enabled, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(tr("Port:"));
+            let port = ui.add(egui::DragValue::new(&mut data.config.site_port).clamp_range(1..=65535));
+            commit |= port.drag_stopped() || port.lost_focus();
+        });
+        let public = crate::site::gate::has_public_ipv4();
+        commit |= ui
+            .add_enabled(
+                !public,
+                egui::Checkbox::new(
+                    &mut data.config.site_lan_only,
+                    tr("Accept only from the local network"),
+                ),
+            )
+            .changed();
+        if public {
+            ui.label(
+                RichText::new(tr(
+                    "This computer has a public address, so a phone in the same room looks like any other visitor: the switch does not apply, the token protects the door.",
+                ))
+                .weak()
+                .small(),
+            );
+        }
+    });
+    if commit {
+        apply_settings(data, dirs);
+    }
+
+    let status = data.site.clone();
+    match &status {
+        Some(site) if site.running => {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(&site.url)
+                        .monospace()
+                        .color(egui::Color32::from_rgb(90, 200, 120)),
+                );
+                if ui.button(tr("Copy")).clicked() {
+                    copy_to_clipboard(&site.url);
+                    *copied_at = ctx.input(|i| i.time);
+                }
+                if site.paired {
+                    ui.label(
+                        RichText::new(tr("The phone is connected"))
+                            .color(egui::Color32::from_rgb(70, 190, 90)),
+                    );
+                } else {
+                    ui.label(RichText::new(tr("No phone is connected")).weak());
+                }
+            });
+            if *copied_at > 0.0 && ctx.input(|i| i.time) < *copied_at + 2.0 {
+                ui.label(RichText::new(tr("Copied!")).color(egui::Color32::from_rgb(90, 200, 120)));
+            }
+            let now = chrono::Local::now().to_rfc3339();
+            if let Some(pairing) = data
+                .site_pairing
+                .clone()
+                .filter(|pairing| pairing.alive(&now))
+            {
+                let link = format!("{}pair?t={}", site.url, pairing.token);
+                ui.add_space(6.0);
+                ui.label(tr("Open this link on the phone:"));
+                ui.horizontal(|ui| {
+                    ui.add(egui::Label::new(RichText::new(&link).monospace()).wrap(true));
+                    if ui.button(tr("Copy")).clicked() {
+                        copy_to_clipboard(&link);
+                    }
+                });
+                // The QR is cached by its text: rebuilding a texture every frame
+                // would burn the GPU for nothing.
+                if qr.as_ref().map(|(text, _)| text != &link).unwrap_or(true) {
+                    *qr = qr_texture(ctx, &link).map(|texture| (link.clone(), texture));
+                }
+                if let Some((_, texture)) = qr.as_ref() {
+                    ui.add(egui::Image::new(texture).fit_to_exact_size(egui::vec2(190.0, 190.0)));
+                }
+                // `2026-11-12T10:05:00+05:00` -> `10:05`
+                let clock = pairing
+                    .until
+                    .get(11..16)
+                    .unwrap_or(pairing.until.as_str())
+                    .to_string();
+                ui.label(
+                    RichText::new(trf(
+                        "The link lives until {time}, then it stops working.",
+                        &[("time", &clock)],
+                    ))
+                    .color(egui::Color32::from_rgb(230, 170, 60)),
+                );
+                ui.label(
+                    RichText::new(tr(
+                        "The link works once. The phone will warn about the certificate: tap through it.",
+                    ))
+                    .weak(),
+                );
+            }
+            if site.paired {
+                if ui.button(tr("Disconnect phone")).clicked() {
+                    crate::ipc::request_site_revoke(&dirs.root);
+                }
+            } else if ui.button(tr("Connect phone")).clicked() {
+                crate::ipc::request_site_pair(&dirs.root);
+            }
+
+            // Internet access: the script opens the firewall and, where it can,
+            // the router. The app only shows what the script reported.
+            ui.add_space(6.0);
+            let network = data.site_network.clone();
+            let busy = data.site_network_busy;
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                // The state is the first thing the eye lands on: a coloured dot
+                // and one plain sentence.
+                let (dot, title) = match (&network, busy) {
+                    (_, true) => (
+                        egui::Color32::from_rgb(230, 170, 60),
+                        tr("Setting up…"),
+                    ),
+                    (Some(network), _) if network.enabled && network.error.is_none() => (
+                        egui::Color32::from_rgb(90, 200, 110),
+                        tr("Internet access is on"),
+                    ),
+                    (Some(network), _) if network.error.is_some() => (
+                        egui::Color32::from_rgb(230, 90, 90),
+                        tr("Internet access failed"),
+                    ),
+                    _ => (egui::Color32::from_gray(140), tr("Internet access is off")),
+                };
+                ui.horizontal(|ui| {
+                    let size = egui::vec2(14.0, 14.0);
+                    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+                    ui.painter()
+                        .circle_filled(rect.center(), 6.0, dot);
+                    ui.label(RichText::new(title).strong().color(dot));
+                    ui.label(RichText::new(tr("Internet access")).weak().small());
+                });
+                match &network {
+                    Some(network) if network.enabled => {
+                        ui.label(RichText::new(crate::site::network::summary(network)).weak().small());
+                    }
+                    Some(network) if network.error.is_some() => {
+                        ui.label(
+                            RichText::new(network.error.clone().unwrap_or_default())
+                                .color(egui::Color32::from_rgb(230, 90, 90))
+                                .small(),
+                        );
+                    }
+                    _ => {
+                        ui.label(
+                            RichText::new(tr(
+                                "The phone is reachable only inside this network until the access is switched on.",
+                            ))
+                            .weak()
+                            .small(),
+                        );
+                    }
+                }
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(!busy, egui::Button::new(tr("Enable internet access")))
+                        .clicked()
+                    {
+                        crate::ipc::request_site_network(&dirs.root, true);
+                    }
+                    if ui
+                        .add_enabled(!busy, egui::Button::new(tr("Disable and remove")))
+                        .clicked()
+                    {
+                        crate::ipc::request_site_network(&dirs.root, false);
+                    }
+                });
+                ui.label(
+                    RichText::new(tr(
+                        "A public address on this computer needs no forwarding; otherwise the router has to support UPnP.",
+                    ))
+                    .weak()
+                    .small(),
+                );
+            });
+        }
+        Some(_) if data.config.site_enabled => {
+            // The server is started and stopped live, so this branch means it
+            // was asked for and could not listen: say why, not "restart".
+            ui.label(RichText::new(tr("Stopped")).color(egui::Color32::GRAY));
+            ui.label(
+                RichText::new(tr("The phone server did not start. The log has the reason."))
+                .weak()
+                .small(),
+            );
+        }
+        _ => {
+            ui.label(RichText::new(tr("Stopped")).color(egui::Color32::GRAY));
+        }
+    }
+
+    // The monologs stay visible whether the server is running or not: they
+    // belong to the person, not to the connection.
+    ui.separator();
+    let list_top = ui.cursor().min;
+    phone_monologs(ui, &data.site_monologs, phone, dirs);
+    if phone.focus_list {
+        // Snapshot mode only: put the list in view for the screenshot.
+        ui.scroll_to_rect(
+            egui::Rect::from_min_size(list_top, egui::vec2(ui.available_width(), 1.0)),
+            Some(egui::Align::TOP),
+        );
+    }
+}
+
+/// The monologs the phone dictated, with the open one's messages below.
+fn phone_monologs(
+    ui: &mut egui::Ui,
+    monologs: &Option<state::SiteMonologs>,
+    phone: &mut PhoneState,
+    dirs: &AppDirs,
+) {
+    ui.heading(tr("Monologs"));
+    let Some(site) = monologs else {
+        ui.label(RichText::new(tr("No monologs yet.")).weak());
+        return;
+    };
+    if site.monologs.is_empty() {
+        ui.label(RichText::new(tr("No monologs yet.")).weak());
+        return;
+    }
+    if let Some(open) = phone.open {
+        if !site.monologs.iter().any(|monolog| monolog.id == open) {
+            // The phone removed it (or the file was replaced): do not keep a
+            // selection for something that is no longer there.
+            phone.open = None;
+            phone.selected.clear();
+        }
+    }
+    // Active and archived are two different jobs: read and archive the first,
+    // only unarchive the second. One mixed list made neither clear.
+    ui.horizontal(|ui| {
+        ui.selectable_value(&mut phone.view, PhoneView::Active, tr("Active"));
+        ui.selectable_value(&mut phone.view, PhoneView::Archive, tr("Archive"));
+    });
+    if phone.view == PhoneView::Archive {
+        // The archive is a list, not a reader: nothing there can be opened.
+        phone.open = None;
+    }
+    let showing_archive = phone.view == PhoneView::Archive;
+    let mut list: Vec<&state::SiteMonolog> = site
+        .monologs
+        .iter()
+        .filter(|monolog| monolog.archived == showing_archive)
+        .collect();
+    if list.is_empty() {
+        ui.label(
+            RichText::new(if showing_archive {
+                tr("The archive is empty.")
+            } else {
+                tr("No monologs yet.")
+            })
+            .weak(),
+        );
+        return;
+    }
+    // Newest monolog first, like the history. The id breaks ties for records
+    // written in the same second.
+    list.sort_by(|left, right| {
+        right
+            .created
+            .cmp(&left.created)
+            .then_with(|| right.id.cmp(&left.id))
+    });
+    let mut archive: Option<(u64, bool)> = None;
+    // One monolog on screen at a time: opening it hides the others, and Back
+    // (or clicking it again) returns to the list. The archive stays a list.
+    if !showing_archive {
+        if let Some(open) = phone.open {
+            if let Some(monolog) = list.iter().copied().find(|monolog| monolog.id == open) {
+                ui.horizontal(|ui| {
+                    if ui.button(tr("Back")).clicked() {
+                        phone.open = None;
+                        phone.selected.clear();
+                    }
+                    ui.label(
+                        RichText::new(format!("{} ({})", monolog.name, monolog.count())).strong(),
+                    );
+                    if ui.small_button(tr("Archive")).clicked() {
+                        archive = Some((monolog.id, true));
+                    }
+                });
+                ui.indent(("phone_messages", monolog.id), |ui| {
+                    phone_messages(ui, monolog, phone);
+                });
+                if let Some((monolog, archived)) = archive {
+                    crate::ipc::request_site_archive(&dirs.root, monolog, archived);
+                }
+                return;
+            }
+        }
+    }
+    for monolog in list {
+        if showing_archive {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!("{} ({})", monolog.name, monolog.count())).strong(),
+                );
+                if ui.small_button(tr("Unarchive")).clicked() {
+                    archive = Some((monolog.id, false));
+                }
+            });
+            continue;
+        }
+        ui.horizontal(|ui| {
+            let open = phone.open == Some(monolog.id);
+            let title = format!("{} ({})", monolog.name, monolog.count());
+            if ui
+                .selectable_label(open, RichText::new(title).strong())
+                .clicked()
+            {
+                if open {
+                    phone.open = None;
+                } else {
+                    phone.open = Some(monolog.id);
+                    phone.selected.clear();
+                }
+            }
+            if ui.small_button(tr("Archive")).clicked() {
+                archive = Some((monolog.id, true));
+            }
+        });
+        if phone.open == Some(monolog.id) {
+            ui.indent(("phone_messages", monolog.id), |ui| {
+                phone_messages(ui, monolog, phone);
+            });
+        }
+    }
+    if let Some((monolog, archived)) = archive {
+        crate::ipc::request_site_archive(&dirs.root, monolog, archived);
+    }
+}
+
+/// Messages of one open monolog: selection, copy, and the takes themselves.
+fn phone_messages(ui: &mut egui::Ui, monolog: &state::SiteMonolog, phone: &mut PhoneState) {
+    let total = monolog.messages.len();
+    if total == 0 {
+        ui.label(RichText::new(tr("No messages from the phone yet.")).weak());
+        return;
+    }
+    ui.horizontal(|ui| {
+        if ui.small_button(tr("Select all")).clicked() {
+            for message in &monolog.messages {
+                phone.selected.insert(message.id);
+            }
+        }
+        if ui.small_button(tr("Clear selection")).clicked() {
+            phone.selected.clear();
+        }
+        let count = monolog
+            .messages
+            .iter()
+            .filter(|message| phone.selected.contains(&message.id))
+            .count();
+        let copy = ui.add_enabled(
+            count > 0,
+            egui::Button::new(trf(
+                "Copy selected ({count})",
+                &[("count", &count.to_string())],
+            )),
+        );
+        if copy.clicked() {
+            let text = selected_text(&monolog.messages, &phone.selected);
+            if !text.is_empty() {
+                copy_to_clipboard(&text);
+            }
+        }
+    });
+    ui.add_space(2.0);
+    // Like the phone's own chat: oldest at the top, newest at the bottom, one
+    // header per day. Only the newest `PHONE_MESSAGE_CAP` are drawn, so the
+    // window stays fast even when the phone has collected thousands of takes.
+    let first = total.saturating_sub(PHONE_MESSAGE_CAP);
+    let mut last_day = String::new();
+    for message in &monolog.messages[first..] {
+        let day = message.recorded.get(0..10).unwrap_or_default().to_string();
+        if day != last_day {
+            ui.separator();
+            ui.label(
+                RichText::new(day_header(&message.recorded))
+                    .small()
+                    .strong()
+                    .color(ui.visuals().weak_text_color()),
+            );
+            last_day = day;
+        }
+        ui.push_id(message.id, |ui| {
+            ui.horizontal(|ui| {
+                let mut checked = phone.selected.contains(&message.id);
+                if ui.checkbox(&mut checked, "").changed() {
+                    if checked {
+                        phone.selected.insert(message.id);
+                    } else {
+                        phone.selected.remove(&message.id);
+                    }
+                }
+                ui.label(RichText::new(message_time(&message.recorded)).small().weak());
+                ui.label(RichText::new(stage_label(message.stage)).small().weak());
+            });
+            if message.text.trim().is_empty() {
+                ui.label(RichText::new("…").weak());
+            } else {
+                ui.add(egui::Label::new(RichText::new(&message.text)).wrap(true));
+            }
+            ui.add_space(2.0);
+        });
+    }
+    if total > PHONE_MESSAGE_CAP {
+        ui.label(
+            RichText::new(trf(
+                "Showing the newest {shown} of {total} messages.",
+                &[
+                    ("shown", &PHONE_MESSAGE_CAP.to_string()),
+                    ("total", &total.to_string()),
+                ],
+            ))
+            .small()
+            .weak(),
+        );
+    }
+}
+
+/// The text "Copy selected" puts on the clipboard: the selected takes in the
+/// order they were spoken, separated by a blank line. Empty takes are skipped.
+fn selected_text(messages: &[state::SiteMessage], selected: &std::collections::BTreeSet<u64>) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for message in messages {
+        if !selected.contains(&message.id) {
+            continue;
+        }
+        let text = message.text.trim();
+        if !text.is_empty() {
+            parts.push(text);
+        }
+    }
+    parts.join("\n\n")
+}
+
+/// `2026-11-12T09:31:00+05:00` -> `2026-11-12 09:31`; an unknown shape is
+/// shown unchanged instead of being hidden.
+fn message_time(recorded: &str) -> String {
+    match recorded.get(0..16) {
+        Some(stamp) => stamp.replace('T', " "),
+        None => recorded.to_string(),
+    }
+}
+
+/// The one word the phone list shows for a stage. The labels live in the
+/// translations; `no-model` is the one key that does not match `Stage::label`.
+fn stage_label(stage: crate::site::monolog::Stage) -> String {
+    match stage {
+        crate::site::monolog::Stage::NoModel => tr("no_model"),
+        stage => tr(stage.label()),
+    }
+}
+
+/// QR code of the pairing link, as a texture the window can draw.
+fn qr_texture(ctx: &egui::Context, text: &str) -> Option<egui::TextureHandle> {
+    let code = qrcode::QrCode::new(text.as_bytes()).ok()?;
+    let width = code.width();
+    let quiet = 2usize;
+    let scale = 4usize;
+    let side = (width + quiet * 2) * scale;
+    let colors = code.to_colors();
+    let mut image = egui::ColorImage::new([side, side], egui::Color32::WHITE);
+    for y in 0..width {
+        for x in 0..width {
+            if colors[y * width + x] != qrcode::Color::Dark {
+                continue;
+            }
+            for dy in 0..scale {
+                for dx in 0..scale {
+                    let px = (x + quiet) * scale + dx;
+                    let py = (y + quiet) * scale + dy;
+                    image[(px, py)] = egui::Color32::from_rgb(20, 24, 20);
+                }
+            }
+        }
+    }
+    Some(ctx.load_texture("site_qr", image, egui::TextureOptions::NEAREST))
+}
+
 fn api_body(
     ui: &mut egui::Ui,
     data: &mut Data,
@@ -1072,7 +1829,7 @@ fn api_body(
     ctx: &egui::Context,
     copied_at: &mut f64,
 ) {
-    ui.heading(tr("API server"));
+    ui.heading(tr("Local server"));
     ui.label(
         RichText::new(
             tr("Accepts sound from a page or a script (PCM16, mono) and returns the transcription. The app's own microphone is not used."),
@@ -1694,13 +2451,7 @@ fn file_body(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs) {
     }
 }
 
-fn capture_body(
-    ui: &mut egui::Ui,
-    data: &mut Data,
-    dirs: &AppDirs,
-    expanded: &mut Option<usize>,
-    filter: &mut HistoryFilter,
-) {
+fn capture_body(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs) {
     let status = data.status;
     match status {
         crate::state::Status::Recording => {
@@ -1806,6 +2557,12 @@ fn capture_body(
             if !can_record {
                 ui.label(RichText::new(tr("Recording is unavailable until a model is ready.")).weak());
             }
+            if data.background_active() {
+                ui.label(
+                    RichText::new(tr("Background task in progress…"))
+                        .color(egui::Color32::from_rgb(150, 110, 220)),
+                );
+            }
             if ui
                 .add_enabled(can_record, egui::Button::new(tr("Start recording")))
                 .clicked()
@@ -1814,8 +2571,16 @@ fn capture_body(
             }
         }
     }
-    ui.separator();
-    history_body(ui, data, expanded, filter);
+    // A dictation and an imported file are the same intent — "turn this into
+    // text" — so they live on one page. While a recording or a file is being
+    // processed there is nothing to choose here.
+    if matches!(
+        status,
+        crate::state::Status::Idle | crate::state::Status::NoModel | crate::state::Status::File
+    ) {
+        ui.separator();
+        file_body(ui, data, dirs);
+    }
 }
 
 /// Take the visible rows of `indices` (newest first) and their heights. Only
@@ -1825,7 +2590,7 @@ const DAY_HEADER_HEIGHT: f32 = 30.0;
 
 /// "Today", "Yesterday" or "Tuesday · 04.11" for a history timestamp.
 fn day_header(at: &str) -> String {
-    let date = at.get(0..10).unwrap_or("");
+    let date = at.get(0..10).unwrap_or(at);
     let today = chrono::Local::now().date_naive();
     let parsed = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok();
     match parsed {
@@ -1836,7 +2601,7 @@ fn day_header(at: &str) -> String {
             tr(weekday_name(chrono::Datelike::weekday(&day))),
             day.format("%d.%m")
         ),
-        None => date.to_string(),
+        None => at.to_string(),
     }
 }
 
@@ -1935,10 +2700,11 @@ fn history_body(
         ui.selectable_value(&mut next, HistoryFilter::User, tr("User"));
         ui.selectable_value(&mut next, HistoryFilter::Server, tr("Server"));
         ui.selectable_value(&mut next, HistoryFilter::File, tr("File"));
+        ui.selectable_value(&mut next, HistoryFilter::Phone, tr("Phone"));
         *filter = next;
     });
     ui.separator();
-    let indices: Vec<usize> = (0..data.history.len())
+    let mut indices: Vec<usize> = (0..data.history.len())
         .filter(|&index| {
             data.history
                 .row(index)
@@ -1946,19 +2712,29 @@ fn history_body(
                 .unwrap_or(false)
         })
         .collect();
+    // History is a log, not a chat: the newest message is always the first
+    // row. The order is by the time of the recording itself: the file is in the
+    // order things were saved, but a phone message may arrive hours later and
+    // must still sit in its own place.
+    indices.sort_by(|left, right| {
+        let left = data.history.row(*left).map(|row| row.at().to_string());
+        let right = data.history.row(*right).map(|row| row.at().to_string());
+        right.unwrap_or_default().cmp(&left.unwrap_or_default())
+    });
     if indices.is_empty() {
         ui.label(match filter {
             HistoryFilter::All => "No transcriptions yet.",
             HistoryFilter::User => "No transcriptions dictated by the user yet.",
             HistoryFilter::Server => "No transcriptions started by the API server yet.",
             HistoryFilter::File => "No imported files yet.",
+            HistoryFilter::Phone => "No messages from the phone yet.",
         });
         return;
     }
 
     let mut copied: Option<String> = None;
     let mut toggle: Option<usize> = None;
-    // Day separators, like a gallery: the newest day first, one header per day.
+    // One header per day, newest day first, like the log it is.
     let dates: Vec<String> = indices
         .iter()
         .map(|&index| {
@@ -2044,6 +2820,17 @@ fn history_body(
                                         RichText::new(tr("file"))
                                             .small()
                                             .color(egui::Color32::from_rgb(70, 190, 90)),
+                                    );
+                                }
+                                if row.source() == state::Source::Site {
+                                    let text = match row.group() {
+                                        Some(group) => format!("{} · {group}", tr("phone")),
+                                        None => tr("phone").to_string(),
+                                    };
+                                    ui.label(
+                                        RichText::new(text)
+                                            .small()
+                                            .color(egui::Color32::from_rgb(150, 110, 220)),
                                     );
                                 }
                                 if row.state().is_partial() {
@@ -2213,9 +3000,36 @@ fn bytes_to_mb(v: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{sync_config_from_disk, visible_history_range};
+    use super::{day_header, message_time, selected_text, sync_config_from_disk, visible_history_range, weekday_name};
     use crate::config::{Backend, Config};
-    use crate::state::Shared;
+    use crate::state::{Shared, SiteMessage};
+    use crate::site::monolog::Stage;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn day_headers_read_like_a_chat() {
+        let today = chrono::Local::now().date_naive();
+        assert_eq!(
+            day_header(&format!("{} 10:00:00", today.format("%Y-%m-%d"))),
+            crate::i18n::tr("Today")
+        );
+        let yesterday = today.pred_opt().unwrap();
+        assert_eq!(
+            day_header(&format!("{} 10:00:00", yesterday.format("%Y-%m-%d"))),
+            crate::i18n::tr("Yesterday")
+        );
+        let older = today - chrono::Days::new(10);
+        let text = day_header(&format!("{} 09:00:00", older.format("%Y-%m-%d")));
+        assert!(
+            text.contains(&older.format("%d.%m").to_string()),
+            "the date is there: {text}"
+        );
+        assert!(
+            text.contains(&crate::i18n::tr(weekday_name(chrono::Datelike::weekday(&older)))),
+            "and the weekday: {text}"
+        );
+        assert_eq!(day_header("nonsense"), "nonsense");
+    }
 
     #[test]
     fn disk_sync_preserves_a_pending_model_selection() {
@@ -2261,5 +3075,39 @@ mod tests {
         assert_eq!(visible_history_range(&offsets, 450.0, 460.0), 44..48);
         assert_eq!(visible_history_range(&offsets, 0.0, 10.0), 0..3);
         assert_eq!(visible_history_range(&[0.0], 0.0, 100.0), 0..0);
+    }
+
+    fn message(id: u64, text: &str) -> SiteMessage {
+        SiteMessage {
+            id,
+            recorded: "2026-11-12T09:31:00+05:00".to_string(),
+            stage: Stage::Done,
+            text: text.to_string(),
+        }
+    }
+
+    #[test]
+    fn copied_selection_keeps_the_spoken_order_and_skips_empty_takes() {
+        let messages = vec![
+            message(1, "Первая мысль."),
+            message(2, "   "),
+            message(3, "Вторая мысль."),
+            message(4, "Не выбрана."),
+        ];
+        let selected: BTreeSet<u64> = [1, 2, 3].into_iter().collect();
+        assert_eq!(
+            selected_text(&messages, &selected),
+            "Первая мысль.\n\nВторая мысль."
+        );
+        assert_eq!(selected_text(&messages, &BTreeSet::new()), "");
+    }
+
+    #[test]
+    fn a_recorded_stamp_becomes_a_readable_time() {
+        assert_eq!(
+            message_time("2026-11-12T09:31:00+05:00"),
+            "2026-11-12 09:31"
+        );
+        assert_eq!(message_time(""), "");
     }
 }

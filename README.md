@@ -104,6 +104,76 @@ node api-demo/server.mjs      # http://127.0.0.1:8080/
 There is no authentication: keep the host on `127.0.0.1` unless the network is
 trusted. Browser microphones work only on localhost or over HTTPS.
 
+## Phone
+
+A phone can dictate into the same app: it opens a page served by the desktop,
+records, and the text is transcribed here while it talks.
+
+**External access → Phone**: switch it on, then press **Connect phone**. The app
+generates a certificate, a one-time pairing token and a QR code; the phone scans
+it and the page opens. One phone at a time — a new QR replaces the old one, and
+**Disconnect phone** revokes the token without touching the messages.
+
+The phone page (sources in `src/web/`, installed with the app as `site-app/`)
+works like a chat: monologs, messages in the order they were recorded, copy, edit
+and delete with a confirmation. The text is written by the desktop, so the phone can also dictate
+while offline: audio is kept in the browser's storage and sent when the
+connection returns, stamped with the time it was actually spoken.
+
+### As an app on the phone
+
+Everything happens on the phone, on the page itself: the monolog menu has
+**Install the app**, which opens a short guide.
+
+1. Install the certificate once. The browser may refuse the download until the
+   certificate is accepted: tap **Advanced → Proceed** on the warning, return to
+   the page and press the button again. Brave blocks such downloads entirely, so
+   use Chrome for this one step.
+2. Install the page from the browser menu (Android: "Install app"; iPhone:
+   Share → "Add to Home Screen").
+
+The certificate is a tiny authority created by the app and kept in
+`site/tls/ca.crt` with its key; it signs nothing but this site's address. Anyone
+who gets that key can sign certificates the phone would trust, so treat it as a
+private key.
+
+### What the phone can and cannot do
+
+- The page is served over **HTTPS on port 8443**. The certificate is
+  self-signed, so the phone shows its usual warning once: tap «Advanced» →
+  «Proceed». Browsers only hand over the microphone in a secure context, so plain
+  HTTP is not an option.
+- Transcription is **background work**: the phone's segments are decoded only
+  while the engine is idle. Starting a recording, importing a file or recovering
+  after a crash stops the phone's decoding at the next segment and resumes it
+  later; the text continues, it does not restart. The phone is a background task,
+  like every task of this kind: the tray icon turns violet while it runs and no
+  sound is played for it, so the microphone stays available.
+- The history keeps the original text of every message forever. Edits and
+  deletions on the phone live in the phone's own storage and never change the
+  history.
+- The phone page speaks the language chosen in the app; there is no separate
+  language setting.
+- Audio is deleted as soon as its text is safe. If transcription failed, the
+  audio stays and the message can be retried.
+
+### Access from the internet
+
+Two buttons in the same section: **Enable internet access** and **Disable and
+remove**. They run `net.ps1` (installed next to the executables) through a UAC
+prompt; the script creates the Windows Firewall rule and, where the router
+supports UPnP, the port mapping. What it did is written to
+`site/network.json` and shown under the buttons.
+
+- Nothing is copied by hand. Changing the port tears the old setup down before
+  the new one is applied, and uninstalling removes the firewall rule.
+- If the machine holds a public address itself, there is nothing to forward and
+  UPnP is skipped.
+- A router without UPnP, or an ISP that puts you behind CGNAT, cannot be fixed
+  from the app: it says so instead of pretending.
+- When the phone is at home it prefers the local address, even if it was opened
+  from the public one.
+
 ## Models
 
 Settings offers Whisper (whisper.cpp) and ONNX Runtime models. Multilingual
@@ -173,6 +243,18 @@ cargo test --release --test e2e -- --ignored --nocapture
 ```
 
 `VB_E2E_MODEL` (default `Onnx/gigaam-v3-rnnt-punct`) selects the model.
+
+The page's modules have their own Node tests, and the page itself is checked in
+a real browser against a live daemon:
+
+```powershell
+node tests\outbox-test.mjs   # also chat, sync, loop, backoff, stage, storage, phone-flow
+python tests\phone-e2e.py
+```
+
+The browser test copies `src/web` to where the daemon serves the page, starts the
+daemon in a temporary profile and drives Chromium over the DevTools protocol. It
+needs the Playwright Chromium and the models in the app's data directory.
 
 To refresh the UI snapshots in `Tests/`:
 

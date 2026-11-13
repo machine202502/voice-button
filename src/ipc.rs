@@ -111,6 +111,122 @@ pub fn read_api_state(root: &Path) -> Option<ApiSnapshot> {
 }
 
 // ---------------------------------------------------------------------------
+// The phone server (daemon → UI): whether it listens, on which port, where the
+// QR points, and whether the one paired phone is connected.
+
+#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq, Eq)]
+pub struct SiteSnapshot {
+    pub running: bool,
+    pub port: u16,
+    /// Address the QR code points at.
+    pub url: String,
+    pub paired: bool,
+}
+
+pub fn site_state_path(root: &Path) -> PathBuf {
+    root.join("site.state.json")
+}
+
+pub fn write_site_state(root: &Path, snap: &SiteSnapshot) {
+    if let Ok(text) = serde_json::to_string(snap) {
+        atomic_write(site_state_path(root), text.as_bytes());
+    }
+}
+
+pub fn read_site_state(root: &Path) -> Option<SiteSnapshot> {
+    let text = std::fs::read_to_string(site_state_path(root)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// Ask the daemon for a fresh pairing token (the "Connect phone" button).
+pub fn request_site_pair(root: &Path) {
+    atomic_write(root.join("site.pair.request"), b"1");
+}
+
+pub fn take_site_pair_request(root: &Path) -> bool {
+    let path = root.join("site.pair.request");
+    if path.exists() {
+        let _ = std::fs::remove_file(path);
+        true
+    } else {
+        false
+    }
+}
+
+/// Ask the daemon to disconnect the phone (the "Disconnect" button).
+pub fn request_site_revoke(root: &Path) {
+    atomic_write(root.join("site.revoke.request"), b"1");
+}
+
+pub fn take_site_revoke_request(root: &Path) -> bool {
+    let path = root.join("site.revoke.request");
+    if path.exists() {
+        let _ = std::fs::remove_file(path);
+        true
+    } else {
+        false
+    }
+}
+
+/// Ask the daemon to archive or unarchive one monolog. The window never writes
+/// `site/db.json`: it leaves the request and the daemon applies it.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SiteArchiveRequest {
+    pub monolog: u64,
+    pub archived: bool,
+}
+
+pub fn request_site_archive(root: &Path, monolog: u64, archived: bool) {
+    let request = SiteArchiveRequest { monolog, archived };
+    if let Ok(text) = serde_json::to_string(&request) {
+        atomic_write(root.join("site.archive.request"), text.as_bytes());
+    }
+}
+
+pub fn take_site_archive_request(root: &Path) -> Option<SiteArchiveRequest> {
+    let path = root.join("site.archive.request");
+    let text = std::fs::read_to_string(&path).ok()?;
+    let _ = std::fs::remove_file(&path);
+    serde_json::from_str(&text).ok()
+}
+
+/// Ask the daemon to open or close the internet access for the phone. The
+/// script needs an elevated PowerShell, so the request is a file and the daemon
+/// runs it on its own thread.
+pub fn request_site_network(root: &Path, enable: bool) {
+    let name = if enable {
+        "site.net.enable"
+    } else {
+        "site.net.disable"
+    };
+    atomic_write(root.join(name), b"1");
+}
+
+pub fn take_site_network(root: &Path) -> Option<bool> {
+    let enable = root.join("site.net.enable");
+    if enable.exists() {
+        let _ = std::fs::remove_file(enable);
+        let _ = std::fs::remove_file(root.join("site.net.disable"));
+        return Some(true);
+    }
+    let disable = root.join("site.net.disable");
+    if disable.exists() {
+        let _ = std::fs::remove_file(disable);
+        return Some(false);
+    }
+    None
+}
+
+/// The internet-access script is running right now (UAC prompt or UPnP).
+pub fn set_site_network_busy(root: &Path, busy: bool) {
+    set_flag_file(root.join("site.network.busy"), busy);
+}
+
+pub fn site_network_busy(root: &Path) -> bool {
+    root.join("site.network.busy").exists()
+}
+
+// ---------------------------------------------------------------------------
 // The recording session (daemon → UI), so the window can show that a recording
 // was started by the API server. Removed when the session ends.
 

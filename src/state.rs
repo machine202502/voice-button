@@ -40,6 +40,9 @@ pub enum AppEvent {
         source: crate::history::Source,
         /// Audio that belongs to the entry (a kept recording or the user's file).
         audio: Option<String>,
+        /// Timestamp for the history entry. The phone owns the time of its own
+        /// messages, so it travels with the event instead of being "now".
+        at: Option<String>,
     },
     /// A file transcription was cancelled by the user.
     Cancelled,
@@ -281,6 +284,38 @@ pub struct Data {
     pub file: Option<crate::ipc::FileSnapshot>,
     /// When the file state was read last, so the tab polls at a sane rate.
     pub file_seen: Option<std::time::Instant>,
+    /// Runtime state of the phone server, mirrored from `site.state.json`.
+    pub site: Option<crate::ipc::SiteSnapshot>,
+    /// Tasks running behind the person's back right now. The tray icon turns
+    /// violet and no sound is played for any of them; the phone is one, and
+    /// more will come, so this is a set and not a flag.
+    pub background: std::collections::BTreeSet<BackgroundJob>,
+    /// A pairing link the window can show as a QR code, read from
+    /// `site/db.json` (the daemon owns that file; the window only mirrors the
+    /// client record).
+    pub site_pairing: Option<SitePairing>,
+    /// The monologs and their messages, mirrored from the same `site/db.json`.
+    pub site_monologs: Option<SiteMonologs>,
+    /// What the internet-access script did last time, read from
+    /// `site/network.json`.
+    pub site_network: Option<crate::site::network::State>,
+    /// The script is running right now.
+    pub site_network_busy: bool,
+}
+
+/// Work the person is not waiting for in front of the window: the tray icon
+/// turns violet and no sound is played for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum BackgroundJob {
+    /// The phone's audio is being received or transcribed.
+    Phone,
+}
+
+impl Data {
+    /// Is any background task running? The violet icon means exactly this.
+    pub fn background_active(&self) -> bool {
+        !self.background.is_empty()
+    }
 }
 
 /// Runtime status of the local API server.
@@ -290,6 +325,85 @@ pub struct ApiStatus {
     pub host: String,
     pub port: u16,
     pub error: Option<String>,
+}
+
+/// The pairing link a phone may still use: its token and deadline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SitePairing {
+    pub token: String,
+    /// When the link stops working, in the same format as the stored stamp.
+    pub until: String,
+}
+
+impl SitePairing {
+    /// True while the link is inside its five minutes. Both stamps come from
+    /// the phone-independent `rfc3339` clock the daemon stores.
+    pub fn alive(&self, now: &str) -> bool {
+        !self.token.is_empty() && !self.until.is_empty() && self.until.as_str() > now
+    }
+}
+
+/// One spoken take of a monolog, as the window shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SiteMessage {
+    pub id: u64,
+    /// The phone's clock when the take started.
+    pub recorded: String,
+    pub stage: crate::site::monolog::Stage,
+    pub text: String,
+}
+
+/// A named thread of dictations with its messages, mirrored from `site/db.json`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SiteMonolog {
+    pub id: u64,
+    pub name: String,
+    pub archived: bool,
+    pub created: String,
+    /// Messages that are not deleted, oldest first.
+    pub messages: Vec<SiteMessage>,
+}
+
+impl SiteMonolog {
+    pub fn count(&self) -> usize {
+        self.messages.len()
+    }
+}
+
+/// The window's copy of everything the phone dictated. The daemon owns the
+/// file; this type is only read from it, never written back.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SiteMonologs {
+    pub monologs: Vec<SiteMonolog>,
+}
+
+impl SiteMonologs {
+    /// Copy the daemon's database into the window-side type. Deleted messages
+    /// and the client record stay out: the window shows what the person can
+    /// still read.
+    pub fn from_db(db: &crate::site::db::Db) -> Self {
+        let monologs = db
+            .monologs(true)
+            .into_iter()
+            .map(|monolog| SiteMonolog {
+                messages: db
+                    .messages(Some(monolog.id))
+                    .into_iter()
+                    .map(|message| SiteMessage {
+                        id: message.id,
+                        recorded: message.recorded.clone(),
+                        stage: message.stage,
+                        text: message.text.clone(),
+                    })
+                    .collect(),
+                id: monolog.id,
+                name: monolog.name,
+                archived: monolog.archived,
+                created: monolog.created,
+            })
+            .collect();
+        Self { monologs }
+    }
 }
 
 pub struct Shared {
@@ -326,6 +440,12 @@ impl Shared {
                 recovering: false,
                 file: None,
                 file_seen: None,
+                site: None,
+                background: std::collections::BTreeSet::new(),
+                site_pairing: None,
+                site_monologs: None,
+                site_network: None,
+                site_network_busy: false,
                 stream: None,
                 api_result: None,
             }),
@@ -398,8 +518,51 @@ pub fn load_history(root: &std::path::Path) -> History {
 
 #[cfg(test)]
 mod tests {
-    use super::{Interactor, ModelChoice, Session};
+    use super::{Interactor, ModelChoice, Session, SiteMonologs};
     use crate::config::{Backend, Config};
+    use crate::site::db::Db;
+    use crate::site::monolog::Stage;
+
+    #[test]
+    fn the_window_mirror_reads_saved_monologs_and_messages() {
+        let root = std::env::temp_dir().join(format!("vb-state-mirror-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        {
+            let mut db = Db::open(&root).unwrap();
+            let monolog = db.create_monolog("Работа", "2026-11-12T10:00:00+05:00");
+            let kept = db.add_message(
+                monolog.id,
+                "2026-11-12T10:01:00+05:00",
+                "2026-11-12T10:01:02+05:00",
+            );
+            db.add_seconds(kept.id, 3.0);
+            db.set_stage(kept.id, Stage::Queued);
+            db.set_stage(kept.id, Stage::Transcribing);
+            db.set_progress(kept.id, "первый текст", 1);
+            db.set_stage(kept.id, Stage::Done);
+            let hidden = db.add_message(
+                monolog.id,
+                "2026-11-12T10:02:00+05:00",
+                "2026-11-12T10:02:01+05:00",
+            );
+            db.delete(hidden.id);
+            db.archive_monolog(monolog.id, true);
+            db.save().unwrap();
+        }
+        // The window opens the file the daemon left, never its own copy.
+        let reopened = Db::open(&root).unwrap();
+        let mirror = SiteMonologs::from_db(&reopened);
+        assert_eq!(mirror.monologs.len(), 1);
+        let monolog = &mirror.monologs[0];
+        assert_eq!(monolog.name, "Работа");
+        assert!(monolog.archived, "an archived monolog is still listed");
+        assert_eq!(monolog.count(), 1, "a deleted message is not counted");
+        assert_eq!(monolog.messages.len(), 1);
+        assert_eq!(monolog.messages[0].text, "первый текст");
+        assert_eq!(monolog.messages[0].stage, Stage::Done);
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     fn session(owner: Interactor) -> Session {
         Session {

@@ -19,9 +19,10 @@
 //! in the binary.
 
 use crate::config::Backend;
+use crate::http::{self, Request, Response};
 use crate::model_manager;
 use crate::state::{self, ModelChoice, Shared};
-use std::io::{ErrorKind, Read, Write};
+use std::io::ErrorKind;
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -160,19 +161,6 @@ fn display_host(ip: IpAddr) -> String {
     }
 }
 
-struct Request {
-    method: String,
-    path: String,
-    query: String,
-    body: Vec<u8>,
-}
-
-struct Response {
-    status: u16,
-    content_type: &'static str,
-    body: String,
-}
-
 fn serve(
     mut stream: TcpStream,
     shared: Arc<Shared>,
@@ -182,121 +170,26 @@ fn serve(
 ) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
-    let Some(request) = read_request(&mut stream) else {
+    let Some(request) = http::read_request(&mut stream) else {
         return;
     };
-    let response = route(&request, &shared, &root, &commands, &base_url);
-    let _ = write_response(&mut stream, &response);
-}
-
-/// Read one HTTP request (headers + Content-Length body). One request per
-/// connection: the response closes it.
-fn read_request(stream: &mut TcpStream) -> Option<Request> {
-    let mut buf: Vec<u8> = Vec::new();
-    let mut chunk = [0u8; 8192];
-    let header_end = loop {
-        if let Some(pos) = find_bytes(&buf, b"\r\n\r\n") {
-            break pos;
-        }
-        if buf.len() > 16 * 1024 {
-            return None;
-        }
-        let n = stream.read(&mut chunk).ok()?;
-        if n == 0 {
-            return None;
-        }
-        buf.extend_from_slice(&chunk[..n]);
-    };
-    let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
-    let mut lines = head.lines();
-    let request_line = lines.next()?;
-    let mut parts = request_line.split_whitespace();
-    let method = parts.next()?.to_string();
-    let target = parts.next()?;
-    let (path, query) = match target.split_once('?') {
-        Some((path, query)) => (path.to_string(), query.to_string()),
-        None => (target.to_string(), String::new()),
-    };
-    let content_length = lines
-        .find_map(|line| {
-            let (key, value) = line.split_once(':')?;
-            if key.trim().eq_ignore_ascii_case("content-length") {
-                value.trim().parse::<usize>().ok()
-            } else {
-                None
-            }
-        })
-        .unwrap_or(0);
-    if content_length > MAX_REQUEST {
-        return None;
-    }
-    let body_start = header_end + 4;
-    while buf.len() < body_start + content_length {
-        let n = stream.read(&mut chunk).ok()?;
-        if n == 0 {
-            return None;
-        }
-        buf.extend_from_slice(&chunk[..n]);
-    }
-    let body = buf[body_start..body_start + content_length].to_vec();
-    Some(Request {
-        method,
-        path,
-        query,
-        body,
-    })
-}
-
-fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return None;
-    }
-    haystack.windows(needle.len()).position(|w| w == needle)
-}
-
-fn write_response(stream: &mut TcpStream, response: &Response) -> std::io::Result<()> {
-    let reason = match response.status {
-        200 => "OK",
-        204 => "No Content",
-        400 => "Bad Request",
-        404 => "Not Found",
-        409 => "Conflict",
-        413 => "Payload Too Large",
-        503 => "Service Unavailable",
-        504 => "Gateway Timeout",
-        _ => "OK",
-    };
     // CORS is what lets the demo page (served by its own Node server on another
-    // port) call the API with fetch().
-    let head = format!(
-        "HTTP/1.1 {} {}\r\n\
-         Content-Type: {}\r\n\
-         Content-Length: {}\r\n\
-         Access-Control-Allow-Origin: *\r\n\
-         Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
-         Access-Control-Allow-Headers: Content-Type\r\n\
-         Cache-Control: no-store\r\n\
-         Connection: close\r\n\r\n",
-        response.status,
-        reason,
-        response.content_type,
-        response.body.len()
-    );
-    stream.write_all(head.as_bytes())?;
-    stream.write_all(response.body.as_bytes())?;
-    stream.flush()
+    // port) call the API with fetch(). These headers belong to this server, not
+    // to the phone one.
+    let response = route(&request, &shared, &root, &commands, &base_url)
+        .with_header("Access-Control-Allow-Origin", "*")
+        .with_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        .with_header("Access-Control-Allow-Headers", "Content-Type")
+        .with_header("Cache-Control", "no-store");
+    let _ = http::write_response(&mut stream, &response);
 }
 
 fn json_response(status: u16, value: serde_json::Value) -> Response {
-    Response {
-        status,
-        content_type: "application/json",
-        body: serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string()),
-    }
+    Response::json(status, value)
 }
 
 fn error_response(status: u16, message: impl Into<String>) -> Response {
-    json_response(
+    Response::json(
         status,
         serde_json::json!({ "ok": false, "error": message.into() }),
     )
@@ -311,11 +204,7 @@ fn route(
 ) -> Response {
     match (request.method.as_str(), request.path.as_str()) {
         // Preflight for the demo page (a different origin).
-        ("OPTIONS", _) => Response {
-            status: 204,
-            content_type: "text/plain",
-            body: String::new(),
-        },
+        ("OPTIONS", _) => Response::empty(204),
         // Self-documenting contract for integrations and agents.
         ("GET", "/api/help") => json_response(200, help::document(base_url)),
         ("GET", "/api/status") => json_response(200, status_json(shared)),
@@ -442,10 +331,7 @@ fn text_json(shared: &Shared) -> serde_json::Value {
 }
 
 fn query_param(query: &str, name: &str) -> Option<String> {
-    query.split('&').find_map(|pair| {
-        let (key, value) = pair.split_once('=')?;
-        (key == name).then(|| value.to_string())
-    })
+    http::query_param(query, name)
 }
 
 fn start_stream(request: &Request, root: &Path, commands: &mpsc::Sender<ApiRequest>) -> Response {
@@ -561,6 +447,7 @@ mod tests {
     use crate::config::Config;
     use crate::history::History;
     use crate::state::{ApiResult, Interactor, InteractorKind, Session, Status, StreamSession};
+    use std::io::{Read, Write};
 
     fn shared() -> Arc<Shared> {
         Arc::new(Shared::new(
@@ -616,7 +503,7 @@ mod tests {
             let n = stream.read(&mut chunk).expect("read");
             assert!(n > 0, "server closed the connection early");
             buf.extend_from_slice(&chunk[..n]);
-            if let Some(pos) = find_bytes(&buf, b"\r\n\r\n") {
+            if let Some(pos) = http::find_bytes(&buf, b"\r\n\r\n") {
                 let head = String::from_utf8_lossy(&buf[..pos]).to_string();
                 let length = head
                     .lines()

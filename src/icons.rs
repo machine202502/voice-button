@@ -93,6 +93,12 @@ pub fn icon_file() -> Icon {
     tinted([0.35, 1.0, 0.45])
 }
 
+/// Violet: a background task runs and the person is not waiting for it. The
+/// microphone stays available — this only says the engine is busy.
+pub fn icon_background() -> Icon {
+    tinted([0.72, 0.55, 1.0])
+}
+
 /// Grayed-out icon, used when no usable model is selected so recording is
 /// unavailable.
 pub fn icon_disabled() -> Icon {

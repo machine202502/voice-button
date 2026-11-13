@@ -60,11 +60,17 @@ fn ensure_real_microphone(cfg: &mut config::Config, root: &std::path::Path) {
     }
 }
 
+/// The end cue means "the text is ready on your screen". Background work has
+/// no cue: nobody is waiting for it in front of the window. The phone is such
+/// a task today, and the rule is the same for every one that follows.
+fn end_cue(play: bool, background: bool) -> bool {
+    play && !background
+}
+
 /// Text copied for record-and-paste ends with the configured separator (a
 /// space by default, or a line break), so the next dictation inserted at the
 /// same caret does not run into this one. History keeps the clean text.
-fn with_separator(text: &str, separator: config::PasteSeparator) -> String {
-    let mut out = text.to_string();
+fn with_separator(text: &str, separator: config::PasteSeparator) -> String {    let mut out = text.to_string();
     let ends_with_whitespace = out
         .chars()
         .last()
@@ -543,6 +549,95 @@ fn sibling_ui_exe() -> std::path::PathBuf {
         .unwrap_or_else(|| "voice-button-ui.exe".into())
 }
 
+/// Publish the phone server state for the UI: what is bound, where the QR
+/// points, and whether a phone is connected.
+fn publish_site_state(root: &std::path::Path, running: bool, port: u16, url: String, paired: bool) {
+    ipc::write_site_state(
+        root,
+        &ipc::SiteSnapshot {
+            running,
+            port,
+            url,
+            paired,
+        },
+    );
+}
+
+/// What the window asked the daemon to change in `site/db.json`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct SiteDbChange {
+    pairing: bool,
+    revoked: bool,
+    archive: bool,
+}
+
+/// Apply the requests the window leaves as files to the daemon-owned phone
+/// database. Only the daemon writes that file; the window only asks.
+fn apply_site_db_requests(
+    root: &std::path::Path,
+    db: &mut voice_button::site::db::Db,
+) -> SiteDbChange {
+    let mut change = SiteDbChange::default();
+    if ipc::take_site_pair_request(root) {
+        let token = voice_button::site::gate::new_token();
+        db.start_pairing(&token, &chrono::Local::now().to_rfc3339());
+        change.pairing = true;
+    }
+    if ipc::take_site_revoke_request(root) {
+        db.revoke();
+        change.revoked = true;
+    }
+    if let Some(request) = ipc::take_site_archive_request(root) {
+        db.archive_monolog(request.monolog, request.archived);
+        change.archive = true;
+    }
+    if change != SiteDbChange::default() {
+        if let Err(e) = db.save() {
+            log::log(&format!("cannot save site/db.json: {e:#}"));
+        }
+    }
+    change
+}
+
+/// Start, stop or move the phone server to match the settings.
+///
+/// The window writes `config.json` at any time, so the server cannot be created
+/// once at startup: switching it on, off or to another port takes effect at
+/// once, the same way the local API server already does.
+fn apply_phone(
+    root: &std::path::Path,
+    enabled: bool,
+    port: u16,
+    shared: &Arc<Shared>,
+    asr: &Arc<Mutex<AsrClient>>,
+    phone: &mut Option<voice_button::site::runtime::PhoneRuntime>,
+    paired: &mut Option<bool>,
+) {
+    if let Some(mut runtime) = phone.take() {
+        runtime.stop();
+    }
+    if !enabled {
+        publish_site_state(root, false, port, String::new(), false);
+        *paired = None;
+        return;
+    }
+    match voice_button::site::runtime::PhoneRuntime::start(root, port, shared.clone(), asr.clone(), None) {
+        Ok(runtime) => {
+            let url = voice_button::site::gate::display_url(runtime.port);
+            let connected = runtime.hub().db_handle().lock().unwrap().data().client.paired;
+            log::log(&format!("phone: listening on port {} at {url}", runtime.port));
+            publish_site_state(root, true, runtime.port, url, connected);
+            *paired = Some(connected);
+            *phone = Some(runtime);
+        }
+        Err(e) => {
+            log::log(&format!("phone: did not start: {e:#}"));
+            publish_site_state(root, false, port, String::new(), false);
+            *paired = None;
+        }
+    }
+}
+
 fn show_ui(child: &mut Option<std::process::Child>, tab: &str) {
     if let Some(c) = &mut *child {
         match c.try_wait() {
@@ -567,12 +662,21 @@ fn show_ui(child: &mut Option<std::process::Child>, tab: &str) {
     }
 }
 
-/// Only one daemon instance may run; a second start exits quietly. The mutex
-/// handle lives for the whole process.
-fn ensure_single_instance() -> bool {
+/// Only one daemon instance may run per data directory; a second start exits
+/// quietly. The mutex handle lives for the whole process. The directory is part
+/// of the name, so a test run with its own `VB_DATA_DIR` does not fight the
+/// real application.
+fn ensure_single_instance(root: &std::path::Path) -> bool {
     use windows_sys::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
     use windows_sys::Win32::System::Threading::CreateMutexW;
-    let name: Vec<u16> = "Local\\voice-button-daemon\0".encode_utf16().collect();
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in root.to_string_lossy().to_lowercase().bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let name: Vec<u16> = format!("Local\\voice-button-daemon-{hash:016x}\0")
+        .encode_utf16()
+        .collect();
     // SAFETY: name is a valid NUL-terminated UTF-16 string.
     let handle = unsafe { CreateMutexW(std::ptr::null(), 1, name.as_ptr()) };
     if handle.is_null() {
@@ -715,6 +819,8 @@ fn start_recovery(
                             state: session::recovered_state(failed),
                             audio: (failed > 0)
                                 .then(|| session::audio_path(&dir).display().to_string()),
+                            group: None,
+                            message: None,
                         };
                         match voice_button::history::append(&dirs.root, &entry) {
                             Ok(row) => shared.lock().history.push_row(row),
@@ -774,8 +880,10 @@ fn start_recovery(
 fn run_daemon() {
     let dirs = config::app_dirs();
     // A second instance must not rotate the log or leave a crash flag behind:
-    // it exits before touching anything the running daemon owns.
-    if !ensure_single_instance() {
+    // it exits before touching anything the running daemon owns. The snapshot
+    // mode shares that rule: it writes into the real profile too, so it may only
+    // run when the app is closed.
+    if !ensure_single_instance(&dirs.root) {
         std::process::exit(0);
     }
     log::init(&dirs.root);
@@ -815,6 +923,13 @@ fn run_daemon() {
     let (api_tx, api_rx) = mpsc::channel::<voice_button::api::ApiRequest>();
     let mut api_server: Option<voice_button::api::ApiServer> = None;
     let mut api_applied: Option<(bool, String, u16)> = None;
+    // The phone layer is started once, below, when the settings say so. The
+    // daemon keeps this runtime for the whole session and stops it on exit.
+    let mut phone: Option<voice_button::site::runtime::PhoneRuntime> = None;
+    let mut phone_applied: Option<(bool, u16)>;
+    let mut last_site_paired: Option<bool> = None;
+    let mut last_site_check = std::time::Instant::now();
+    let mut last_background = false;
     let (action_tx, action_rx) = mpsc::channel::<tray::TrayAction>();
     let tray_cmds = tray::start(
         action_tx,
@@ -831,6 +946,19 @@ fn run_daemon() {
     let asr = Arc::new(Mutex::new(AsrClient::new(
         std::env::current_exe().unwrap_or_else(|_| "voice-button.exe".into()),
     )));
+    // The phone layer: the runtime opens the database, starts the queue pump
+    // and binds the HTTPS port. Binding happens here, so a busy port is
+    // reported instead of vanishing into a thread.
+    phone_applied = Some((cfg.site_enabled, cfg.site_port));
+    apply_phone(
+        &dirs.root,
+        cfg.site_enabled,
+        cfg.site_port,
+        &shared,
+        &asr,
+        &mut phone,
+        &mut last_site_paired,
+    );
     daemon::install(Runtime {
         buffer: recorder.buffer_handle(),
         asr: asr.clone(),
@@ -903,6 +1031,7 @@ fn run_daemon() {
                         }
                     }
                 }
+                tray::TrayAction::OpenHistory => show_ui(&mut ui_child, "history"),
                 tray::TrayAction::OpenSettings => show_ui(&mut ui_child, "settings"),
                 tray::TrayAction::OpenCapture => show_ui(&mut ui_child, "capture"),
                 tray::TrayAction::CopyLast => match shared.lock().history.entry(0) {
@@ -929,10 +1058,10 @@ fn run_daemon() {
                     dir,
                     source,
                     audio,
+                    at,
                 } => {
                     // The session is still open while its text is being stored;
                     // it says who started this recording.
-                    let session = shared.lock().session.clone();
                     let api_text = text.clone();
                     let api_model = model.clone();
                     // A partial transcription is not guaranteed: the audio stays
@@ -997,7 +1126,7 @@ fn run_daemon() {
                         let data = shared.lock();
                         (data.config.play_end_sound, data.config.sound_volume)
                     };
-                    if play {
+                    if end_cue(play, source == voice_button::history::Source::Site) {
                         voice_button::sound::play_end(volume);
                     }
                     if !text_is_empty {
@@ -1045,14 +1174,20 @@ fn run_daemon() {
                                     .then(|| dir.as_ref().map(|dir| session::audio_path(dir).display().to_string()))
                                     .flatten();
                                 saved_audio = audio.clone();
+                                // The phone owns the time of its own messages:
+                                // a message recorded offline and delivered an
+                                // hour later still belongs to the hour it was
+                                // spoken.
                                 let entry = state::HistoryEntry {
-                                    at: now_stamp(),
+                                    at: at.unwrap_or_else(now_stamp),
                                     text,
                                     model,
                                     parts: Vec::new(),
                                     source,
                                     state: entry_state,
                                     audio,
+                                    group: None,
+                                    message: None,
                                 };
                                 match voice_button::history::append(&dirs.root, &entry) {
                                     Ok(row) => {
@@ -1342,6 +1477,28 @@ fn run_daemon() {
         }
         // API server lifecycle follows the settings: enabling, disabling or
         // moving it restarts the listener and republishes its real address.
+        // Violet tray icon while any background task runs: the microphone stays
+        // available, and no sound is played for that work.
+        let background = shared.lock().background_active();
+        if background != last_background {
+            last_background = background;
+            let _ = tray_cmds.send(tray::TrayCommand::SetBackground(background));
+        }
+        // The phone server follows the settings the way the local API does:
+        // switching it on, off or to another port happens without a restart.
+        let wanted_phone = (cfg.site_enabled, cfg.site_port);
+        if phone_applied != Some(wanted_phone) {
+            phone_applied = Some(wanted_phone);
+            apply_phone(
+                &dirs.root,
+                wanted_phone.0,
+                wanted_phone.1,
+                &shared,
+                &asr,
+                &mut phone,
+                &mut last_site_paired,
+            );
+        }
         let wanted_api = (cfg.api_enabled, cfg.api_host.clone(), cfg.api_port);
         if api_applied.as_ref() != Some(&wanted_api) {
             api_applied = Some(wanted_api.clone());
@@ -1397,6 +1554,87 @@ fn run_daemon() {
                         error: None,
                     },
                 );
+            }
+        }
+        // "Connect phone" and "Disconnect" arrive as request files, like the
+        // file import does: the UI process never touches the phone storage.
+        // The daemon owns the database and applies the change there.
+        if let Some(runtime) = phone.as_ref() {
+            let db = runtime.hub().db_handle();
+            let url = voice_button::site::gate::display_url(runtime.port);
+            let change = {
+                let mut db = db.lock().unwrap();
+                apply_site_db_requests(&dirs.root, &mut db)
+            };
+            if change.pairing {
+                log::log("phone: a new pairing token was issued");
+            }
+            if change.revoked {
+                log::log("phone: the token was revoked");
+            }
+            if change.pairing || change.revoked {
+                let paired = db.lock().unwrap().data().client.paired;
+                publish_site_state(&dirs.root, true, runtime.port, url.clone(), paired);
+            }
+            // The pairing happens inside the server thread: the window only
+            // knows what is published, so a change must be published.
+            if last_site_check.elapsed() >= Duration::from_secs(1) {
+                last_site_check = std::time::Instant::now();
+                let paired = db.lock().unwrap().data().client.paired;
+                if last_site_paired != Some(paired) {
+                    last_site_paired = Some(paired);
+                    publish_site_state(&dirs.root, true, runtime.port, url, paired);
+                }
+            }
+        } else if let Some(request) = ipc::take_site_archive_request(&dirs.root) {
+            // With the server off the daemon still owns the file and may
+            // archive a monolog: nothing else writes it right now.
+            match voice_button::site::db::Db::open(&dirs.root) {
+                Ok(mut db) => {
+                    db.archive_monolog(request.monolog, request.archived);
+                    if let Err(e) = db.save() {
+                        log::log(&format!("cannot save site/db.json: {e:#}"));
+                    }
+                }
+                Err(e) => log::log(&format!("cannot open site/db.json: {e:#}")),
+            }
+        }
+        // Internet access: the script opens the firewall and, where it can,
+        // the router. It shows a UAC prompt, so it runs on its own thread.
+        if !ipc::site_network_busy(&dirs.root) {
+            if let Some(enable) = ipc::take_site_network(&dirs.root) {
+                ipc::set_site_network_busy(&dirs.root, true);
+                let root = dirs.root.clone();
+                let port = cfg.site_port;
+                let internal = voice_button::site::gate::private_ipv4()
+                    .map(|ip| ip.to_string())
+                    .unwrap_or_default();
+                let skip_upnp = voice_button::site::gate::has_public_ipv4();
+                std::thread::spawn(move || {
+                    let result = if enable {
+                        if let Some(state) = voice_button::site::network::read(&root) {
+                            if voice_button::site::network::stale(&state, port) {
+                                let _ = voice_button::site::network::clear(&root);
+                            }
+                        }
+                        voice_button::site::network::apply(&root, port, &internal, skip_upnp)
+                    } else {
+                        voice_button::site::network::clear(&root)
+                    };
+                    if let Err(e) = result {
+                        // The script exits non-zero when the prompt is
+                        // dismissed: say so instead of leaving the last good
+                        // state on screen.
+                        log::log(&format!("network: {e:#}"));
+                        voice_button::site::network::record_failure(
+                            &root,
+                            &voice_button::i18n::tr(
+                                "The setup did not finish. Approve the administrator prompt and try again.",
+                            ),
+                        );
+                    }
+                    ipc::set_site_network_busy(&root, false);
+                });
             }
         }
         // The Settings window asks for the shortcut(s) to be released while it
@@ -1459,6 +1697,12 @@ fn run_daemon() {
     if let Some(mut child) = ui_child {
         let _ = child.kill();
     }
+    // Stop the phone layer before the process goes away: the queue thread and
+    // the HTTPS port must not outlive the daemon.
+    if let Some(mut runtime) = phone.take() {
+        runtime.stop();
+    }
+    publish_site_state(&dirs.root, false, cfg.site_port, String::new(), false);
     shared.lock().quit = true;
     // A clean exit must not look like a crash to the guard or the next start.
     log::clear_running(&dirs.root);
@@ -1498,7 +1742,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{merged_entry, with_separator};
+    use super::{end_cue, merged_entry, with_separator};
     use voice_button::daemon;
     use std::sync::atomic::AtomicBool;
     use std::sync::mpsc;
@@ -1512,6 +1756,15 @@ mod tests {
         HistoryChunk, HistoryEntry, Interactor, Session, Shared, Status, StreamSession,
     };
 
+    #[test]
+    fn background_work_never_plays_the_end_cue() {
+        // The phone is a background task: the person is not waiting for it, so
+        // there is no cue. A local dictation still gets one.
+        assert!(!end_cue(true, true));
+        assert!(!end_cue(false, false));
+        assert!(end_cue(true, false));
+    }
+
     fn entry(text: &str) -> HistoryEntry {
         HistoryEntry {
             at: "2026-11-07 10:00:00".to_string(),
@@ -1521,6 +1774,8 @@ mod tests {
             source: voice_button::state::Source::User,
             state: voice_button::history::EntryState::Complete,
             audio: None,
+            group: None,
+            message: None,
         }
     }
 
@@ -1784,5 +2039,33 @@ mod tests {
             with_separator("Привет ", PasteSeparator::Newline),
             "Привет "
         );
+    }
+
+    #[test]
+    fn an_archive_request_reaches_the_daemon_database() {
+        let dirs = temp_dirs("archive-request");
+        let id = {
+            let mut db = voice_button::site::db::Db::open(&dirs.root).unwrap();
+            let monolog = db.create_monolog("Работа", "2026-11-12T10:00:00+05:00");
+            db.save().unwrap();
+            monolog.id
+        };
+        // The window only leaves a request file; the daemon applies it.
+        voice_button::ipc::request_site_archive(&dirs.root, id, true);
+        let change = {
+            let mut db = voice_button::site::db::Db::open(&dirs.root).unwrap();
+            super::apply_site_db_requests(&dirs.root, &mut db)
+        };
+        assert!(change.archive);
+        assert!(!dirs.root.join("site.archive.request").exists(), "consumed");
+        let db = voice_button::site::db::Db::open(&dirs.root).unwrap();
+        assert!(db.monolog(id).unwrap().archived, "the daemon saved it");
+
+        voice_button::ipc::request_site_archive(&dirs.root, id, false);
+        let mut db = voice_button::site::db::Db::open(&dirs.root).unwrap();
+        super::apply_site_db_requests(&dirs.root, &mut db);
+        let db = voice_button::site::db::Db::open(&dirs.root).unwrap();
+        assert!(!db.monolog(id).unwrap().archived, "and it can come back");
+        let _ = std::fs::remove_dir_all(&dirs.root);
     }
 }

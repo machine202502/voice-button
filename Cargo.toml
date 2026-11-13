@@ -20,6 +20,9 @@ name = "voice-button-ui"
 path = "src/ui_main.rs"
 
 [dependencies]
+# A listening socket that can be rebound while Windows still holds the old
+# connections in TIME_WAIT; std::net does not expose SO_REUSEADDR.
+socket2 = "0.4"
 anyhow = "1"
 chrono = "0.4"
 cpal = "0.15"
@@ -38,6 +41,16 @@ winit = "0.29"
 image = { version = "0.25", default-features = false, features = ["png"] }
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging", "Win32_Media_Audio", "Win32_Graphics_Gdi", "Win32_Storage_Xps", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_Globalization"] }
 sherpa-onnx = { version = "2", default-features = false, features = ["shared"] }
+# The phone talks to the app over HTTPS: browsers refuse microphone access on
+# plain HTTP. Certificates are generated locally, so no CA is involved.
+# The authority is reloaded from its own PEM files, which needs the parser.
+rcgen = { version = "0.11", features = ["pem", "x509-parser"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+rustls-pemfile = "2"
+# Addresses of the machine: the certificate and the QR code need them.
+if-addrs = "0.13"
+getrandom = "0.2"
+qrcode = { version = "0.14", default-features = false }
 
 [build-dependencies]
 winresource = "0.1"
