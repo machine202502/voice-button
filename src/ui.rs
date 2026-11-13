@@ -8,7 +8,7 @@ use eframe::egui;
 use egui::{ProgressBar, RichText, ScrollArea};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub const WINDOW_TITLE: &str = "Voice Button";
 
@@ -16,6 +16,7 @@ pub const WINDOW_TITLE: &str = "Voice Button";
 enum Tab {
     Capture,
     History,
+    Telegram,
     Settings,
     External,
 }
@@ -36,6 +37,7 @@ enum HistoryFilter {
     Server,
     File,
     Phone,
+    Telegram,
 }
 
 impl HistoryFilter {
@@ -46,6 +48,7 @@ impl HistoryFilter {
             HistoryFilter::Server => source == state::Source::Server,
             HistoryFilter::File => source == state::Source::File,
             HistoryFilter::Phone => source == state::Source::Site,
+            HistoryFilter::Telegram => source == state::Source::Telegram,
         }
     }
 }
@@ -231,6 +234,8 @@ fn run_ui(config: config::Config, history: state::History, dirs: AppDirs, tab: S
         Tab::History
     } else if tab == "api" {
         Tab::External
+    } else if tab == "telegram" {
+        Tab::Telegram
     } else {
         Tab::Capture
     };
@@ -254,6 +259,9 @@ fn run_ui(config: config::Config, history: state::History, dirs: AppDirs, tab: S
         api_copied_at: 0.0,
         site_qr: None,
         phone: PhoneState::default(),
+        telegram_chat: Vec::new(),
+        telegram_chat_at: None,
+        telegram_form: TelegramForm::default(),
         snapshot_dir: std::env::var("VB_SNAPSHOT").ok().map(PathBuf::from),
         snapshot_frame: 0,
     };
@@ -517,6 +525,9 @@ pub struct MainWindow {
     /// The QR code of the current pairing link, cached by its text.
     site_qr: Option<(String, egui::TextureHandle)>,
     phone: PhoneState,
+    telegram_chat: Vec<crate::telegram::ChatEntry>,
+    telegram_chat_at: Option<Instant>,
+    telegram_form: TelegramForm,
     snapshot_dir: Option<PathBuf>,
     snapshot_frame: u32,
 }
@@ -525,6 +536,22 @@ impl eframe::App for MainWindow {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Keep the UI fresh (e.g. download progress) between events.
         ctx.request_repaint_after(Duration::from_millis(250));
+        if self.tab == Tab::Telegram
+            && self.telegram_chat_at.map(|at| at.elapsed() > Duration::from_millis(500)).unwrap_or(true)
+        {
+            self.telegram_chat = crate::telegram::chat(&self.dirs);
+            self.telegram_chat_at = Some(Instant::now());
+        }
+        if self.tab == Tab::Settings
+            && self
+                .telegram_form
+                .snapshot_at
+                .map(|at| at.elapsed() > Duration::from_secs(1))
+                .unwrap_or(true)
+        {
+            self.telegram_form.snapshot = Some(crate::telegram::snapshot(&self.dirs.root));
+            self.telegram_form.snapshot_at = Some(Instant::now());
+        }
 
         let mut data = self.shared.lock();
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -532,6 +559,7 @@ impl eframe::App for MainWindow {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.tab, Tab::Capture, tr("Capture"));
                 ui.selectable_value(&mut self.tab, Tab::History, tr("History"));
+                ui.selectable_value(&mut self.tab, Tab::Telegram, tr("Telegram"));
                 ui.selectable_value(&mut self.tab, Tab::Settings, tr("Settings"));
                 ui.selectable_value(&mut self.tab, Tab::External, tr("External access"));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -556,13 +584,16 @@ impl eframe::App for MainWindow {
                     &mut self.expanded_history,
                     &mut self.history_filter,
                 ),
+                Tab::Telegram => telegram_body(ui, &self.telegram_chat),
                 Tab::Settings => {
                     // The settings page is taller than the window on small
                     // screens, so keep everything reachable by scrolling.
                     ScrollArea::vertical()
                         .id_source("settings_scroll")
                         .auto_shrink([false, false])
-                        .show(ui, |ui| settings_body(ui, &mut data, &self.dirs));
+                        .show(ui, |ui| {
+                            settings_body(ui, &mut data, &self.dirs, &mut self.telegram_form)
+                        });
                 }
                 Tab::External => external_body(
                     ui,
@@ -932,7 +963,12 @@ fn apply_settings(data: &mut Data, dirs: &AppDirs) {
     }
 }
 
-fn settings_body(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs) {
+fn settings_body(
+    ui: &mut egui::Ui,
+    data: &mut Data,
+    dirs: &AppDirs,
+    telegram: &mut TelegramForm,
+) {
     ui.heading(tr("Interface language"));
     let locales = crate::i18n::available();
     let selected = if data.config.ui_language.is_empty() {
@@ -1262,11 +1298,140 @@ fn settings_body(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs) {
             .color(egui::Color32::from_rgb(230, 170, 60)),
         );
     }
+    ui.separator();
+    telegram_settings(ui, data, dirs, telegram);
     if let Some(err) = &data.last_error {
         ui.label(
             RichText::new(trf("Error: {error}", &[("error", err)])).color(egui::Color32::from_rgb(230, 90, 90)),
         );
     }
+}
+
+#[derive(Default)]
+struct TelegramForm {
+    token: String,
+    proxy: String,
+    snapshot: Option<crate::telegram::Snapshot>,
+    snapshot_at: Option<Instant>,
+}
+
+fn telegram_settings(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs, form: &mut TelegramForm) {
+    ui.heading(tr("Telegram bot"));
+    let mut commit = ui
+        .checkbox(&mut data.config.telegram_enabled, tr("Receive files from Telegram"))
+        .changed();
+    ui.horizontal(|ui| {
+        ui.label(tr("Proxy:"));
+        let proxy = ui.add(
+            egui::TextEdit::singleline(&mut data.config.telegram_proxy)
+                .hint_text("http://127.0.0.1:10408"),
+        );
+        commit |= proxy.lost_focus();
+    });
+    if commit {
+        apply_settings(data, dirs);
+    }
+    if form.proxy.is_empty() {
+        form.proxy = data.config.telegram_proxy.clone();
+    }
+    ui.label(RichText::new(tr(
+        "The token is stored for this Windows user only; it is never written to config.json.",
+    )).weak().small());
+    ui.horizontal(|ui| {
+        ui.add(
+            egui::TextEdit::singleline(&mut form.token)
+                .password(true)
+                .hint_text(tr("Bot token from @BotFather")),
+        );
+        if ui.button(tr("Save token")).clicked() {
+            // An empty config proxy means "keep the proxy stored with the
+            // token"; saving a token must not wipe it.
+            let proxy = if data.config.telegram_proxy.trim().is_empty() {
+                crate::telegram::read_secure(dirs).proxy
+            } else {
+                data.config.telegram_proxy.clone()
+            };
+            crate::ipc::request_telegram_token(&dirs.root, &form.token, &proxy);
+            form.token.clear();
+        }
+    });
+    if let Some(snapshot) = &form.snapshot {
+        let owner = snapshot
+            .owner
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| tr("nobody yet — send /start to the bot").to_string());
+        ui.label(trf("Owner: {owner}", &[("owner", &owner)]));
+        ui.label(trf("In queue: {count}", &[("count", &snapshot.queued.to_string())]));
+        if let Some(current) = &snapshot.current {
+            ui.label(trf(
+                "Now: {file} · {stage}",
+                &[("file", &current.file_name), ("stage", &current.stage)],
+            ));
+        }
+        if let Some(error) = &snapshot.last_error {
+            ui.label(RichText::new(error).color(egui::Color32::from_rgb(230, 90, 90)).small());
+        }
+        if ui.button(tr("Reset the bot owner")).clicked() {
+            crate::ipc::request_telegram_reset(&dirs.root);
+        }
+    }
+}
+
+fn telegram_body(ui: &mut egui::Ui, chat: &[crate::telegram::ChatEntry]) {
+    ui.heading(tr("Telegram"));
+    ui.label(
+        RichText::new(tr(
+            "Files sent to the bot and their transcripts. Read-only: Telegram keeps the originals.",
+        ))
+        .weak()
+        .small(),
+    );
+    if chat.is_empty() {
+        ui.label(RichText::new(tr("Nothing from Telegram yet.")).weak());
+        return;
+    }
+    ui.separator();
+    ScrollArea::vertical()
+        .id_source("telegram_scroll")
+        .auto_shrink([false, false])
+        .stick_to_bottom(true)
+        .show(ui, |ui| {
+            let mut day = String::new();
+            for entry in chat {
+                let entry_day = entry.at.get(..10).unwrap_or("").to_string();
+                if entry_day != day {
+                    day = entry_day;
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(&day).small().weak());
+                }
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    let clock = entry.at.get(11..16).unwrap_or("");
+                    let seconds = if entry.seconds > 0.0 {
+                        format!(" · {:.0} с", entry.seconds)
+                    } else {
+                        String::new()
+                    };
+                    ui.label(RichText::new(format!(
+                        "{} · {}{}{}",
+                        clock,
+                        entry.kind,
+                        if entry.file_name.is_empty() { "" } else { " · " },
+                        entry.file_name
+                    )).small().weak());
+                    ui.label(RichText::new(if entry.text.is_empty() { "—" } else { &entry.text }));
+                    if let Some(error) = &entry.error {
+                        ui.label(RichText::new(error).color(egui::Color32::from_rgb(230, 90, 90)).small());
+                    }
+                    ui.horizontal(|ui| {
+                        ui.hyperlink_to(tr("Open in Telegram"), entry.link());
+                        if !entry.text.is_empty() && ui.small_button(tr("Copy")).clicked() {
+                            copy_to_clipboard(&entry.text);
+                        }
+                        ui.label(RichText::new(seconds).small().weak());
+                    });
+                });
+            }
+        });
 }
 
 /// "External access": the local server for scripts and pages, and the phone
@@ -2701,6 +2866,7 @@ fn history_body(
         ui.selectable_value(&mut next, HistoryFilter::Server, tr("Server"));
         ui.selectable_value(&mut next, HistoryFilter::File, tr("File"));
         ui.selectable_value(&mut next, HistoryFilter::Phone, tr("Phone"));
+        ui.selectable_value(&mut next, HistoryFilter::Telegram, tr("Telegram"));
         *filter = next;
     });
     ui.separator();
@@ -2728,6 +2894,7 @@ fn history_body(
             HistoryFilter::Server => "No transcriptions started by the API server yet.",
             HistoryFilter::File => "No imported files yet.",
             HistoryFilter::Phone => "No messages from the phone yet.",
+            HistoryFilter::Telegram => "No Telegram messages yet.",
         });
         return;
     }
@@ -2820,6 +2987,13 @@ fn history_body(
                                         RichText::new(tr("file"))
                                             .small()
                                             .color(egui::Color32::from_rgb(70, 190, 90)),
+                                    );
+                                }
+                                if row.source() == state::Source::Telegram {
+                                    ui.label(
+                                        RichText::new(tr("Telegram"))
+                                            .small()
+                                            .color(egui::Color32::from_rgb(90, 170, 220)),
                                     );
                                 }
                                 if row.source() == state::Source::Site {

@@ -591,6 +591,16 @@ fn apply_site_db_requests(
         db.archive_monolog(request.monolog, request.archived);
         change.archive = true;
     }
+    if let Some(request) = ipc::take_telegram_token_request(root) {
+        if let Err(error) =
+            voice_button::telegram::write_secure_root(root, &request.token, &request.proxy)
+        {
+            voice_button::log::log(&format!("telegram: cannot store the token: {error:#}"));
+        }
+    }
+    if ipc::take_telegram_reset(root) {
+        voice_button::telegram::reset_owner(root);
+    }
     if change != SiteDbChange::default() {
         if let Err(e) = db.save() {
             log::log(&format!("cannot save site/db.json: {e:#}"));
@@ -946,6 +956,9 @@ fn run_daemon() {
     let asr = Arc::new(Mutex::new(AsrClient::new(
         std::env::current_exe().unwrap_or_else(|_| "voice-button.exe".into()),
     )));
+    // The Telegram bot waits for its switch and token, then polls in its own
+    // threads; it is lower priority than the phone and the microphone.
+    voice_button::telegram::spawn(dirs.clone(), shared.clone(), asr.clone());
     // The phone layer: the runtime opens the database, starts the queue pump
     // and binds the HTTPS port. Binding happens here, so a busy port is
     // reported instead of vanishing into a thread.

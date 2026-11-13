@@ -26,6 +26,8 @@ pub enum Source {
     /// Dictated from the phone: the original text never changes here, the
     /// phone keeps its own editable copy.
     Site,
+    /// A voice/file sent to the Telegram bot.
+    Telegram,
 }
 
 /// Whether the recording behind an entry was transcribed completely.

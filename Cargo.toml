@@ -41,6 +41,10 @@ winit = "0.29"
 image = { version = "0.25", default-features = false, features = ["png"] }
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging", "Win32_Media_Audio", "Win32_Graphics_Gdi", "Win32_Storage_Xps", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_Globalization"] }
 sherpa-onnx = { version = "2", default-features = false, features = ["shared"] }
+# Telegram voice notes are Ogg/Opus. Symphonia 0.5 has neither, so the bot uses
+# the 0.6 line with the pure-Rust Opus decoder; the rest of the app keeps 0.5.
+symphonia06 = { package = "symphonia", version = "0.6.1", features = ["ogg", "mkv", "mp3", "aac", "isomp4", "alac"] }
+symphonia-opus = "0.1"
 # The phone talks to the app over HTTPS: browsers refuse microphone access on
 # plain HTTP. Certificates are generated locally, so no CA is involved.
 # The authority is reloaded from its own PEM files, which needs the parser.

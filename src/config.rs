@@ -114,6 +114,15 @@ pub struct Config {
     /// microphone answer faster when the owner takes it back.
     #[serde(default = "default_site_segment_seconds")]
     pub site_segment_seconds: f32,
+    /// Telegram bot: off until the person turns it on in the settings.
+    #[serde(default)]
+    pub telegram_enabled: bool,
+    /// Proxy for api.telegram.org, e.g. http://127.0.0.1:10408. Empty = direct.
+    #[serde(default)]
+    pub telegram_proxy: String,
+    /// Test/override base URL; empty uses the real Bot API.
+    #[serde(default)]
+    pub telegram_api_base: String,
 }
 
 /// Shortcuts start unbound: the user picks them in Settings.
@@ -172,6 +181,9 @@ impl Default for Config {
             site_public_url: String::new(),
             site_lan_only: true,
             site_segment_seconds: default_site_segment_seconds(),
+            telegram_enabled: false,
+            telegram_proxy: String::new(),
+            telegram_api_base: String::new(),
         }
     }
 }

@@ -22,6 +22,8 @@ pub mod site;
 pub mod sound;
 pub mod state;
 pub mod stitch;
+pub mod telegram;
+pub mod telegram_media;
 pub mod transcribe;
 pub mod tray;
 pub mod ui;

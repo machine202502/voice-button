@@ -168,6 +168,45 @@ pub fn take_site_revoke_request(root: &Path) -> bool {
     }
 }
 
+/// Store or replace the Telegram bot token without writing it to config.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct TelegramTokenRequest {
+    pub token: String,
+    #[serde(default)]
+    pub proxy: String,
+}
+
+pub fn request_telegram_token(root: &Path, token: &str, proxy: &str) {
+    let request = TelegramTokenRequest {
+        token: token.to_string(),
+        proxy: proxy.to_string(),
+    };
+    if let Ok(text) = serde_json::to_string(&request) {
+        atomic_write(root.join("telegram.token.request"), text.as_bytes());
+    }
+}
+
+pub fn take_telegram_token_request(root: &Path) -> Option<TelegramTokenRequest> {
+    let path = root.join("telegram.token.request");
+    let text = std::fs::read_to_string(&path).ok()?;
+    let _ = std::fs::remove_file(&path);
+    serde_json::from_str(&text).ok()
+}
+
+pub fn request_telegram_reset(root: &Path) {
+    atomic_write(root.join("telegram.reset.request"), b"1");
+}
+
+pub fn take_telegram_reset(root: &Path) -> bool {
+    let path = root.join("telegram.reset.request");
+    if path.exists() {
+        let _ = std::fs::remove_file(&path);
+        true
+    } else {
+        false
+    }
+}
+
 /// Ask the daemon to archive or unarchive one monolog. The window never writes
 /// `site/db.json`: it leaves the request and the daemon applies it.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
