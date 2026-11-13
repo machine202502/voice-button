@@ -2,6 +2,7 @@ target/
 dist/
 design/
 plans/
+node_modules/
 # Written by tests/phone-e2e.py when a run fails.
 tests/e2e-diag.log
 # Python bytecode from the test scripts.
@@ -10,3 +11,11 @@ __pycache__/
 
 # Downloaded by scripts/package.ps1 at package time (25 MB, not source).
 installer/vc_redist.x64.exe
+
+# The new phone page: dependencies, Vite output and the staging directory.
+web/node_modules/
+web/dist/
+src/web.new/
+
+# The phone page is built from web/ into src/web, which the daemon serves.
+src/web/

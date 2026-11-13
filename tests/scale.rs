@@ -91,8 +91,8 @@ fn fifty_thousand_rows_are_read_by_window() {
         root: root.clone(),
         models: PathBuf::new(),
     };
-    assert_eq!(voice_button::telegram::chat_count(&dirs), 50_000);
-    let chat = voice_button::telegram::chat_page(&dirs, 200, 49_800);
+    assert_eq!(voice_button::telegram::chat_count(&dirs, voice_button::telegram::ChatRange::All), 50_000);
+    let chat = voice_button::telegram::chat_page(&dirs, voice_button::telegram::ChatRange::All, 200, 49_800);
     assert_eq!(chat.len(), 200);
     assert_eq!(chat[0].text, "telegram row 49800");
 

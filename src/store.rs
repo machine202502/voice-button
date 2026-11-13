@@ -209,10 +209,15 @@ CREATE TABLE IF NOT EXISTS telegram_chat (
     file_name TEXT NOT NULL DEFAULT '',
     seconds REAL NOT NULL DEFAULT 0,
     text TEXT NOT NULL DEFAULT '',
-    error TEXT
+    error TEXT,
+    -- When the bot handled the message, in UTC. The `at` above is the date of the
+    -- original file, which can be years old; the log and its date filter follow
+    -- the processing order, so they need this one.
+    added_at TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS telegram_chat_at ON telegram_chat(at, id);
+CREATE INDEX IF NOT EXISTS telegram_chat_added ON telegram_chat(added_at, id);
 
 CREATE TABLE IF NOT EXISTS site_client (
     id INTEGER PRIMARY KEY CHECK (id = 1),

@@ -6,6 +6,7 @@ use crate::site::db::{MessageRow, MonologRow};
 use crate::store::Store;
 use crate::i18n::{tr, trf};
 use crate::state::{self, Data, Shared};
+use crate::theme::{self, Palette, Theme};
 use arboard;
 use eframe::egui;
 use egui::{ProgressBar, RichText, ScrollArea};
@@ -14,6 +15,39 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub const WINDOW_TITLE: &str = "Voice Button";
+
+/// Tell Windows which mode the frame is in.
+///
+/// The title bar is drawn by the system, not by us, so switching the palette
+/// alone leaves the caption in the old mode: dark mode paints white text, which
+/// on the light theme is unreadable. DWMWA_USE_IMMERSIVE_DARK_MODE is the switch
+/// the desktop honours.
+fn apply_caption_theme(dark: bool) {
+    use windows_sys::Win32::Graphics::Dwm::{
+        DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE,
+    };
+    let hwnd = find_own_window();
+    if hwnd == 0 {
+        return;
+    }
+    let value: i32 = i32::from(dark);
+    // SAFETY: the handle belongs to this process (find_own_window filters by pid)
+    // and the attribute expects a DWORD of this size.
+    unsafe {
+        DwmSetWindowAttribute(
+            hwnd as *mut core::ffi::c_void,
+            DWMWA_USE_IMMERSIVE_DARK_MODE as u32,
+            &value as *const i32 as *const core::ffi::c_void,
+            std::mem::size_of::<i32>() as u32,
+        );
+    }
+}
+
+/// The palette of the theme the window is painted with right now. `theme::apply`
+/// has already put the theme into the visuals, so pages do not thread it around.
+fn pal(ui: &egui::Ui) -> Palette {
+    theme::palette(theme::active(ui.ctx()))
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
@@ -85,7 +119,13 @@ pub fn run_from_args() {
         cfg.ui_language = "en".to_string();
         cfg.backend = Backend::Onnx;
         cfg.onnx_model = "gigaam-v3-sherpa-int8".to_string();
-        cfg.language = "auto".to_string();
+        // GigaAM cannot detect the language itself, so the snapshot uses a real
+        // code: "auto" here painted an amber warning across the Settings shot.
+        cfg.language = "ru".to_string();
+        // Committed snapshots must not depend on the config or the Windows
+        // theme: the walk below forces dark and switches to light only for the
+        // two review frames.
+        cfg.theme = Theme::Dark;
         history = state::History::from_entries(vec![
             state::HistoryEntry {
                 at: "2026-11-05 09:14:32".to_string(),
@@ -227,6 +267,9 @@ fn install_cjk_fonts(ctx: &egui::Context) {
 }
 
 fn run_ui(config: config::Config, history: state::History, dirs: AppDirs, tab: String) {
+    // The window owns its colours now; the OS theme must not repaint it, and
+    // the palette starts from the saved theme (dark when the file has none).
+    let initial_theme = config.theme;
     let shared = Arc::new(Shared::new(config, history));
     let store = match Store::open(&dirs.root) {
         Ok(store) => Arc::new(store),
@@ -258,6 +301,12 @@ fn run_ui(config: config::Config, history: state::History, dirs: AppDirs, tab: S
         ..Default::default()
     };
     options.viewport = options.viewport.with_active(true);
+    // eframe follows the Windows theme by default and would overwrite the
+    // palette on a system theme change; the app's own setting wins here.
+    options.follow_system_theme = false;
+    let snapshot_theme = std::env::var("VB_SNAPSHOT")
+        .ok()
+        .map(|_| Theme::Dark);
     let app = MainWindow {
         shared: shared.clone(),
         dirs: dirs.clone(),
@@ -275,6 +324,7 @@ fn run_ui(config: config::Config, history: state::History, dirs: AppDirs, tab: S
         history_filter: HistoryFilter::All,
         history_search: String::new(),
         history_paged: Paged::new(),
+        history_heights: crate::lazy_list::LazyList::new(0.0, 20.0),
         history_key: None,
         history_query: None,
         download_done_seen: false,
@@ -282,15 +332,24 @@ fn run_ui(config: config::Config, history: state::History, dirs: AppDirs, tab: S
         site_qr: None,
         phone: PhoneState::default(),
         telegram_chat: Paged::new(),
+        telegram_heights: crate::lazy_list::LazyList::new(8.0, 120.0),
         telegram_key: None,
         telegram_form: TelegramForm::default(),
         telegram_search: String::new(),
+        telegram_range: crate::telegram::ChatRange::default(),
         snapshot_dir: std::env::var("VB_SNAPSHOT").ok().map(PathBuf::from),
         snapshot_frame: 0,
+        applied_theme: Some(theme::resolve(initial_theme)),
+        applied_setting: Some(initial_theme),
+        theme_checked_at: None,
+        snapshot_theme,
     };
     let creator: Box<dyn FnOnce(&eframe::CreationContext<'_>) -> Box<dyn eframe::App>> =
         Box::new(move |cc| {
             install_cjk_fonts(&cc.egui_ctx);
+            let theme = theme::resolve(initial_theme);
+            theme::apply(&cc.egui_ctx, theme);
+            apply_caption_theme(matches!(theme, crate::theme::Theme::Dark));
             Box::new(app)
         });
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -381,6 +440,11 @@ fn spawn_file_poller(shared: Arc<Shared>, dirs: AppDirs, store: Arc<crate::store
     std::thread::spawn(move || {
         let config_path = dirs.root.join("config.json");
         let mut config_meta = meta_key(&std::fs::metadata(&config_path).ok());
+        // A snapshot run paints illustrative states on purpose. After its first
+        // read, a later daemon-file poll must not overwrite them, otherwise the
+        // committed image depends on where the 300 ms poll happens to land.
+        let snapshot = std::env::var("VB_SNAPSHOT").is_ok();
+        let mut first_poll = true;
         loop {
             std::thread::sleep(Duration::from_millis(300));
             let m = meta_key(&std::fs::metadata(&config_path).ok());
@@ -406,36 +470,39 @@ fn spawn_file_poller(shared: Arc<Shared>, dirs: AppDirs, store: Arc<crate::store
             });
             {
                 let mut data = shared.lock();
-                data.download = download;
-                if let Some(status) = crate::ipc::read_status(&dirs.root) {
-                    data.status = status;
+                if !snapshot || first_poll {
+                    data.download = download;
+                    if let Some(status) = crate::ipc::read_status(&dirs.root) {
+                        data.status = status;
+                    }
+                    match crate::ipc::read_live(&dirs.root) {
+                        Some(live) => {
+                            data.live_text = live.text;
+                            data.live_started_ms = live.started;
+                        }
+                        None => {
+                            data.live_text.clear();
+                            data.live_started_ms = 0;
+                        }
+                    }
+                    data.api = crate::ipc::read_api_state(&dirs.root).map(Into::into);
+                    data.site = crate::ipc::read_site_state(&dirs.root);
+                    data.session_view = crate::ipc::read_session(&dirs.root).map(Into::into);
+                    data.site_pairing = crate::site::db::client(&store).and_then(|client| {
+                        if client.paired || client.token.is_empty() {
+                            None
+                        } else {
+                            Some(state::SitePairing {
+                                token: client.token,
+                                until: client.expires,
+                            })
+                        }
+                    });
+                    data.site_network = crate::site::network::read(&dirs.root);
+                    data.site_network_busy = crate::ipc::site_network_busy(&dirs.root);
                 }
-                match crate::ipc::read_live(&dirs.root) {
-                    Some(live) => {
-                        data.live_text = live.text;
-                        data.live_started_ms = live.started;
-                    }
-                    None => {
-                        data.live_text.clear();
-                        data.live_started_ms = 0;
-                    }
-                }
-                data.api = crate::ipc::read_api_state(&dirs.root).map(Into::into);
-                data.site = crate::ipc::read_site_state(&dirs.root);
-                data.session_view = crate::ipc::read_session(&dirs.root).map(Into::into);
-                data.site_pairing = crate::site::db::client(&store).and_then(|client| {
-                    if client.paired || client.token.is_empty() {
-                        None
-                    } else {
-                        Some(state::SitePairing {
-                            token: client.token,
-                            until: client.expires,
-                        })
-                    }
-                });
-                data.site_network = crate::site::network::read(&dirs.root);
-                data.site_network_busy = crate::ipc::site_network_busy(&dirs.root);
             }
+            first_poll = false;
         }
     });
 }
@@ -455,8 +522,6 @@ struct PhoneState {
     open: Option<u64>,
     search: String,
     selected: std::collections::BTreeSet<u64>,
-    /// Snapshot mode only: scroll the phone page to the monolog list.
-    focus_list: bool,
     /// One page window over `monologs`, keyed by (revision, archive, search).
     monologs: Paged<MonologRow>,
     monolog_key: Option<(u64, bool, String)>,
@@ -465,6 +530,10 @@ struct PhoneState {
     /// (revision, monolog id).
     messages: Paged<MessageRow>,
     message_key: Option<(u64, u64)>,
+    /// Measured heights: a message is as tall as its text, a monolog as tall as
+    /// its preview. Both lists are lazy with per-row heights.
+    monolog_heights: crate::lazy_list::LazyList,
+    message_heights: crate::lazy_list::LazyList,
 }
 
 /// Messages drawn per frame. A phone can collect thousands of takes; drawing
@@ -481,6 +550,8 @@ pub struct MainWindow {
     history_filter: HistoryFilter,
     history_search: String,
     history_paged: Paged<crate::history::HistoryRow>,
+    /// Measured heights of the history rows: an opened row is as tall as its text.
+    history_heights: crate::lazy_list::LazyList,
     history_key: Option<(u64, HistoryFilter, String)>,
     history_query: Option<(HistoryFilter, String)>,
     download_done_seen: bool,
@@ -491,11 +562,26 @@ pub struct MainWindow {
     site_qr: Option<(String, egui::TextureHandle)>,
     phone: PhoneState,
     telegram_chat: Paged<crate::telegram::ChatEntry>,
-    telegram_key: Option<(u64, String)>,
+    /// Measured heights of the Telegram rows: they differ by message length.
+    telegram_heights: crate::lazy_list::LazyList,
+    telegram_key: Option<(u64, String, crate::telegram::ChatRange)>,
     telegram_form: TelegramForm,
     telegram_search: String,
+    /// Today / week / everything: the log opens on today.
+    telegram_range: crate::telegram::ChatRange,
     snapshot_dir: Option<PathBuf>,
     snapshot_frame: u32,
+    /// Theme the visuals currently carry. A mismatch means Settings (or the
+    /// config file) changed it and the palette must be applied again.
+    applied_theme: Option<Theme>,
+    /// The setting `applied_theme` was resolved from, `System` included.
+    applied_setting: Option<Theme>,
+    /// When the Windows setting was last read for `System`, so a live Windows
+    /// light/dark switch is picked up without a registry read every frame.
+    theme_checked_at: Option<Instant>,
+    /// Snapshot mode only: overrides the config so committed images do not
+    /// depend on it. `None` outside snapshot runs.
+    snapshot_theme: Option<Theme>,
 }
 
 impl eframe::App for MainWindow {
@@ -516,6 +602,28 @@ impl eframe::App for MainWindow {
         }
 
         let mut data = self.shared.lock();
+        // Settings, the config file and the snapshot walk all write the theme
+        // into `config`/`snapshot_theme`. `System` is resolved here: right away
+        // when the setting changes, and at most once a second otherwise, so a
+        // Windows light/dark switch is followed without a WM_SETTINGCHANGE hook.
+        let setting = self.snapshot_theme.unwrap_or(data.config.theme);
+        let recheck = self.applied_setting != Some(setting)
+            || setting != Theme::System
+            || self.applied_theme.is_none()
+            || self
+                .theme_checked_at
+                .map(|at| at.elapsed() >= Duration::from_secs(1))
+                .unwrap_or(true);
+        if recheck {
+            self.applied_setting = Some(setting);
+            self.theme_checked_at = Some(Instant::now());
+            let wanted = theme::resolve(setting);
+            if self.applied_theme != Some(wanted) {
+                theme::apply(ctx, wanted);
+                apply_caption_theme(matches!(wanted, crate::theme::Theme::Dark));
+                self.applied_theme = Some(wanted);
+            }
+        }
         egui::CentralPanel::default().show(ctx, |ui| {
             show_download_banner(ui, &mut data, &self.dirs);
             ui.horizontal(|ui| {
@@ -546,6 +654,7 @@ impl eframe::App for MainWindow {
                     &mut self.history_filter,
                     &mut self.history_search,
                     &mut self.history_paged,
+                    &mut self.history_heights,
                 ),
                 Tab::Settings => {
                     // The settings page is taller than the window on small
@@ -566,6 +675,8 @@ impl eframe::App for MainWindow {
                     &mut self.site_qr,
                     &mut self.phone,
                     &mut self.telegram_chat,
+                    &mut self.telegram_heights,
+                    &mut self.telegram_range,
                     &mut self.telegram_form,
                     &mut self.telegram_search,
                 ),
@@ -588,6 +699,14 @@ impl eframe::App for MainWindow {
         }
 
         self.drive_snapshot();
+    }
+
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        // The window background behind the panels follows the theme, so a
+        // resize never shows a dark strip under the light palette.
+        theme::palette(self.applied_theme.unwrap_or(Theme::Dark))
+            .bg
+            .to_normalized_gamma_f32()
     }
 }
 
@@ -616,14 +735,16 @@ impl MainWindow {
         let telegram_key = (
             self.store.revision("rev.telegram"),
             self.telegram_search.trim().to_string(),
+            self.telegram_range,
         );
         if self.telegram_key.as_ref() != Some(&telegram_key) {
             let total = if telegram_key.1.is_empty() {
-                crate::telegram::chat_count(&self.dirs)
+                crate::telegram::chat_count(&self.dirs, telegram_key.2)
             } else {
-                crate::telegram::chat_search_count(&self.dirs, &telegram_key.1)
+                crate::telegram::chat_search_count(&self.dirs, telegram_key.2, &telegram_key.1)
             };
             self.telegram_chat.reset(total);
+            self.telegram_heights.reset();
             self.telegram_key = Some(telegram_key);
         }
 
@@ -732,10 +853,9 @@ impl MainWindow {
                 self.tab = Tab::External;
                 self.external_tab = ExternalTab::Phone;
                 // The seeded database holds one monolog with two messages:
-                // open it and scroll to the list so the snapshot shows it.
+                // open it so the snapshot shows both the QR and the list.
                 self.phone.open = Some(1);
                 self.phone.selected.insert(2);
-                self.phone.focus_list = true;
                 let mut data = self.shared.lock();
                 data.download = None;
                 data.config.site_enabled = true;
@@ -760,10 +880,100 @@ impl MainWindow {
                 });
                 data.site_network_busy = false;
             }
-            // Several frames let the scroll animation settle before the shot;
-            // the target is set on the first frame that draws the list.
-            70 => self.capture(&dir.join("phone.png")),
-            72 => std::process::exit(0),
+            // The seeded database holds one monolog with two messages; it is
+            // open, so the shot shows the QR and the list.
+            70 => {
+                self.capture(&dir.join("phone.png"));
+                // The dark set is complete. The rest is the same states in the
+                // light theme: switch the palette and replay them, so both sets
+                // come from the same deterministic data.
+                self.snapshot_theme = Some(Theme::Light);
+                // The picker in the light Settings shot must agree with the
+                // paint. Nothing is saved: the walk never calls apply_settings.
+                let mut data = self.shared.lock();
+                data.config.theme = Theme::Light;
+                data.download = None;
+                data.status = crate::state::Status::Recording;
+                data.live_text =
+                    "Book a table for two at the Italian place on Saturday evening.".to_string();
+                data.live_started_ms = chrono::Local::now().timestamp_millis() - 42_000;
+                data.file = None;
+                self.tab = Tab::Capture;
+            }
+            74 => self.capture(&dir.join("capture-recording-light.png")),
+            75 => {
+                let mut data = self.shared.lock();
+                data.status = crate::state::Status::Idle;
+                data.live_text.clear();
+                data.live_started_ms = 0;
+                self.tab = Tab::Settings;
+            }
+            77 => self.capture(&dir.join("settings-light.png")),
+            78 => {
+                let mut data = self.shared.lock();
+                data.config.api_enabled = true;
+                data.api = Some(state::ApiStatus {
+                    running: true,
+                    host: "127.0.0.1".to_string(),
+                    port: 8931,
+                    error: None,
+                });
+                self.tab = Tab::External;
+                self.external_tab = ExternalTab::LocalServer;
+            }
+            80 => self.capture(&dir.join("api-light.png")),
+            81 => {
+                let mut data = self.shared.lock();
+                data.config.api_enabled = false;
+                data.api = None;
+                self.tab = Tab::History;
+            }
+            84 => self.capture(&dir.join("history-light.png")),
+            85 => self.expanded_history = Some(0),
+            88 => self.capture(&dir.join("history-expanded-light.png")),
+            89 => {
+                self.expanded_history = None;
+                self.tab = Tab::Settings;
+                self.show_about = true;
+            }
+            92 => self.capture(&dir.join("about-light.png")),
+            93 => {
+                self.show_about = false;
+                let mut data = self.shared.lock();
+                data.status = crate::state::Status::Idle;
+                data.live_text.clear();
+                data.live_started_ms = 0;
+                data.file = None;
+                self.tab = Tab::Capture;
+            }
+            95 => self.capture(&dir.join("record-light.png")),
+            96 => {
+                let mut data = self.shared.lock();
+                data.download = Some(state::DownloadProgress {
+                    model: "v3_ctc".to_string(),
+                    file: 1,
+                    files: 2,
+                    downloaded: 63_443_213,
+                    total: Some(224_893_347),
+                    done_bytes: 73_105,
+                    done_total: 73_105,
+                    done: false,
+                    error: None,
+                    cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                });
+            }
+            99 => self.capture(&dir.join("download-progress-light.png")),
+            100 => {
+                let mut data = self.shared.lock();
+                data.download = None;
+                self.tab = Tab::External;
+                self.external_tab = ExternalTab::Phone;
+                self.phone.open = Some(1);
+                self.phone.selected.clear();
+                self.phone.selected.insert(2);
+            }
+            103 => self.capture(&dir.join("phone-light.png")),
+            105 => std::process::exit(0),
             _ => {}
         }
     }
@@ -986,6 +1196,7 @@ fn apply_settings(data: &mut Data, dirs: &AppDirs) {
 }
 
 fn settings_body(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs) {
+    let p = pal(ui);
     ui.heading(tr("Interface language"));
     let locales = crate::i18n::available();
     let selected = if data.config.ui_language.is_empty() {
@@ -1070,7 +1281,50 @@ fn settings_body(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs) {
     if selection_pending(data) {
         ui.label(
             RichText::new(tr("The selected model is not downloaded yet — the selection applies once it is ready."))
-                .color(egui::Color32::from_rgb(230, 170, 60)),
+                .color(p.amber),
+        );
+    }
+    ui.separator();
+    // The model's input language belongs with the model, not at the bottom of
+    // the page next to the shortcuts.
+    let (format, model_id) = match data.config.backend {
+        Backend::Whisper => (Backend::Whisper, data.config.whisper_model.as_str()),
+        Backend::Onnx => (Backend::Onnx, data.config.onnx_model.as_str()),
+    };
+    let supports_auto = model_manager::supports_auto(format, model_id);
+    let mut language_changed = false;
+    ui.horizontal(|ui| {
+        ui.label(tr("Language code:"));
+        egui::ComboBox::from_id_source("language_code")
+            .selected_text(data.config.language.clone())
+            .show_ui(ui, |ui| {
+                if supports_auto {
+                    language_changed |= ui
+                        .selectable_value(
+                            &mut data.config.language,
+                            "auto".to_string(),
+                            tr("auto (detect automatically)"),
+                        )
+                        .changed();
+                }
+                for code in [
+                    "ru", "en", "de", "fr", "es", "pt", "it", "nl", "pl", "tr", "zh", "ja", "ko",
+                ] {
+                    language_changed |= ui
+                        .selectable_value(&mut data.config.language, code.to_string(), code)
+                        .changed();
+                }
+            });
+    });
+    if language_changed {
+        apply_settings(data, dirs);
+    }
+    if data.config.language == "auto" && !supports_auto {
+        ui.label(
+            RichText::new(
+                tr("The current model cannot detect the language automatically — pick a language code."),
+            )
+            .color(p.amber),
         );
     }
     ui.separator();
@@ -1243,6 +1497,28 @@ fn settings_body(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs) {
     );
     ui.separator();
     ui.heading(tr("Appearance"));
+    // `accent` is the fill/icon colour and is too light for text; labels and
+    // links use `accent_ink` through the style, never the palette's accent.
+    ui.horizontal(|ui| {
+        ui.label(tr("Theme:"));
+        let mut theme = data.config.theme;
+        let mut theme_changed = false;
+        theme_changed |= ui
+            .radio_value(&mut theme, Theme::Dark, tr(Theme::Dark.label()))
+            .changed();
+        theme_changed |= ui
+            .radio_value(&mut theme, Theme::Light, tr(Theme::Light.label()))
+            .changed();
+        theme_changed |= ui
+            .radio_value(&mut theme, Theme::System, tr(Theme::System.label()))
+            .changed();
+        if theme_changed {
+            data.config.theme = theme;
+            // Saved right away; the update loop resolves System and repaints
+            // with the new palette on the next frame — nothing to restart.
+            apply_settings(data, dirs);
+        }
+    });
     if ui
         .checkbox(&mut data.config.holiday_icons, tr("Holiday icons"))
         .changed()
@@ -1287,50 +1563,9 @@ fn settings_body(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs) {
     hotkey_section(ui, data, dirs, HotkeyField::Record);
     hotkey_section(ui, data, dirs, HotkeyField::Append);
     hotkey_section(ui, data, dirs, HotkeyField::Paste);
-    ui.separator();
-    let (format, model_id) = match data.config.backend {
-        Backend::Whisper => (Backend::Whisper, data.config.whisper_model.as_str()),
-        Backend::Onnx => (Backend::Onnx, data.config.onnx_model.as_str()),
-    };
-    let supports_auto = model_manager::supports_auto(format, model_id);
-    let mut language_changed = false;
-    ui.horizontal(|ui| {
-        ui.label(tr("Language code:"));
-        egui::ComboBox::from_id_source("language_code")
-            .selected_text(data.config.language.clone())
-            .show_ui(ui, |ui| {
-                if supports_auto {
-                    language_changed |= ui
-                        .selectable_value(
-                            &mut data.config.language,
-                            "auto".to_string(),
-                            tr("auto (detect automatically)"),
-                        )
-                        .changed();
-                }
-                for code in [
-                    "ru", "en", "de", "fr", "es", "pt", "it", "nl", "pl", "tr", "zh", "ja", "ko",
-                ] {
-                    language_changed |= ui
-                        .selectable_value(&mut data.config.language, code.to_string(), code)
-                        .changed();
-                }
-            });
-    });
-    if language_changed {
-        apply_settings(data, dirs);
-    }
-    if data.config.language == "auto" && !supports_auto {
-        ui.label(
-            RichText::new(
-                tr("The current model cannot detect the language automatically — pick a language code."),
-            )
-            .color(egui::Color32::from_rgb(230, 170, 60)),
-        );
-    }
     if let Some(err) = &data.last_error {
         ui.label(
-            RichText::new(trf("Error: {error}", &[("error", err)])).color(egui::Color32::from_rgb(230, 90, 90)),
+            RichText::new(trf("Error: {error}", &[("error", err)])).color(p.red),
         );
     }
 }
@@ -1370,6 +1605,7 @@ fn telegram_kind_label(kind: &str) -> String {
 }
 
 fn telegram_settings(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs, form: &mut TelegramForm) {
+    let p = pal(ui);
     ui.heading(tr("Telegram bot"));
     let mut commit = ui
         .checkbox(&mut data.config.telegram_enabled, tr("Receive files from Telegram"))
@@ -1419,7 +1655,7 @@ fn telegram_settings(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs, form: &
             ));
         }
         if let Some(error) = &snapshot.last_error {
-            ui.label(RichText::new(error).color(egui::Color32::from_rgb(230, 90, 90)).small());
+            ui.label(RichText::new(error).color(p.red).small());
         }
         if ui.button(tr("Reset the bot owner")).clicked() {
             crate::ipc::request_telegram_reset(&dirs.root);
@@ -1451,8 +1687,11 @@ fn telegram_body(
     ui: &mut egui::Ui,
     dirs: &AppDirs,
     chat: &mut Paged<crate::telegram::ChatEntry>,
+    heights: &mut crate::lazy_list::LazyList,
+    range: &mut crate::telegram::ChatRange,
     search: &mut String,
 ) {
+    let p = pal(ui);
     ui.heading(tr("Telegram"));
     ui.label(
         RichText::new(tr(
@@ -1461,6 +1700,10 @@ fn telegram_body(
         .weak()
         .small(),
     );
+    // The order is the bot's own: the first message it finished is at the top, the
+    // last at the bottom. The date under a card is the date of the *original* file,
+    // which can be years old for a forwarded note, so it is metadata only and never
+    // reorders anything.
     if chat.total() == 0 {
         ui.horizontal(|ui| {
             ui.add(
@@ -1485,6 +1728,11 @@ fn telegram_body(
                 .hint_text(tr("Search"))
                 .desired_width(220.0),
         );
+        // The log opens on today: the bot handled those messages now, and the
+        // date on a card is the date of the original file, which may be older.
+        ui.selectable_value(range, crate::telegram::ChatRange::Today, tr("Today"));
+        ui.selectable_value(range, crate::telegram::ChatRange::Week, tr("Week"));
+        ui.selectable_value(range, crate::telegram::ChatRange::All, tr("All time"));
         ui.label(
             RichText::new(trf("Messages: {count}", &[("count", &chat.total().to_string())]))
                 .small()
@@ -1492,102 +1740,148 @@ fn telegram_body(
         );
     });
     ui.separator();
-    // Uniform rows let egui draw only what is visible; the pages around the
-    // viewport come from SQLite on demand.
-    const ROW_HEIGHT: f32 = 220.0;
+    // Proper lazy list: each row is drawn at its natural height and measured, so a
+    // three-line message and a thirty-line one both fit, and nothing has to be
+    // guessed. Only the rows inside the viewport (plus a couple as a margin) are
+    // built; the pages they need come from SQLite on demand.
     let needle = search.trim().to_string();
     let total = chat.total();
+    if heights.len() != total {
+        heights.reset();
+        heights.ensure(total);
+    }
+    let spacing = 8.0_f32;
+    let mut changed = false;
     ScrollArea::vertical()
         .id_source("telegram_scroll")
         .auto_shrink([false, false])
-        .stick_to_bottom(true)
-        .show_rows(ui, ROW_HEIGHT, total, |ui, range| {
-            chat.ensure(range.clone(), |offset, limit| {
+        .show_viewport(ui, |ui, viewport| {
+            let content_top = ui.max_rect().top();
+            let row_width = ui.max_rect().width();
+            ui.set_height(heights.total());
+            let first = heights.index_at(viewport.min.y).saturating_sub(2);
+            let last = (heights.index_at(viewport.max.y) + 3).min(total);
+            if first >= last {
+                return;
+            }
+            chat.ensure(first..last, |offset, limit| {
                 if needle.is_empty() {
-                    crate::telegram::chat_page(dirs, limit, offset)
+                    crate::telegram::chat_page(dirs, *range, limit, offset)
                 } else {
-                    crate::telegram::chat_search_page(dirs, &needle, limit, offset)
+                    crate::telegram::chat_search_page(dirs, *range, &needle, limit, offset)
                 }
             });
-            for index in range {
+            for index in first..last {
                 let Some(entry) = chat.get(index) else {
                     continue;
                 };
-                let entry_day = telegram_day_label(&entry.at);
                 let previous_day = index
                     .checked_sub(1)
                     .and_then(|previous| chat.get(previous))
                     .map(|previous| telegram_day_label(&previous.at));
-                ui.allocate_ui_with_layout(
-                    egui::vec2(ui.available_width(), ROW_HEIGHT - 6.0),
-                    egui::Layout::top_down(egui::Align::Min),
-                    |ui| {
-                        if previous_day.as_deref() != Some(entry_day.as_str()) {
-                            ui.label(RichText::new(&entry_day).small().weak());
+                let top = content_top + heights.offset(index);
+                // The cell is as wide as the list and as tall as the content wants
+                // to be: the bottom is left open so nothing is squeezed.
+                let rect = egui::Rect::from_min_size(
+                    egui::pos2(ui.max_rect().left(), top),
+                    egui::vec2(row_width, heights.total().max(top) + 4000.0),
+                );
+                let drawn = ui
+                    .allocate_ui_at_rect(rect, |ui| {
+                        if previous_day.as_deref() != Some(entry_day(entry).as_str()) {
+                            ui.label(RichText::new(telegram_day_label(&entry.at)).small().weak());
                         }
                         egui::Frame::group(ui.style()).show(ui, |ui| {
                             ui.set_width(ui.available_width());
-                            let clock = telegram_date_label(&entry.at);
-                            let sender = if entry.sender.trim().is_empty() {
-                                tr("User")
-                            } else {
-                                entry.sender.clone()
-                            };
-                            let seconds = if entry.seconds > 0.0 {
-                                format!(" · {:.0} {}", entry.seconds, tr("s"))
-                            } else {
-                                String::new()
-                            };
-                            ui.label(
-                                RichText::new(format!(
-                                    "{} · {} · {}{}{}",
-                                    clock,
-                                    sender,
-                                    telegram_kind_label(&entry.kind),
-                                    if entry.file_name.is_empty() { "" } else { " · " },
-                                    entry.file_name
-                                ))
-                                .size(12.5)
-                                .color(ui.visuals().text_color()),
-                            );
-                            let body = if entry.text.is_empty() { "—" } else { entry.text.as_str() };
-                            ui.allocate_ui_with_layout(
-                                egui::vec2(ui.available_width(), 120.0),
-                                egui::Layout::top_down(egui::Align::Min),
-                                |ui| {
-                                    ScrollArea::vertical()
-                                        .id_source(("telegram_text", entry.message_id))
-                                        .max_height(120.0)
-                                        .auto_shrink([false, true])
-                                        .show(ui, |ui| {
-                                            ui.add(
-                                                egui::Label::new(body)
-                                                    .wrap(true)
-                                                    .sense(egui::Sense::hover()),
-                                            );
-                                        });
-                                },
-                            );
-                            if let Some(error) = &entry.error {
-                                ui.label(
-                                    RichText::new(error)
-                                        .color(egui::Color32::from_rgb(230, 90, 90))
-                                        .small(),
-                                );
-                            }
-                            ui.horizontal(|ui| {
-                                if !entry.text.is_empty()
-                                    && ui.small_button(tr("Copy")).clicked()
-                                {
-                                    copy_to_clipboard(&entry.text);
-                                }
-                                ui.label(RichText::new(seconds).small().weak());
-                            });
+                            telegram_card(ui, entry, p);
                         });
-                    },
-                );
+                    })
+                    .response
+                    .rect
+                    .height();
+                changed |= heights.set(index, drawn + spacing);
             }
         });
+    if changed {
+        ui.ctx().request_repaint();
+    }
+}
+
+/// Characters shown before a message is folded. Chosen so a preview stays
+/// readable in the narrow list and the button is worth pressing.
+const LONG_TEXT_CHARS: usize = 320;
+
+/// A message body that folds when it is long.
+///
+/// Tall rows are fine — the list measures them — but a telegram with five
+/// paragraphs should not push every other message off the screen. The open/closed
+/// state lives in the widget memory keyed by the message id, so it survives
+/// scrolling and repaints but not a restart.
+fn long_text(ui: &mut egui::Ui, id: egui::Id, body: &str) {
+    let chars = body.chars().count();
+    if chars <= LONG_TEXT_CHARS {
+        ui.add(egui::Label::new(body).wrap(true).sense(egui::Sense::hover()));
+        return;
+    }
+    let key = id.with("expanded");
+    let expanded = ui.data(|data| data.get_temp::<bool>(key).unwrap_or(false));
+    if expanded {
+        ui.add(egui::Label::new(body).wrap(true).sense(egui::Sense::hover()));
+        if ui.small_button(tr("Show less")).clicked() {
+            ui.data_mut(|data| data.insert_temp(key, false));
+        }
+    } else {
+        let mut preview: String = body.chars().take(LONG_TEXT_CHARS).collect();
+        preview.push('…');
+        ui.add(egui::Label::new(preview).wrap(true).sense(egui::Sense::hover()));
+        if ui.small_button(tr("Show more")).clicked() {
+            ui.data_mut(|data| data.insert_temp(key, true));
+        }
+    }
+}
+
+/// The day heading a row needs above it, if the previous row was another day.
+fn entry_day(entry: &crate::telegram::ChatEntry) -> String {
+    telegram_day_label(&entry.at)
+}
+
+/// One message card, at whatever height its text needs.
+fn telegram_card(ui: &mut egui::Ui, entry: &crate::telegram::ChatEntry, p: Palette) {
+    ui.set_width(ui.available_width());
+    let clock = telegram_date_label(&entry.at);
+    let sender = if entry.sender.trim().is_empty() {
+        tr("User")
+    } else {
+        entry.sender.clone()
+    };
+    let seconds = if entry.seconds > 0.0 {
+        format!(" · {:.0} {}", entry.seconds, tr("s"))
+    } else {
+        String::new()
+    };
+    ui.label(
+        RichText::new(format!(
+            "{} · {} · {}{}{}",
+            clock,
+            sender,
+            telegram_kind_label(&entry.kind),
+            if entry.file_name.is_empty() { "" } else { " · " },
+            entry.file_name
+        ))
+        .size(12.5)
+        .color(ui.visuals().text_color()),
+    );
+    let body = if entry.text.is_empty() { "—" } else { entry.text.as_str() };
+    long_text(ui, egui::Id::new(("telegram_body", entry.message_id)), body);
+    if let Some(error) = &entry.error {
+        ui.label(RichText::new(error).color(p.red).small());
+    }
+    ui.horizontal(|ui| {
+        if !entry.text.is_empty() && ui.small_button(tr("Copy")).clicked() {
+            copy_to_clipboard(&entry.text);
+        }
+        ui.label(RichText::new(seconds).small().weak());
+    });
 }
 /// "External access": the local server for scripts and pages, and the phone
 /// that dictates into monologs.
@@ -1603,6 +1897,8 @@ fn external_body(
     qr: &mut Option<(String, egui::TextureHandle)>,
     phone: &mut PhoneState,
     telegram_chat: &mut Paged<crate::telegram::ChatEntry>,
+    telegram_heights: &mut crate::lazy_list::LazyList,
+    telegram_range: &mut crate::telegram::ChatRange,
     telegram: &mut TelegramForm,
     telegram_search: &mut String,
 ) {
@@ -1620,7 +1916,7 @@ fn external_body(
             ui.separator();
             telegram_settings(ui, data, dirs, telegram);
             ui.separator();
-            telegram_body(ui, dirs, telegram_chat, telegram_search);
+            telegram_body(ui, dirs, telegram_chat, telegram_heights, telegram_range, telegram_search);
         }
     }
 }
@@ -1734,6 +2030,7 @@ fn phone_settings(
     qr: &mut Option<(String, egui::TextureHandle)>,
     phone: &mut PhoneState,
 ) {
+    let p = pal(ui);
     source_model_picker(ui, data, dirs, SourceModel::Phone);
     ui.separator();
     ui.heading(tr("Phone"));
@@ -1787,7 +2084,7 @@ fn phone_settings(
                 ui.label(
                     RichText::new(&site.url)
                         .monospace()
-                        .color(egui::Color32::from_rgb(90, 200, 120)),
+                        .color(p.success),
                 );
                 if ui.button(tr("Copy")).clicked() {
                     copy_to_clipboard(&site.url);
@@ -1796,14 +2093,14 @@ fn phone_settings(
                 if site.paired {
                     ui.label(
                         RichText::new(tr("The phone is connected"))
-                            .color(egui::Color32::from_rgb(70, 190, 90)),
+                            .color(p.success),
                     );
                 } else {
                     ui.label(RichText::new(tr("No phone is connected")).weak());
                 }
             });
             if *copied_at > 0.0 && ctx.input(|i| i.time) < *copied_at + 2.0 {
-                ui.label(RichText::new(tr("Copied!")).color(egui::Color32::from_rgb(90, 200, 120)));
+                ui.label(RichText::new(tr("Copied!")).color(p.success));
             }
             let now = chrono::Local::now().to_rfc3339();
             if let Some(pairing) = data
@@ -1839,7 +2136,7 @@ fn phone_settings(
                         "The link lives until {time}, then it stops working.",
                         &[("time", &clock)],
                     ))
-                    .color(egui::Color32::from_rgb(230, 170, 60)),
+                    .color(p.amber),
                 );
                 ui.label(
                     RichText::new(tr(
@@ -1866,18 +2163,18 @@ fn phone_settings(
                 // and one plain sentence.
                 let (dot, title) = match (&network, busy) {
                     (_, true) => (
-                        egui::Color32::from_rgb(230, 170, 60),
+                        p.amber,
                         tr("Setting up…"),
                     ),
                     (Some(network), _) if network.enabled && network.error.is_none() => (
-                        egui::Color32::from_rgb(90, 200, 110),
+                        p.success,
                         tr("Internet access is on"),
                     ),
                     (Some(network), _) if network.error.is_some() => (
-                        egui::Color32::from_rgb(230, 90, 90),
+                        p.red,
                         tr("Internet access failed"),
                     ),
-                    _ => (egui::Color32::from_gray(140), tr("Internet access is off")),
+                    _ => (p.muted, tr("Internet access is off")),
                 };
                 ui.horizontal(|ui| {
                     let size = egui::vec2(14.0, 14.0);
@@ -1894,7 +2191,7 @@ fn phone_settings(
                     Some(network) if network.error.is_some() => {
                         ui.label(
                             RichText::new(network.error.clone().unwrap_or_default())
-                                .color(egui::Color32::from_rgb(230, 90, 90))
+                                .color(p.red)
                                 .small(),
                         );
                     }
@@ -1934,7 +2231,7 @@ fn phone_settings(
         Some(_) if data.config.site_enabled => {
             // The server is started and stopped live, so this branch means it
             // was asked for and could not listen: say why, not "restart".
-            ui.label(RichText::new(tr("Stopped")).color(egui::Color32::GRAY));
+            ui.label(RichText::new(tr("Stopped")).color(p.muted));
             ui.label(
                 RichText::new(tr("The phone server did not start. The log has the reason."))
                 .weak()
@@ -1942,22 +2239,14 @@ fn phone_settings(
             );
         }
         _ => {
-            ui.label(RichText::new(tr("Stopped")).color(egui::Color32::GRAY));
+            ui.label(RichText::new(tr("Stopped")).color(p.muted));
         }
     }
 
     // The monologs stay visible whether the server is running or not: they
     // belong to the person, not to the connection.
     ui.separator();
-    let list_top = ui.cursor().min;
     phone_monologs(ui, store, phone, dirs);
-    if phone.focus_list {
-        // Snapshot mode only: put the list in view for the screenshot.
-        ui.scroll_to_rect(
-            egui::Rect::from_min_size(list_top, egui::vec2(ui.available_width(), 1.0)),
-            Some(egui::Align::TOP),
-        );
-    }
 }
 
 /// The monologs the phone dictated, with the open one's messages below.
@@ -2034,14 +2323,28 @@ fn phone_monologs(
             egui::vec2(350.0, list_height),
             egui::Layout::top_down(egui::Align::Min),
             |ui| {
-                // Uniform rows: only the visible monologs are drawn and only
-                // the pages near the viewport are loaded.
-                const MONOLOG_ROW_HEIGHT: f32 = 72.0;
+                // Lazy rows with measured heights: a two-line monolog name and a
+                // long preview do not share a size, and forcing them to would
+                // leave holes. Only the rows near the viewport are built, and only
+                // the pages they need are read.
+                if phone.monolog_heights.len() != total {
+                    phone.monolog_heights.reset();
+                    phone.monolog_heights.ensure(total);
+                }
+                let mut monolog_changed = false;
                 ScrollArea::vertical()
                     .id_source("phone_monolog_list")
                     .auto_shrink([false, false])
-                    .show_rows(ui, MONOLOG_ROW_HEIGHT, total, |ui, range| {
-                        phone.monologs.ensure(range.clone(), |offset, limit| {
+                    .show_viewport(ui, |ui, viewport| {
+                        let content_top = ui.max_rect().top();
+                        let row_width = ui.max_rect().width();
+                        ui.set_height(phone.monolog_heights.total());
+                        let first = phone.monolog_heights.index_at(viewport.min.y).saturating_sub(2);
+                        let last = (phone.monolog_heights.index_at(viewport.max.y) + 3).min(total);
+                        if first >= last {
+                            return;
+                        }
+                        phone.monologs.ensure(first..last, |offset, limit| {
                             crate::site::db::monolog_page(
                                 store,
                                 showing_archive,
@@ -2050,7 +2353,7 @@ fn phone_monologs(
                                 limit,
                             )
                         });
-                        for index in range {
+                        for index in first..last {
                             let Some(monolog) = phone.monologs.get(index) else {
                                 continue;
                             };
@@ -2064,21 +2367,30 @@ fn phone_monologs(
                                 trf("Messages: {count}", &[("count", &monolog.count.to_string())]),
                                 preview
                             );
-                            if ui
-                                .add_sized(
-                                    egui::vec2(ui.available_width(), 66.0),
-                                    egui::SelectableLabel::new(
-                                        selected,
-                                        RichText::new(text).size(14.0),
-                                    ),
+                            let top = content_top + phone.monolog_heights.offset(index);
+                            let rect = egui::Rect::from_min_size(
+                                egui::pos2(ui.max_rect().left(), top),
+                                egui::vec2(
+                                    row_width,
+                                    phone.monolog_heights.total().max(top) + 4000.0,
+                                ),
+                            );
+                            let drawn = ui.allocate_ui_at_rect(rect, |ui| {
+                                ui.add(
+                                    egui::SelectableLabel::new(selected, RichText::new(text).size(14.0)),
                                 )
                                 .clicked()
-                            {
+                            });
+                            monolog_changed |= phone.monolog_heights.set(index, drawn.response.rect.height() + 6.0);
+                            if drawn.inner {
                                 phone.open = Some(monolog.id);
                                 phone.selected.clear();
                             }
                         }
                     });
+                if monolog_changed {
+                    ui.ctx().request_repaint();
+                }
             },
         );
         ui.separator();
@@ -2178,16 +2490,29 @@ fn phone_messages(
     });
     ui.add_space(2.0);
     // Like the phone's own chat: oldest at the top, newest at the bottom, one
-    // header per day. Uniform rows keep the scrollbar exact.
-    const MESSAGE_ROW_HEIGHT: f32 = 112.0;
+    // header per day. Every row keeps its own height — a message is as tall as
+    // its text — and the list builds only the rows inside the viewport.
+    if phone.message_heights.len() != total {
+        phone.message_heights.reset();
+        phone.message_heights.ensure(total);
+    }
+    let mut changed = false;
     ScrollArea::vertical()
         .id_source(("phone_messages_scroll", monolog.id))
         .auto_shrink([false, false])
-        .show_rows(ui, MESSAGE_ROW_HEIGHT, total, |ui, range| {
-            phone.messages.ensure(range.clone(), |offset, limit| {
+        .show_viewport(ui, |ui, viewport| {
+            let content_top = ui.max_rect().top();
+            let row_width = ui.max_rect().width();
+            ui.set_height(phone.message_heights.total());
+            let first = phone.message_heights.index_at(viewport.min.y).saturating_sub(2);
+            let last = (phone.message_heights.index_at(viewport.max.y) + 3).min(total);
+            if first >= last {
+                return;
+            }
+            phone.messages.ensure(first..last, |offset, limit| {
                 crate::site::db::message_page(store, monolog.id, offset, limit)
             });
-            for index in range {
+            for index in first..last {
                 let Some(message) = phone.messages.get(index) else {
                     continue;
                 };
@@ -2196,10 +2521,16 @@ fn phone_messages(
                     .checked_sub(1)
                     .and_then(|previous| phone.messages.get(previous))
                     .and_then(|previous| previous.recorded.get(0..10));
-                ui.allocate_ui_with_layout(
-                    egui::vec2(ui.available_width(), MESSAGE_ROW_HEIGHT - 4.0),
-                    egui::Layout::top_down(egui::Align::Min),
-                    |ui| {
+                let top = content_top + phone.message_heights.offset(index);
+                let rect = egui::Rect::from_min_size(
+                    egui::pos2(ui.max_rect().left(), top),
+                    egui::vec2(
+                        row_width,
+                        phone.message_heights.total().max(top) + 4000.0,
+                    ),
+                );
+                let drawn = ui
+                    .allocate_ui_at_rect(rect, |ui| {
                         if previous_day != Some(day.as_str()) {
                             ui.label(
                                 RichText::new(day_header(&message.recorded))
@@ -2229,31 +2560,22 @@ fn phone_messages(
                                         .weak(),
                                 );
                             });
-                            ui.allocate_ui_with_layout(
-                                egui::vec2(ui.available_width(), 56.0),
-                                egui::Layout::top_down(egui::Align::Min),
-                                |ui| {
-                                    ScrollArea::vertical()
-                                        .id_source(("phone_text", message.id))
-                                        .max_height(56.0)
-                                        .auto_shrink([false, true])
-                                        .show(ui, |ui| {
-                                            if message.text.trim().is_empty() {
-                                                ui.label(RichText::new("…").weak());
-                                            } else {
-                                                ui.add(
-                                                    egui::Label::new(RichText::new(&message.text))
-                                                        .wrap(true),
-                                                );
-                                            }
-                                        });
-                                },
-                            );
+                            if message.text.trim().is_empty() {
+                                ui.label(RichText::new("…").weak());
+                            } else {
+                                long_text(ui, egui::Id::new(("phone_body", message.id)), &message.text);
+                            }
                         });
-                    },
-                );
+                    })
+                    .response
+                    .rect
+                    .height();
+                changed |= phone.message_heights.set(index, drawn + 6.0);
             }
         });
+    if changed {
+        ui.ctx().request_repaint();
+    }
 }
 
 /// shown unchanged instead of being hidden.
@@ -2275,13 +2597,14 @@ fn stage_label(stage: crate::site::monolog::Stage) -> String {
 
 /// QR code of the pairing link, as a texture the window can draw.
 fn qr_texture(ctx: &egui::Context, text: &str) -> Option<egui::TextureHandle> {
+    let p = theme::palette(theme::active(ctx));
     let code = qrcode::QrCode::new(text.as_bytes()).ok()?;
     let width = code.width();
     let quiet = 2usize;
     let scale = 4usize;
     let side = (width + quiet * 2) * scale;
     let colors = code.to_colors();
-    let mut image = egui::ColorImage::new([side, side], egui::Color32::WHITE);
+    let mut image = egui::ColorImage::new([side, side], p.qr_bg);
     for y in 0..width {
         for x in 0..width {
             if colors[y * width + x] != qrcode::Color::Dark {
@@ -2291,7 +2614,7 @@ fn qr_texture(ctx: &egui::Context, text: &str) -> Option<egui::TextureHandle> {
                 for dx in 0..scale {
                     let px = (x + quiet) * scale + dx;
                     let py = (y + quiet) * scale + dy;
-                    image[(px, py)] = egui::Color32::from_rgb(20, 24, 20);
+                    image[(px, py)] = p.qr_fg;
                 }
             }
         }
@@ -2306,6 +2629,7 @@ fn api_body(
     ctx: &egui::Context,
     copied_at: &mut f64,
 ) {
+    let p = pal(ui);
     ui.heading(tr("Local server"));
     ui.label(
         RichText::new(
@@ -2345,7 +2669,7 @@ fn api_body(
             RichText::new(
                 tr("This host is reachable from the network: anyone who can open the port can start recordings."),
             )
-            .color(egui::Color32::from_rgb(230, 170, 60)),
+            .color(p.amber),
         );
     }
 
@@ -2358,7 +2682,7 @@ fn api_body(
             ui.label(
                 RichText::new(&url)
                     .monospace()
-                    .color(egui::Color32::from_rgb(90, 200, 120)),
+                    .color(p.success),
             );
             if ui.button(tr("Copy")).clicked() {
                 if let Ok(mut clipboard) = arboard::Clipboard::new() {
@@ -2369,18 +2693,18 @@ fn api_body(
         });
         // Transient "Copied!" feedback right after a copy click.
         if *copied_at > 0.0 && ctx.input(|i| i.time) < *copied_at + 2.0 {
-            ui.label(RichText::new(tr("Copied!")).color(egui::Color32::from_rgb(90, 200, 120)));
+            ui.label(RichText::new(tr("Copied!")).color(p.success));
         }
     } else if data.config.api_enabled {
         match data.api.as_ref().and_then(|s| s.error.clone()) {
             Some(error) => ui.label(
                 RichText::new(trf("Not listening: {error}", &[("error", &error)]))
-                    .color(egui::Color32::from_rgb(230, 90, 90)),
+                    .color(p.red),
             ),
-            None => ui.label(RichText::new(tr("Starting…")).color(egui::Color32::GRAY)),
+            None => ui.label(RichText::new(tr("Starting…")).color(p.muted)),
         };
     } else {
-        ui.label(RichText::new(tr("Stopped")).color(egui::Color32::GRAY));
+        ui.label(RichText::new(tr("Stopped")).color(p.muted));
     }
 
     ui.separator();
@@ -2480,6 +2804,7 @@ fn stop_hotkey_capture(data: &mut Data, dirs: &AppDirs) {
 }
 
 fn hotkey_section(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs, field: HotkeyField) {
+    let p = pal(ui);
     let heading = tr(match field {
         HotkeyField::Record => "Global hotkey",
         HotkeyField::Append => "Append hotkey (continue the last message)",
@@ -2510,7 +2835,7 @@ fn hotkey_section(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs, field: Hot
         if field.capturing(data) {
             ui.label(
                 RichText::new(tr("press Ctrl/Alt/Shift + key (or an F-key), Esc cancels"))
-                    .color(egui::Color32::from_rgb(230, 170, 60)),
+                    .color(p.amber),
             );
         } else if ui.button(tr("Record shortcut")).clicked() {
             start_hotkey_capture(data, dirs, field);
@@ -2585,6 +2910,7 @@ fn hotkey_section(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs, field: Hot
 }
 
 fn download_section(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs, model_id: &str) {
+    let p = pal(ui);
     let active = data
         .download
         .as_ref()
@@ -2621,7 +2947,7 @@ fn download_section(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs, model_id
             if dl.model == model_id {
                 ui.label(
                     RichText::new(trf("Download error: {error}", &[("error", err)]))
-                        .color(egui::Color32::from_rgb(230, 90, 90)),
+                        .color(p.red),
                 );
             }
         } else if dl.done && dl.model == model_id {
@@ -2643,6 +2969,7 @@ fn download_section(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs, model_id
 }
 
 fn whisper_section(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs, locked: bool) {
+    let p = pal(ui);
     let custom = data.config.whisper_model == "custom";
     let mut changed = false;
     ui.add_enabled_ui(!locked, |ui| {
@@ -2693,7 +3020,7 @@ fn whisper_section(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs, locked: b
     if !custom {
         let id = data.config.whisper_model.clone();
         if model_manager::is_ready(&dirs.models, &id) {
-            ui.label(RichText::new(tr("Model is ready.")).color(egui::Color32::from_rgb(90, 200, 120)));
+            ui.label(RichText::new(tr("Model is ready.")).color(p.success));
         }
         download_section(ui, data, dirs, &id);
     } else {
@@ -2703,7 +3030,7 @@ fn whisper_section(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs, locked: b
                 if !PathBuf::from(&file).exists() {
                     ui.label(
                         RichText::new(tr("File does not exist."))
-                            .color(egui::Color32::from_rgb(230, 170, 60)),
+                            .color(p.amber),
                     );
                 }
             }
@@ -2724,6 +3051,7 @@ fn whisper_section(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs, locked: b
 }
 
 fn onnx_section(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs, locked: bool) {
+    let p = pal(ui);
     let custom = data.config.onnx_model == "custom";
     let mut changed = false;
     ui.add_enabled_ui(!locked, |ui| {
@@ -2774,7 +3102,7 @@ fn onnx_section(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs, locked: bool
     if !custom {
         let id = data.config.onnx_model.clone();
         if model_manager::is_ready(&dirs.models, &id) {
-            ui.label(RichText::new(tr("Model is ready.")).color(egui::Color32::from_rgb(90, 200, 120)));
+            ui.label(RichText::new(tr("Model is ready.")).color(p.success));
         }
         download_section(ui, data, dirs, &id);
     } else {
@@ -2792,7 +3120,7 @@ fn onnx_section(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs, locked: bool
                 if model_ok {
                     ui.label(
                         RichText::new(tr("Model files found."))
-                            .color(egui::Color32::from_rgb(90, 200, 120)),
+                            .color(p.success),
                     );
                 } else {
                     let missing = [
@@ -2807,7 +3135,7 @@ fn onnx_section(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs, locked: bool
                     .join(", ");
                     ui.label(
                         RichText::new(trf("Missing files: {missing}", &[("missing", &missing)]))
-                            .color(egui::Color32::from_rgb(230, 170, 60)),
+                            .color(p.amber),
                     );
                 }
             }
@@ -2845,6 +3173,7 @@ fn show_in_folder(path: &str) {
 /// Tab "File": pick an audio file and watch its transcription. The file is read
 /// where it is; the daemon never copies it.
 fn file_body(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs) {
+    let p = pal(ui);
     let refresh = data
         .file_seen
         .map(|at| at.elapsed() >= Duration::from_millis(250))
@@ -2907,7 +3236,7 @@ fn file_body(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs) {
         )));
     }
     if let Some(error) = &file.error {
-        ui.label(RichText::new(error).color(egui::Color32::from_rgb(200, 70, 70)));
+        ui.label(RichText::new(error).color(p.red));
     }
     if file.cancelled {
         ui.label(RichText::new(tr("Cancelled")).weak());
@@ -2929,11 +3258,12 @@ fn file_body(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs) {
 }
 
 fn capture_body(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs) {
+    let p = pal(ui);
     let status = data.status;
     match status {
         crate::state::Status::Recording => {
             if ui
-                .button(RichText::new(tr("Stop recording")).color(egui::Color32::from_rgb(200, 60, 60)))
+                .button(RichText::new(tr("Stop recording")).color(p.red))
                 .clicked()
             {
                 crate::ipc::write_record_request(&dirs.root, "user");
@@ -2949,7 +3279,7 @@ fn capture_body(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs) {
                 let model = model.map(|model| format!(" · {model}")).unwrap_or_default();
                 ui.label(
                     RichText::new(trf("API session: receiving audio{model}", &[("model", &model)]))
-                        .color(egui::Color32::from_rgb(230, 170, 60)),
+                        .color(p.amber),
                 );
                 ui.label(
                     RichText::new(
@@ -2963,10 +3293,10 @@ fn capture_body(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs) {
                     let secs = (elapsed / 1000).max(0);
                     ui.label(
                         RichText::new(trf("REC {secs}s", &[("secs", &secs.to_string())]))
-                            .color(egui::Color32::from_rgb(220, 60, 60)),
+                            .color(p.red),
                     );
                 } else {
-                    ui.label(RichText::new(tr("REC")).color(egui::Color32::from_rgb(220, 60, 60)));
+                    ui.label(RichText::new(tr("REC")).color(p.red));
                 }
                 ui.add_space(4.0);
                 // A dedicated read-only field makes the live state visible even
@@ -2995,12 +3325,12 @@ fn capture_body(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs) {
             }
         }
         crate::state::Status::Transcribing => {
-            ui.label(RichText::new(tr("Transcribing…")).color(egui::Color32::from_rgb(230, 150, 40)));
+            ui.label(RichText::new(tr("Transcribing…")).color(p.amber));
         }
         crate::state::Status::File => {
             ui.label(
                 RichText::new(tr("Transcribing a file…"))
-                    .color(egui::Color32::from_rgb(70, 190, 90)),
+                    .color(p.success),
             );
             ui.label(
                 RichText::new(tr(
@@ -3012,7 +3342,7 @@ fn capture_body(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs) {
         crate::state::Status::Recovering => {
             ui.label(
                 RichText::new(tr("Recovering a recording…"))
-                    .color(egui::Color32::from_rgb(70, 130, 240)),
+                    .color(p.info),
             );
             ui.label(
                 RichText::new(tr(
@@ -3037,7 +3367,7 @@ fn capture_body(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs) {
             if data.background_active() {
                 ui.label(
                     RichText::new(tr("Background task in progress…"))
-                        .color(egui::Color32::from_rgb(150, 110, 220)),
+                        .color(p.violet),
                 );
             }
             if ui
@@ -3090,11 +3420,6 @@ fn weekday_name(day: chrono::Weekday) -> &'static str {
     }
 }
 
-/// Height of one collapsed history row. A day header lives inside this slot,
-/// so every row has the same height and the scrollbar can map a position to a
-/// row without measuring the whole table.
-const HISTORY_ROW_HEIGHT: f32 = 22.0;
-
 fn history_entry_for(
     history: &state::History,
     row: &crate::history::HistoryRow,
@@ -3107,32 +3432,6 @@ fn history_entry_for(
     }
 }
 
-fn history_expanded_extra(ui: &egui::Ui, entry: &state::HistoryEntry, wrap_width: f32) -> f32 {
-    let font = egui::TextStyle::Body.resolve(ui.style());
-    let color = ui.visuals().text_color();
-    let spacing = ui.spacing().item_spacing.y;
-    let mut height = ui.fonts(|fonts| {
-        fonts
-            .layout(entry.text.clone(), font.clone(), color, wrap_width)
-            .size()
-            .y
-    }) + spacing
-        + 8.0;
-    for part in &entry.parts {
-        let part_height = ui.fonts(|fonts| {
-            fonts
-                .layout(part.text.clone(), font.clone(), color, wrap_width)
-                .size()
-                .y
-        });
-        height += ui.spacing().interact_size.y + part_height + 2.0 * spacing;
-    }
-    if !entry.parts.is_empty() {
-        height += spacing;
-    }
-    height
-}
-
 fn history_body(
     ui: &mut egui::Ui,
     data: &mut Data,
@@ -3140,7 +3439,9 @@ fn history_body(
     filter: &mut HistoryFilter,
     search: &mut String,
     paged: &mut Paged<crate::history::HistoryRow>,
+    heights: &mut crate::lazy_list::LazyList,
 ) {
+    let p = pal(ui);
     ui.horizontal(|ui| {
         ui.heading(tr("History"));
         ui.add_space(10.0);
@@ -3185,17 +3486,15 @@ fn history_body(
             data.history.page(&sources, &needle, offset, limit)
         });
     }
-    let expanded_entry = expanded.and_then(|index| {
-        let row = paged.get(index)?;
-        history_entry_for(&data.history, row, index)
-    });
-    let wrap_width = ui.available_width().max(32.0);
-    let extra = expanded_entry
-        .as_ref()
-        .map(|entry| history_expanded_extra(ui, entry, wrap_width))
-        .unwrap_or(0.0);
     let total = paged.total();
-    let total_height = total as f32 * HISTORY_ROW_HEIGHT + extra;
+    // Rows are measured like every other lazy list here: a collapsed row takes one
+    // line, an opened one takes as much as its transcript needs, and nothing is
+    // pre-computed with a guessed height.
+    if heights.len() != total {
+        heights.reset();
+        heights.ensure(total);
+    }
+    let mut changed = false;
 
     let mut copied: Option<String> = None;
     let mut toggle: Option<usize> = None;
@@ -3203,10 +3502,9 @@ fn history_body(
         .id_source("history_rows")
         .auto_shrink([false, false])
         .show_viewport(ui, |ui, viewport| {
-            ui.set_height(total_height);
-            let first = ((viewport.min.y / HISTORY_ROW_HEIGHT).floor() as usize).saturating_sub(2);
-            let last = (viewport.max.y / HISTORY_ROW_HEIGHT).ceil() as usize + 3;
-            let last = last.min(total);
+            ui.set_height(heights.total());
+            let first = heights.index_at(viewport.min.y).saturating_sub(2);
+            let last = (heights.index_at(viewport.max.y) + 3).min(total);
             if first >= last {
                 return;
             }
@@ -3219,16 +3517,10 @@ fn history_body(
                     continue;
                 };
                 let is_open = *expanded == Some(index);
-                let shift = if expanded.map(|open| open < index).unwrap_or(false) {
-                    extra
-                } else {
-                    0.0
-                };
-                let height = HISTORY_ROW_HEIGHT + if is_open { extra } else { 0.0 };
-                let top = content_top + index as f32 * HISTORY_ROW_HEIGHT + shift;
+                let top = content_top + heights.offset(index);
                 let rect = egui::Rect::from_min_size(
                     egui::pos2(ui.max_rect().left(), top),
-                    egui::vec2(ui.max_rect().width(), height),
+                    egui::vec2(ui.max_rect().width(), heights.total().max(top) + 4000.0),
                 );
                 let starts_day = index == 0
                     || paged
@@ -3240,7 +3532,8 @@ fn history_body(
                 } else {
                     None
                 };
-                ui.allocate_ui_at_rect(rect, |ui| {
+                let drawn = ui
+                    .allocate_ui_at_rect(rect, |ui| {
                     ui.set_width(ui.available_width());
                     ui.push_id(index, |ui| {
                         ui.horizontal(|ui| {
@@ -3282,21 +3575,21 @@ fn history_body(
                                 ui.label(
                                     RichText::new(tr("server"))
                                         .small()
-                                        .color(egui::Color32::from_rgb(230, 170, 60)),
+                                        .color(p.amber),
                                 );
                             }
                             if row.source() == state::Source::File {
                                 ui.label(
                                     RichText::new(tr("file"))
                                         .small()
-                                        .color(egui::Color32::from_rgb(70, 190, 90)),
+                                        .color(p.success),
                                 );
                             }
                             if row.source() == state::Source::Telegram {
                                 ui.label(
                                     RichText::new(tr("Telegram"))
                                         .small()
-                                        .color(egui::Color32::from_rgb(90, 170, 220)),
+                                        .color(p.info),
                                 );
                             }
                             if row.source() == state::Source::Site {
@@ -3307,14 +3600,14 @@ fn history_body(
                                 ui.label(
                                     RichText::new(text)
                                         .small()
-                                        .color(egui::Color32::from_rgb(150, 110, 220)),
+                                        .color(p.violet),
                                 );
                             }
                             if row.state().is_partial() {
                                 ui.label(
                                     RichText::new(tr("incomplete"))
                                         .small()
-                                        .color(egui::Color32::from_rgb(90, 150, 250)),
+                                        .color(p.info),
                                 );
                             }
                             if ui.selectable_label(is_open, row.preview()).clicked() {
@@ -3367,9 +3660,16 @@ fn history_body(
                             egui::Stroke::new(1.0_f32, ui.visuals().weak_text_color().gamma_multiply(0.25)),
                         );
                     });
-                });
+                    })
+                    .response
+                    .rect
+                    .height();
+                changed |= heights.set(index, drawn);
             }
         });
+    if changed {
+        ui.ctx().request_repaint();
+    }
     if let Some(index) = toggle {
         *expanded = if *expanded == Some(index) {
             None
@@ -3406,13 +3706,19 @@ fn about_lines() -> Vec<String> {
 
 /// The microphone in the About title: the holiday head when one is showing, the
 /// brand green on the tile and the stand, exactly like the tray's idle icon.
+/// Its colour comes from the palette, so the light theme does not show a lime
+/// glyph on white.
 fn about_mic(ctx: &egui::Context, holiday_icons: bool) -> Option<egui::TextureHandle> {
-    type Cached = (Option<String>, egui::TextureHandle);
+    type Cached = (Option<String>, Theme, egui::TextureHandle);
     static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<Cached>>> = std::sync::OnceLock::new();
     let cache = CACHE.get_or_init(|| std::sync::Mutex::new(None));
+    let theme = theme::active(ctx);
+    let accent = theme::palette(theme).accent;
     // The window runs in its own process, so the daemon's published holiday is
-    // not visible here: it is worked out from the same date and language.
-    let holiday = if holiday_icons {
+    // not visible here: it is worked out from the same date and language. UI
+    // snapshots are committed files and must not carry a holiday, so the
+    // snapshot mode always shows the plain microphone.
+    let holiday = if holiday_icons && std::env::var("VB_SNAPSHOT").is_err() {
         crate::holidays::active(
             chrono::Local::now().date_naive(),
             &crate::i18n::active_code(),
@@ -3422,16 +3728,16 @@ fn about_mic(ctx: &egui::Context, holiday_icons: bool) -> Option<egui::TextureHa
         None
     };
     let mut guard = cache.lock().unwrap();
-    if let Some((cached, texture)) = guard.as_ref() {
-        if *cached == holiday {
+    if let Some((cached, cached_theme, texture)) = guard.as_ref() {
+        if *cached == holiday && *cached_theme == theme {
             return Some(texture.clone());
         }
     }
-    let svg = crate::icons::tray_svg(holiday.as_deref(), [0xc7, 0xf3, 0x6b]);
+    let svg = crate::icons::tray_svg(holiday.as_deref(), [accent.r(), accent.g(), accent.b()]);
     let (rgba, width, height) = crate::icons::render_rgba(&svg, 64)?;
     let image = egui::ColorImage::from_rgba_unmultiplied([width as usize, height as usize], &rgba);
     let texture = ctx.load_texture("about-mic", image, egui::TextureOptions::LINEAR);
-    *guard = Some((holiday, texture.clone()));
+    *guard = Some((holiday, theme, texture.clone()));
     Some(texture)
 }
 
@@ -3442,6 +3748,7 @@ fn show_about_modal(
     holiday_icons: bool,
 ) {
     let screen = ctx.screen_rect();
+    let p = theme::palette(theme::active(ctx));
     let mut close = false;
     let mut close_clicked = false;
     // Dim overlay that swallows clicks, so the UI behind the modal is blocked.
@@ -3451,7 +3758,7 @@ fn show_about_modal(
         .show(ctx, |ui| {
             let response = ui.allocate_response(screen.size(), egui::Sense::click());
             ui.painter()
-                .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(140));
+                .rect_filled(screen, 0.0, p.overlay);
             if response.clicked() {
                 close = true;
             }

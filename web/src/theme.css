@@ -1,0 +1,281 @@
+/*
+ * Voice Button theme for Skeleton 5.
+ *
+ * The palette is the phone page palette: a near-black green background,
+ * a slightly lighter panel, warm ink, muted green-grey text and one loud
+ * lime accent.  Skeleton reads these custom properties under the active
+ * `data-theme`, so its own components inherit the same colours as the
+ * hand-written shell.  This build is dark-only; the light values exist
+ * only so Skeleton's light-dark() pairs have a defined counterpart.
+ */
+[data-theme='voice'] {
+  --spacing: 0.25rem;
+  --text-scaling: 1;
+
+  /* Typography */
+  --typo-base--font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+  --typo-base--font-size: 1rem;
+  --typo-base--color-light: #111713;
+  --typo-base--color-dark: #f0f4e9;
+  --typo-base--line-height: 1.45;
+  --typo-base--font-weight: 400;
+  --typo-base--font-style: normal;
+  --typo-base--letter-spacing: 0em;
+  --typo-base--font-stretch: inherit;
+  --typo-base--font-kerning: inherit;
+  --typo-base--text-shadow: inherit;
+  --typo-base--word-spacing: inherit;
+  --typo-base--hyphens: inherit;
+  --typo-base--text-transform: inherit;
+
+  --typo-heading--font-family: inherit;
+  --typo-heading--color-light: inherit;
+  --typo-heading--color-dark: inherit;
+  --typo-heading--font-weight: 650;
+  --typo-heading--font-style: normal;
+  --typo-heading--letter-spacing: -0.01em;
+  --typo-heading--font-stretch: inherit;
+  --typo-heading--font-kerning: inherit;
+  --typo-heading--text-shadow: inherit;
+  --typo-heading--word-spacing: inherit;
+  --typo-heading--hyphens: inherit;
+  --typo-heading--text-transform: inherit;
+
+  --typo-anchor--font-family: inherit;
+  --typo-anchor--font-size: inherit;
+  --typo-anchor--color-light: var(--color-primary-700);
+  --typo-anchor--color-dark: var(--color-primary-500);
+  --typo-anchor--line-height: inherit;
+  --typo-anchor--font-weight: inherit;
+  --typo-anchor--font-style: inherit;
+  --typo-anchor--letter-spacing: inherit;
+  --typo-anchor--font-stretch: inherit;
+  --typo-anchor--font-kerning: inherit;
+  --typo-anchor--text-shadow: inherit;
+  --typo-anchor--word-spacing: inherit;
+  --typo-anchor--hyphens: inherit;
+  --typo-anchor--text-transform: inherit;
+  --typo-anchor--text-decoration-line: none;
+  --typo-anchor--text-decoration-color: inherit;
+  --typo-anchor--text-decoration-style: inherit;
+  --typo-anchor--text-decoration-thickness: inherit;
+  --typo-anchor--text-underline-offset: inherit;
+  --typo-anchor--text-underline-position: inherit;
+  --typo-anchor--hover--text-decoration-line: underline;
+  --typo-anchor--hover--text-decoration-color: inherit;
+  --typo-anchor--hover--text-decoration-style: inherit;
+  --typo-anchor--hover--text-decoration-thickness: inherit;
+  --typo-anchor--hover--text-underline-offset: inherit;
+  --typo-anchor--hover--text-underline-position: inherit;
+  --typo-anchor--active--text-decoration-line: none;
+  --typo-anchor--active--text-decoration-color: inherit;
+  --typo-anchor--active--text-decoration-style: inherit;
+  --typo-anchor--active--text-decoration-thickness: inherit;
+  --typo-anchor--active--text-underline-offset: inherit;
+  --typo-anchor--active--text-underline-position: inherit;
+  --typo-anchor--focus--text-decoration-line: none;
+  --typo-anchor--focus--text-decoration-color: inherit;
+  --typo-anchor--focus--text-decoration-style: inherit;
+  --typo-anchor--focus--text-decoration-thickness: inherit;
+  --typo-anchor--focus--text-underline-offset: inherit;
+  --typo-anchor--focus--text-underline-position: inherit;
+
+  /* Shape */
+  --radius-base: 0.75rem;
+  --radius-container: 1rem;
+  --default-border-width: 1px;
+  --default-outline-width: 1px;
+  --default-ring-width: 1px;
+  --corner-shape-base: inherit;
+  --corner-shape-container: inherit;
+
+  /* Page background and brand */
+  --color-root-bg-light: #f4f7ef;
+  --color-root-bg-dark: #111713;
+  --color-brand-light: var(--color-primary-700);
+  --color-brand-contrast-light: #f6ffe8;
+  --color-brand-dark: var(--color-primary-500);
+  --color-brand-contrast-dark: #17200f;
+
+  /* Lime — the one loud accent. */
+  --color-primary-50: color-mix(in oklab, #c7f36b 12%, white);
+  --color-primary-100: color-mix(in oklab, #c7f36b 28%, white);
+  --color-primary-200: color-mix(in oklab, #c7f36b 45%, white);
+  --color-primary-300: color-mix(in oklab, #c7f36b 63%, white);
+  --color-primary-400: color-mix(in oklab, #c7f36b 82%, white);
+  --color-primary-500: #c7f36b;
+  --color-primary-600: color-mix(in oklab, #c7f36b 82%, #111713);
+  --color-primary-700: color-mix(in oklab, #c7f36b 64%, #111713);
+  --color-primary-800: color-mix(in oklab, #c7f36b 46%, #111713);
+  --color-primary-900: color-mix(in oklab, #c7f36b 30%, #111713);
+  --color-primary-950: color-mix(in oklab, #c7f36b 18%, #111713);
+  --color-primary-contrast-dark: #17200f;
+  --color-primary-contrast-light: #f6ffe8;
+  --color-primary-contrast-50: var(--color-primary-contrast-dark);
+  --color-primary-contrast-100: var(--color-primary-contrast-dark);
+  --color-primary-contrast-200: var(--color-primary-contrast-dark);
+  --color-primary-contrast-300: var(--color-primary-contrast-dark);
+  --color-primary-contrast-400: var(--color-primary-contrast-dark);
+  --color-primary-contrast-500: var(--color-primary-contrast-dark);
+  --color-primary-contrast-600: var(--color-primary-contrast-dark);
+  --color-primary-contrast-700: var(--color-primary-contrast-light);
+  --color-primary-contrast-800: var(--color-primary-contrast-light);
+  --color-primary-contrast-900: var(--color-primary-contrast-light);
+  --color-primary-contrast-950: var(--color-primary-contrast-light);
+
+  /* Violet — live voice. */
+  --color-secondary-50: color-mix(in oklab, #b9a2f0 12%, white);
+  --color-secondary-100: color-mix(in oklab, #b9a2f0 28%, white);
+  --color-secondary-200: color-mix(in oklab, #b9a2f0 45%, white);
+  --color-secondary-300: color-mix(in oklab, #b9a2f0 63%, white);
+  --color-secondary-400: color-mix(in oklab, #b9a2f0 82%, white);
+  --color-secondary-500: #b9a2f0;
+  --color-secondary-600: color-mix(in oklab, #b9a2f0 82%, #111713);
+  --color-secondary-700: color-mix(in oklab, #b9a2f0 64%, #111713);
+  --color-secondary-800: color-mix(in oklab, #b9a2f0 46%, #111713);
+  --color-secondary-900: color-mix(in oklab, #b9a2f0 30%, #111713);
+  --color-secondary-950: color-mix(in oklab, #b9a2f0 18%, #111713);
+  --color-secondary-contrast-dark: #1a1424;
+  --color-secondary-contrast-light: #f5efff;
+  --color-secondary-contrast-50: var(--color-secondary-contrast-dark);
+  --color-secondary-contrast-100: var(--color-secondary-contrast-dark);
+  --color-secondary-contrast-200: var(--color-secondary-contrast-dark);
+  --color-secondary-contrast-300: var(--color-secondary-contrast-dark);
+  --color-secondary-contrast-400: var(--color-secondary-contrast-dark);
+  --color-secondary-contrast-500: var(--color-secondary-contrast-dark);
+  --color-secondary-contrast-600: var(--color-secondary-contrast-dark);
+  --color-secondary-contrast-700: var(--color-secondary-contrast-light);
+  --color-secondary-contrast-800: var(--color-secondary-contrast-light);
+  --color-secondary-contrast-900: var(--color-secondary-contrast-light);
+  --color-secondary-contrast-950: var(--color-secondary-contrast-light);
+
+  /* Amber — unsent work. */
+  --color-tertiary-50: color-mix(in oklab, #ffbd62 12%, white);
+  --color-tertiary-100: color-mix(in oklab, #ffbd62 28%, white);
+  --color-tertiary-200: color-mix(in oklab, #ffbd62 45%, white);
+  --color-tertiary-300: color-mix(in oklab, #ffbd62 63%, white);
+  --color-tertiary-400: color-mix(in oklab, #ffbd62 82%, white);
+  --color-tertiary-500: #ffbd62;
+  --color-tertiary-600: color-mix(in oklab, #ffbd62 82%, #111713);
+  --color-tertiary-700: color-mix(in oklab, #ffbd62 64%, #111713);
+  --color-tertiary-800: color-mix(in oklab, #ffbd62 46%, #111713);
+  --color-tertiary-900: color-mix(in oklab, #ffbd62 30%, #111713);
+  --color-tertiary-950: color-mix(in oklab, #ffbd62 18%, #111713);
+  --color-tertiary-contrast-dark: #241a0a;
+  --color-tertiary-contrast-light: #fff6e6;
+  --color-tertiary-contrast-50: var(--color-tertiary-contrast-dark);
+  --color-tertiary-contrast-100: var(--color-tertiary-contrast-dark);
+  --color-tertiary-contrast-200: var(--color-tertiary-contrast-dark);
+  --color-tertiary-contrast-300: var(--color-tertiary-contrast-dark);
+  --color-tertiary-contrast-400: var(--color-tertiary-contrast-dark);
+  --color-tertiary-contrast-500: var(--color-tertiary-contrast-dark);
+  --color-tertiary-contrast-600: var(--color-tertiary-contrast-dark);
+  --color-tertiary-contrast-700: var(--color-tertiary-contrast-light);
+  --color-tertiary-contrast-800: var(--color-tertiary-contrast-light);
+  --color-tertiary-contrast-900: var(--color-tertiary-contrast-light);
+  --color-tertiary-contrast-950: var(--color-tertiary-contrast-light);
+
+  /* Success — same lime as the working state. */
+  --color-success-50: color-mix(in oklab, #c7f36b 12%, white);
+  --color-success-100: color-mix(in oklab, #c7f36b 28%, white);
+  --color-success-200: color-mix(in oklab, #c7f36b 45%, white);
+  --color-success-300: color-mix(in oklab, #c7f36b 63%, white);
+  --color-success-400: color-mix(in oklab, #c7f36b 82%, white);
+  --color-success-500: #c7f36b;
+  --color-success-600: color-mix(in oklab, #c7f36b 82%, #111713);
+  --color-success-700: color-mix(in oklab, #c7f36b 64%, #111713);
+  --color-success-800: color-mix(in oklab, #c7f36b 46%, #111713);
+  --color-success-900: color-mix(in oklab, #c7f36b 30%, #111713);
+  --color-success-950: color-mix(in oklab, #c7f36b 18%, #111713);
+  --color-success-contrast-dark: #17200f;
+  --color-success-contrast-light: #f6ffe8;
+  --color-success-contrast-50: var(--color-success-contrast-dark);
+  --color-success-contrast-100: var(--color-success-contrast-dark);
+  --color-success-contrast-200: var(--color-success-contrast-dark);
+  --color-success-contrast-300: var(--color-success-contrast-dark);
+  --color-success-contrast-400: var(--color-success-contrast-dark);
+  --color-success-contrast-500: var(--color-success-contrast-dark);
+  --color-success-contrast-600: var(--color-success-contrast-dark);
+  --color-success-contrast-700: var(--color-success-contrast-light);
+  --color-success-contrast-800: var(--color-success-contrast-light);
+  --color-success-contrast-900: var(--color-success-contrast-light);
+  --color-success-contrast-950: var(--color-success-contrast-light);
+
+  /* Warning — amber. */
+  --color-warning-50: color-mix(in oklab, #ffbd62 12%, white);
+  --color-warning-100: color-mix(in oklab, #ffbd62 28%, white);
+  --color-warning-200: color-mix(in oklab, #ffbd62 45%, white);
+  --color-warning-300: color-mix(in oklab, #ffbd62 63%, white);
+  --color-warning-400: color-mix(in oklab, #ffbd62 82%, white);
+  --color-warning-500: #ffbd62;
+  --color-warning-600: color-mix(in oklab, #ffbd62 82%, #111713);
+  --color-warning-700: color-mix(in oklab, #ffbd62 64%, #111713);
+  --color-warning-800: color-mix(in oklab, #ffbd62 46%, #111713);
+  --color-warning-900: color-mix(in oklab, #ffbd62 30%, #111713);
+  --color-warning-950: color-mix(in oklab, #ffbd62 18%, #111713);
+  --color-warning-contrast-dark: #241a0a;
+  --color-warning-contrast-light: #fff6e6;
+  --color-warning-contrast-50: var(--color-warning-contrast-dark);
+  --color-warning-contrast-100: var(--color-warning-contrast-dark);
+  --color-warning-contrast-200: var(--color-warning-contrast-dark);
+  --color-warning-contrast-300: var(--color-warning-contrast-dark);
+  --color-warning-contrast-400: var(--color-warning-contrast-dark);
+  --color-warning-contrast-500: var(--color-warning-contrast-dark);
+  --color-warning-contrast-600: var(--color-warning-contrast-dark);
+  --color-warning-contrast-700: var(--color-warning-contrast-light);
+  --color-warning-contrast-800: var(--color-warning-contrast-light);
+  --color-warning-contrast-900: var(--color-warning-contrast-light);
+  --color-warning-contrast-950: var(--color-warning-contrast-light);
+
+  /* Red — recording and failures. */
+  --color-error-50: color-mix(in oklab, #ff8f8f 12%, white);
+  --color-error-100: color-mix(in oklab, #ff8f8f 28%, white);
+  --color-error-200: color-mix(in oklab, #ff8f8f 45%, white);
+  --color-error-300: color-mix(in oklab, #ff8f8f 63%, white);
+  --color-error-400: color-mix(in oklab, #ff8f8f 82%, white);
+  --color-error-500: #ff8f8f;
+  --color-error-600: color-mix(in oklab, #ff8f8f 82%, #111713);
+  --color-error-700: color-mix(in oklab, #ff8f8f 64%, #111713);
+  --color-error-800: color-mix(in oklab, #ff8f8f 46%, #111713);
+  --color-error-900: color-mix(in oklab, #ff8f8f 30%, #111713);
+  --color-error-950: color-mix(in oklab, #ff8f8f 18%, #111713);
+  --color-error-contrast-dark: #2a0f0f;
+  --color-error-contrast-light: #fff0f0;
+  --color-error-contrast-50: var(--color-error-contrast-dark);
+  --color-error-contrast-100: var(--color-error-contrast-dark);
+  --color-error-contrast-200: var(--color-error-contrast-dark);
+  --color-error-contrast-300: var(--color-error-contrast-dark);
+  --color-error-contrast-400: var(--color-error-contrast-dark);
+  --color-error-contrast-500: var(--color-error-contrast-dark);
+  --color-error-contrast-600: var(--color-error-contrast-dark);
+  --color-error-contrast-700: var(--color-error-contrast-light);
+  --color-error-contrast-800: var(--color-error-contrast-light);
+  --color-error-contrast-900: var(--color-error-contrast-light);
+  --color-error-contrast-950: var(--color-error-contrast-light);
+
+  /* Surface — background, panels and text. */
+  --color-surface-50: #f0f4e9;
+  --color-surface-100: #d5dfcd;
+  --color-surface-200: #b3c0ae;
+  --color-surface-300: #8f9c8b;
+  --color-surface-400: #6f806d;
+  --color-surface-500: #4d5f50;
+  --color-surface-600: #34443a;
+  --color-surface-700: #26332a;
+  --color-surface-800: #1d271e;
+  --color-surface-900: #182019;
+  --color-surface-950: #111713;
+  --color-surface-contrast-dark: #111713;
+  --color-surface-contrast-light: #f0f4e9;
+  --color-surface-contrast-50: var(--color-surface-contrast-dark);
+  --color-surface-contrast-100: var(--color-surface-contrast-dark);
+  --color-surface-contrast-200: var(--color-surface-contrast-dark);
+  --color-surface-contrast-300: var(--color-surface-contrast-dark);
+  --color-surface-contrast-400: var(--color-surface-contrast-dark);
+  --color-surface-contrast-500: var(--color-surface-contrast-light);
+  --color-surface-contrast-600: var(--color-surface-contrast-light);
+  --color-surface-contrast-700: var(--color-surface-contrast-light);
+  --color-surface-contrast-800: var(--color-surface-contrast-light);
+  --color-surface-contrast-900: var(--color-surface-contrast-light);
+  --color-surface-contrast-950: var(--color-surface-contrast-light);
+}

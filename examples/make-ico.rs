@@ -30,8 +30,8 @@ fn main() -> anyhow::Result<()> {
     // static by design, so it is built once and shipped.
     for side in [192u32, 512] {
         let png = icons::render_png(&svg, side).ok_or_else(|| anyhow::anyhow!("render {side} px"))?;
-        fs::write(format!("src/web/icons/icon-{side}.png"), png)?;
-        println!("wrote src/web/icons/icon-{side}.png");
+        fs::write(format!("web/public/icons/icon-{side}.png"), png)?;
+        println!("wrote web/public/icons/icon-{side}.png");
     }
     // Maskable icons are cropped to a circle on some launchers, so the artwork
     // must stay inside the middle 80 %; the rest is the tile colour.
@@ -39,8 +39,16 @@ fn main() -> anyhow::Result<()> {
     let inner = RgbaImage::from_raw(inner.1, inner.2, inner.0).expect("matching dimensions");
     let mut maskable = RgbaImage::from_pixel(512, 512, Rgba(TILE));
     image::imageops::overlay(&mut maskable, &inner, 51, 51);
-    maskable.save("src/web/icons/maskable-512.png")?;
-    println!("wrote src/web/icons/maskable-512.png");
+    maskable.save("web/public/icons/maskable-512.png")?;
+    println!("wrote web/public/icons/maskable-512.png");
+
+    // The favicon is the same artwork in vector form: the phone page and the
+    // promo site both show it in a browser tab, and a hand-drawn second copy is
+    // exactly how they ended up with an icon the app no longer uses.
+    for target in ["web/public/favicon.svg", "site/assets/favicon.svg"] {
+        fs::write(target, &svg)?;
+        println!("wrote {target}");
+    }
     Ok(())
 }
 

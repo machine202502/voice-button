@@ -47,6 +47,15 @@ fn ui_snapshots_render() {
         "capture-recording.png",
         "record.png",
         "phone.png",
+        "settings-light.png",
+        "history-light.png",
+        "record-light.png",
+        "capture-recording-light.png",
+        "api-light.png",
+        "about-light.png",
+        "download-progress-light.png",
+        "phone-light.png",
+        "history-expanded-light.png",
     ] {
         let path = out.join(name);
         let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("missing snapshot {name}: {e}"));

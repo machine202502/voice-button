@@ -23,6 +23,10 @@
     "Telegram": "Telegram",
     "Monologs": "独白",
     "Appearance": "外观",
+    "Theme:": "主题：",
+    "Dark": "深色",
+    "Light": "浅色",
+    "System": "跟随系统",
     "Holiday icons": "节日图标",
     "Show the holiday microphone in the tray and on the site: a tree around New Year, the clock on the night itself, and the symbol of each holiday on its day. Recording and file processing keep their own colour.": "在托盘和网站上显示节日麦克风：新年期间是圣诞树，跨年夜是时钟，每个节日当天是对应的图案。录音和文件处理仍使用各自的状态颜色。",
     "Sounds": "声音",
@@ -222,7 +226,6 @@
     "no_model": "没有模型",
     "cancelled": "已取消",
     "Monolog": "独白",
-    "Monologs": "独白",
     "Dictation from the phone goes into monologs; the text is transcribed here, in the background.": "电话录音会存入独白，文字在这台电脑上后台识别。",
     "monolog": "独白",
     "monologs": "独白",
@@ -231,7 +234,6 @@
     "Archived": "已归档",
     "No monologs yet.": "还没有独白。",
     "Showing the newest {shown} of {total} messages.": "仅显示最新 {shown} 条，共 {total} 条消息。",
-    "Telegram": "Telegram",
     "Telegram bot": "Telegram 机器人",
     "Receive files from Telegram": "接收 Telegram 文件",
     "Proxy:": "代理：",
@@ -297,6 +299,10 @@
     "The link has expired": "链接已过期",
     "The link is valid for five minutes. Ask for a new QR code on the computer.": "链接有效期为五分钟。请在电脑上获取新的二维码。",
     "Connecting": "正在连接",
-    "The phone is connecting to the computer.": "手机正在连接电脑。"
+    "The phone is connecting to the computer.": "手机正在连接电脑。",
+    "Show more": "展开全文",
+    "Show less": "收起",
+    "Week": "本周",
+    "All time": "全部时间"
   }
 }

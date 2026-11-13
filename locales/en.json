@@ -25,6 +25,10 @@
     "Telegram": "Telegram",
     "Monologs": "Monologs",
     "Appearance": "Appearance",
+    "Theme:": "Theme:",
+    "Dark": "Dark",
+    "Light": "Light",
+    "System": "System",
     "Holiday icons": "Holiday icons",
     "Show the holiday microphone in the tray and on the site: a tree around New Year, the clock on the night itself, and the symbol of each holiday on its day. Recording and file processing keep their own colour.": "Show the holiday microphone in the tray and on the site: a tree around New Year, the clock on the night itself, and the symbol of each holiday on its day. Recording and file processing keep their own colour.",
     "Sounds": "Sounds",
@@ -222,7 +226,6 @@
     "no_model": "No model",
     "cancelled": "Cancelled",
     "Monolog": "Monolog",
-    "Monologs": "Monologs",
     "Dictation from the phone goes into monologs; the text is transcribed here, in the background.": "Dictation from the phone goes into monologs; the text is transcribed here, in the background.",
     "monolog": "monolog",
     "monologs": "Monologs",
@@ -231,7 +234,6 @@
     "Archived": "Archived",
     "No monologs yet.": "No monologs yet.",
     "Showing the newest {shown} of {total} messages.": "Showing the newest {shown} of {total} messages.",
-    "Telegram": "Telegram",
     "Telegram bot": "Telegram bot",
     "Receive files from Telegram": "Receive files from Telegram",
     "Proxy:": "Proxy:",
@@ -297,6 +299,10 @@
     "The link has expired": "The link has expired",
     "The link is valid for five minutes. Ask for a new QR code on the computer.": "The link is valid for five minutes. Ask for a new QR code on the computer.",
     "Connecting": "Connecting",
-    "The phone is connecting to the computer.": "The phone is connecting to the computer."
+    "The phone is connecting to the computer.": "The phone is connecting to the computer.",
+    "Show more": "Show more",
+    "Show less": "Show less",
+    "Week": "Week",
+    "All time": "All time"
   }
 }

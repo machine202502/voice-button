@@ -892,7 +892,43 @@ fn start_recovery(
         });
 }
 
+/// Make this process per-monitor DPI aware (V2) before it creates its first
+/// window.
+///
+/// The notification-area menu is a native Win32 popup that this process owns:
+/// `muda` builds it with `CreatePopupMenu`/`AppendMenuW` and shows it with
+/// `TrackPopupMenu`, so Windows draws its labels. A process that is not DPI
+/// aware is virtualized at 96 DPI and the compositor stretches its windows to
+/// the monitor's real scaling — on a 200 % display every menu label is a 96-DPI
+/// bitmap blown up 2×, which is the mush the owner sees. The UI process gets
+/// this context from winit's event loop; the daemon never starts one, so
+/// nothing else asks for it here.
+///
+/// Must be called before any window of this process exists, otherwise Windows
+/// refuses the change.
+fn declare_per_monitor_dpi_awareness() -> bool {
+    use windows_sys::Win32::UI::HiDpi::{
+        SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    };
+    // SAFETY: no preconditions beyond "no window exists yet", which the caller
+    // guarantees; the context is a constant, not a live handle.
+    unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) != 0 }
+}
+
+/// The DPI context Windows reports for the calling thread: 0 unaware, 1 system
+/// aware, 2 per-monitor aware. Logged once so a support log carries the real
+/// value instead of the intention.
+fn dpi_awareness() -> i32 {
+    use windows_sys::Win32::UI::HiDpi::{
+        GetAwarenessFromDpiAwarenessContext, GetThreadDpiAwarenessContext,
+    };
+    // SAFETY: both calls only read the calling thread's context.
+    unsafe { GetAwarenessFromDpiAwarenessContext(GetThreadDpiAwarenessContext()) }
+}
+
 fn run_daemon() {
+    // First, before the tray thread creates its window or the menu is built.
+    let dpi_aware = declare_per_monitor_dpi_awareness();
     let dirs = config::app_dirs();
     // A second instance must not rotate the log or leave a crash flag behind:
     // it exits before touching anything the running daemon owns. The snapshot
@@ -902,6 +938,10 @@ fn run_daemon() {
         std::process::exit(0);
     }
     log::init(&dirs.root);
+    log::log(&format!(
+        "dpi awareness: per-monitor v2 set={dpi_aware}, now {} (0 unaware, 1 system, 2 per-monitor)",
+        dpi_awareness()
+    ));
     // The flag distinguishes a crash from a clean quit: it is removed on a
     // normal exit and the guard records the exit code of a dying daemon.
     let crashed = log::previous_run_crashed(&dirs.root);

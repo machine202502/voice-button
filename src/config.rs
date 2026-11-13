@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
+use crate::theme::Theme;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Backend {
     Whisper,
@@ -64,6 +66,9 @@ pub struct Config {
     /// Settings — it is set by hand in `config.json` and empty by default.
     #[serde(default)]
     pub debug_holiday: String,
+    /// Window colours: follow Windows (the default), dark, or light.
+    #[serde(default)]
+    pub theme: Theme,
     /// Separator added after text inserted by record-and-paste.
     #[serde(default)]
     pub paste_separator: PasteSeparator,
@@ -185,6 +190,7 @@ impl Default for Config {
             swap_mouse_buttons: false,
             holiday_icons: true,
             debug_holiday: String::new(),
+            theme: Theme::System,
             paste_separator: PasteSeparator::Space,
             autostart: true,
             silent_start: true,

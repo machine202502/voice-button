@@ -141,6 +141,10 @@ if ($MyInvocation.InvocationName -ne '.') {
     }
 
     Write-Host "Building Voice Button $Version"
+    # The phone page is a build product too: rebuild it here so the installer can
+    # never ship a stale copy left over from an earlier checkout.
+    & (Join-Path $PSScriptRoot 'web.ps1')
+    if ($LASTEXITCODE -ne 0) { throw 'scripts/web.ps1 failed' }
     cargo build --release --bins
     if ($LASTEXITCODE -ne 0) { throw 'cargo build --release failed' }
     $daemon = Join-Path $TargetDir 'release\voice-button.exe'

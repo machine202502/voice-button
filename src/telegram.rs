@@ -673,8 +673,8 @@ fn append_chat(root: &Path, entry: &ChatEntry) {
     };
     let _ = transaction.execute(
         "INSERT INTO telegram_chat(update_id, chat_id, message_id, at, sender, kind,
-            file_name, seconds, text, error)
-         VALUES (0, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            file_name, seconds, text, error, added_at)
+         VALUES (0, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         rusqlite::params![
             entry.chat_id,
             entry.message_id,
@@ -684,7 +684,8 @@ fn append_chat(root: &Path, entry: &ChatEntry) {
             entry.file_name,
             entry.seconds,
             entry.text,
-            entry.error
+            entry.error,
+            chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
         ],
     );
     if let Err(error) = transaction.execute(
@@ -721,34 +722,102 @@ pub fn reset_owner(root: &Path) {
 }
 
 /// One page of the chat, oldest first, for the window's lazy list.
-pub fn chat_page(dirs: &AppDirs, limit: usize, offset: usize) -> Vec<ChatEntry> {
+/// Which slice of the chat the list shows.
+///
+/// The bounds follow the bot's own clock: a message belongs to the day it was
+/// processed, not to the day printed on the file it carried. `at` is still read
+/// for older rows that predate the column, so old data keeps working.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ChatRange {
+    #[default]
+    Today,
+    Week,
+    All,
+}
+
+impl ChatRange {
+    /// Lower bound in UTC, or `""` for "no bound". Every stored `added_at` is UTC
+    /// in the same shape, so a string comparison is a time comparison.
+    pub fn since(self) -> String {
+        let local = chrono::Local::now();
+        let start = match self {
+            Self::All => return String::new(),
+            // Midnight at the start of today: the current day runs from 00:00.
+            Self::Today => local.date_naive().and_hms_opt(0, 0, 0),
+            // Seven calendar days including today.
+            Self::Week => (local.date_naive() - chrono::Days::new(6)).and_hms_opt(0, 0, 0),
+        };
+        let Some(start) = start else {
+            return String::new();
+        };
+        let start = chrono::TimeZone::from_local_datetime(&chrono::Local, &start).earliest();
+        start
+            .map(|moment| {
+                moment
+                    .with_timezone(&chrono::Utc)
+                    .format("%Y-%m-%dT%H:%M:%SZ")
+                    .to_string()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The SQL condition shared by every query: empty `since` means everything.
+    fn clause(column: &str) -> String {
+        format!("(?1 = '' OR COALESCE(NULLIF({column}, ''), at) >= ?1)")
+    }
+}
+
+pub fn chat_page(
+    dirs: &AppDirs,
+    range: ChatRange,
+    limit: usize,
+    offset: usize,
+) -> Vec<ChatEntry> {
     let Some(store) = open_store(&dirs.root) else {
         return Vec::new();
     };
     let conn = store.conn();
     let Ok(mut statement) = conn.prepare(&format!(
-        "SELECT {CHAT_COLUMNS} FROM telegram_chat ORDER BY id LIMIT ?1 OFFSET ?2"
+        "SELECT {CHAT_COLUMNS} FROM telegram_chat
+         WHERE {} ORDER BY id LIMIT ?2 OFFSET ?3",
+        ChatRange::clause("added_at")
     )) else {
         return Vec::new();
     };
     statement
-        .query_map([limit as i64, offset as i64], read_chat)
+        .query_map(
+            rusqlite::params![range.since(), limit as i64, offset as i64],
+            read_chat,
+        )
         .map(|rows| rows.flatten().collect())
         .unwrap_or_default()
 }
 
-pub fn chat_count(dirs: &AppDirs) -> usize {
+pub fn chat_count(dirs: &AppDirs, range: ChatRange) -> usize {
     open_store(&dirs.root)
         .and_then(|store| {
             store
                 .conn()
-                .query_row("SELECT COUNT(*) FROM telegram_chat", [], |row| row.get::<_, i64>(0))
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM telegram_chat WHERE {}",
+                        ChatRange::clause("added_at")
+                    ),
+                    rusqlite::params![range.since()],
+                    |row| row.get::<_, i64>(0),
+                )
                 .ok()
         })
         .unwrap_or(0) as usize
 }
 
-pub fn chat_search_page(dirs: &AppDirs, needle: &str, limit: usize, offset: usize) -> Vec<ChatEntry> {
+pub fn chat_search_page(
+    dirs: &AppDirs,
+    range: ChatRange,
+    needle: &str,
+    limit: usize,
+    offset: usize,
+) -> Vec<ChatEntry> {
     let Some(store) = open_store(&dirs.root) else {
         return Vec::new();
     };
@@ -756,34 +825,40 @@ pub fn chat_search_page(dirs: &AppDirs, needle: &str, limit: usize, offset: usiz
     let conn = store.conn();
     let Ok(mut statement) = conn.prepare(&format!(
         "SELECT {CHAT_COLUMNS} FROM telegram_chat
-         WHERE vb_lower(text) LIKE vb_lower(?1) ESCAPE '\\'
+         WHERE (vb_lower(text) LIKE vb_lower(?1) ESCAPE '\\'
             OR vb_lower(sender) LIKE vb_lower(?1) ESCAPE '\\'
-            OR vb_lower(file_name) LIKE vb_lower(?1) ESCAPE '\\'
-         ORDER BY id LIMIT ?2 OFFSET ?3"
+            OR vb_lower(file_name) LIKE vb_lower(?1) ESCAPE '\\')
+           AND ({range_clause})
+         ORDER BY id LIMIT ?2 OFFSET ?3",
+        range_clause = ChatRange::clause("added_at").replace("?1", "?4")
     )) else {
         return Vec::new();
     };
     statement
         .query_map(
-            rusqlite::params![pattern, limit as i64, offset as i64],
+            rusqlite::params![pattern, limit as i64, offset as i64, range.since()],
             read_chat,
         )
         .map(|rows| rows.flatten().collect())
         .unwrap_or_default()
 }
 
-pub fn chat_search_count(dirs: &AppDirs, needle: &str) -> usize {
+pub fn chat_search_count(dirs: &AppDirs, range: ChatRange, needle: &str) -> usize {
     open_store(&dirs.root)
         .and_then(|store| {
             let pattern = format!("%{}%", needle.trim().replace('%', "\\%").replace('_', "\\_"));
             store
                 .conn()
                 .query_row(
-                    "SELECT COUNT(*) FROM telegram_chat
-                     WHERE vb_lower(text) LIKE vb_lower(?1) ESCAPE '\\'
-                        OR vb_lower(sender) LIKE vb_lower(?1) ESCAPE '\\'
-                        OR vb_lower(file_name) LIKE vb_lower(?1) ESCAPE '\\'",
-                    [pattern],
+                    &format!(
+                        "SELECT COUNT(*) FROM telegram_chat
+                         WHERE (vb_lower(text) LIKE vb_lower(?1) ESCAPE '\\'
+                            OR vb_lower(sender) LIKE vb_lower(?1) ESCAPE '\\'
+                            OR vb_lower(file_name) LIKE vb_lower(?1) ESCAPE '\\')
+                           AND {}",
+                        ChatRange::clause("added_at").replace("?1", "?2")
+                    ),
+                    rusqlite::params![pattern, range.since()],
                     |row| row.get::<_, i64>(0),
                 )
                 .ok()
@@ -1815,7 +1890,7 @@ mod tests {
             Ok(me) => println!("getMe: ok, bot @{}", me["result"]["username"]),
             Err(error) => println!("getMe failed: {error:#}"),
         }
-        let entries = chat_page(&dirs, 5, 0);
+        let entries = chat_page(&dirs, ChatRange::All, 5, 0);
         println!("stored messages: {}", entries.len());
         for entry in &entries {
             println!(
@@ -2016,9 +2091,92 @@ mod tests {
         finish_job(&api, &dirs, &state, &job, Err(anyhow!("broken container")));
         assert!(api.sent()[0].contains(tr("Bot: could not transcribe: {error}").split("{error}").next().unwrap()));
         assert_eq!(api.reactions.lock().unwrap().last().unwrap().1, "👎");
-        let entry = chat_page(&dirs, 1, 0)[0].clone();
+        let entry = chat_page(&dirs, ChatRange::All, 1, 0)[0].clone();
         assert!(entry.error.is_some());
         assert!(entry.text.contains("broken container"));
+        let _ = std::fs::remove_dir_all(&dirs.root);
+    }
+
+    #[test]
+    fn the_date_filter_counts_by_processing_time() {
+        let dirs = dirs("range");
+        let today = chrono::Utc::now();
+        let three_days = today - chrono::Duration::days(3);
+        let long_ago = today - chrono::Duration::days(40);
+        let stamp = |moment: chrono::DateTime<chrono::Utc>| moment.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+
+        {
+            let store = open_store(&dirs.root).expect("store");
+            let conn = store.conn();
+            for (index, added) in [today, three_days, long_ago].iter().enumerate() {
+                conn.execute(
+                    "INSERT INTO telegram_chat(chat_id, message_id, at, sender, kind, file_name,
+                        seconds, text, error, added_at)
+                     VALUES (1, ?1, '2001-01-01T00:00:00Z', 'User', 'voice', 'a.ogg', 1.0, ?2, NULL, ?3)",
+                    rusqlite::params![index as i64 + 1, format!("message {index}"), stamp(*added)],
+                )
+                .expect("insert");
+            }
+        }
+
+        assert_eq!(chat_count(&dirs, ChatRange::Today), 1, "only today's message");
+        assert_eq!(chat_count(&dirs, ChatRange::Week), 2, "today and three days ago");
+        assert_eq!(chat_count(&dirs, ChatRange::All), 3, "everything");
+        assert_eq!(chat_page(&dirs, ChatRange::Today, 10, 0).len(), 1);
+        assert_eq!(chat_page(&dirs, ChatRange::All, 10, 0).len(), 3);
+        // The date on the file is 2001 and must not decide anything.
+        assert!(chat_page(&dirs, ChatRange::All, 10, 0)
+            .iter()
+            .all(|entry| entry.at.starts_with("2001-")));
+        let _ = std::fs::remove_dir_all(&dirs.root);
+    }
+
+    #[test]
+    fn the_chat_keeps_the_order_the_bot_worked_through_it() {
+        // The date on a message is the date of the original file and can be
+        // anything: a forwarded note is old while it is processed today. The log
+        // is the bot's own order, so the rows must follow the order they were
+        // stored in, never the timestamp.
+        let dirs = dirs("order");
+        let api = Fake::new(1000);
+        let today = ChatEntry {
+            chat_id: 1,
+            message_id: 7,
+            at: "2026-11-13T12:00:00Z".to_string(),
+            sender: "User".to_string(),
+            kind: "voice".to_string(),
+            file_name: "today.ogg".to_string(),
+            seconds: 3.0,
+            text: "processed first, dated today".to_string(),
+            error: None,
+        };
+        let ancient = ChatEntry {
+            chat_id: 1,
+            message_id: 8,
+            at: "2019-01-02T09:00:00Z".to_string(),
+            sender: "User".to_string(),
+            kind: "voice".to_string(),
+            file_name: "ancient.ogg".to_string(),
+            seconds: 3.0,
+            text: "processed second, dated 2019".to_string(),
+            error: None,
+        };
+        append_chat(&dirs.root, &today);
+        append_chat(&dirs.root, &ancient);
+        let _ = api;
+
+        let entries = chat_page(&dirs, ChatRange::All, 10, 0);
+        let texts: Vec<&str> = entries.iter().map(|entry| entry.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec!["processed first, dated today", "processed second, dated 2019"],
+            "the order is the order of processing, not of the message dates"
+        );
+        // And it holds across pages: the second page continues where the first
+        // stopped, whatever the dates say.
+        let second = chat_page(&dirs, ChatRange::All, 1, 1);
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].text, "processed second, dated 2019");
         let _ = std::fs::remove_dir_all(&dirs.root);
     }
 

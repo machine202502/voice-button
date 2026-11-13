@@ -20,9 +20,13 @@
     "Model and runtime switching is locked while recording or transcribing.": "Смена модели и движка блокируется во время записи и распознавания.",
     "The selected model is not downloaded yet — the selection applies once it is ready.": "Выбранная модель ещё не скачана — выбор применится, когда она будет готова.",
     "Open models folder": "Открыть папку моделей",
-    "Telegram": "Telegram",
+    "Telegram": "Телеграм",
     "Monologs": "Монологи",
     "Appearance": "Оформление",
+    "Theme:": "Тема:",
+    "Dark": "Тёмная",
+    "Light": "Светлая",
+    "System": "Системная",
     "Holiday icons": "Праздничные иконки",
     "Show the holiday microphone in the tray and on the site: a tree around New Year, the clock on the night itself, and the symbol of each holiday on its day. Recording and file processing keep their own colour.": "Показывать праздничный микрофон в трее и на сайте: ёлка вокруг Нового года, часы в саму ночь и символ каждого праздника в его день. Запись и обработка файла сохраняют свой цвет.",
     "Sounds": "Звуки",
@@ -222,7 +226,6 @@
     "no_model": "Нет модели",
     "cancelled": "Отменено",
     "Monolog": "Монолог",
-    "Monologs": "Монологи",
     "Dictation from the phone goes into monologs; the text is transcribed here, in the background.": "Диктовка с телефона складывается в монологи, а расшифровывается здесь, в фоне.",
     "monolog": "монолог",
     "monologs": "Монологи",
@@ -231,7 +234,6 @@
     "Archived": "В архиве",
     "No monologs yet.": "Пока нет монологов.",
     "Showing the newest {shown} of {total} messages.": "Показаны последние {shown} из {total} сообщений.",
-    "Telegram": "Телеграм",
     "Telegram bot": "Телеграм-бот",
     "Receive files from Telegram": "Принимать файлы из Telegram",
     "Proxy:": "Прокси:",
@@ -297,6 +299,10 @@
     "The link has expired": "Срок ссылки истёк",
     "The link is valid for five minutes. Ask for a new QR code on the computer.": "Ссылка действует пять минут. Попросите новый QR-код на компьютере.",
     "Connecting": "Подключение",
-    "The phone is connecting to the computer.": "Телефон сейчас подключится к компьютеру."
+    "The phone is connecting to the computer.": "Телефон сейчас подключится к компьютеру.",
+    "Show more": "Показать полностью",
+    "Show less": "Свернуть",
+    "Week": "Неделя",
+    "All time": "За всё время"
   }
 }

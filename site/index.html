@@ -3,182 +3,391 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Voice Button — голос становится текстом локально</title>
-  <meta name="description" content="Voice Button — бесплатная Windows-утилита для локального голосового ввода. Live-транскрипция, Whisper и GigaAM, история и работа из трея без облака.">
-  <meta name="theme-color" content="#111713">
+  <title>Voice Button — голос в текст на вашем компьютере</title>
+  <meta name="description" content="Бесплатная диктовка для Windows 10/11: говорите, а текст появляется на компьютере. Трей, горячие клавиши, монологи с телефона, Telegram-бот. Без облака.">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#0d120f">
   <link rel="canonical" href="https://machine202502.github.io/voice-button/">
   <link rel="alternate" hreflang="ru" href="https://machine202502.github.io/voice-button/">
   <link rel="alternate" hreflang="en" href="https://machine202502.github.io/voice-button/en/">
   <link rel="alternate" hreflang="zh" href="https://machine202502.github.io/voice-button/zh/">
   <link rel="alternate" hreflang="x-default" href="https://machine202502.github.io/voice-button/">
-  <meta property="og:locale" content="ru_RU">
   <meta property="og:type" content="website">
+  <meta property="og:site_name" content="Voice Button">
+  <meta property="og:locale" content="ru_RU">
   <meta property="og:title" content="Voice Button — сказал. Готово.">
-  <meta property="og:description" content="Локальная транскрипция голоса для Windows. Без аккаунта и облака.">
+  <meta property="og:description" content="Локальная диктовка для Windows: в любом приложении, с телефона и через Telegram. Без аккаунта и облака.">
   <meta property="og:url" content="https://machine202502.github.io/voice-button/">
-  <meta property="og:image" content="https://machine202502.github.io/voice-button/assets/capture.png">
-  <link rel="icon" type="image/png" href="assets/icon.png">
+  <meta property="og:image" content="https://machine202502.github.io/voice-button/assets/app-record.png">
+  <meta property="og:image:width" content="1118">
+  <meta property="og:image:height" content="558">
+  <meta property="og:image:alt" content="Окно Voice Button с идущей записью и живым текстом">
+  <meta name="twitter:card" content="summary_large_image">
+  <link rel="icon" type="image/svg+xml" href="assets/favicon.svg">
+  <link rel="icon" type="image/png" sizes="192x192" href="assets/icon-192.png">
+  <link rel="apple-touch-icon" href="assets/icon-192.png">
+  <link rel="icon" type="image/x-icon" href="assets/favicon.ico" sizes="16x16 32x32">
   <link rel="stylesheet" href="styles.css">
   <script type="application/ld+json">
-  {
-    "@context": "https://schema.org",
-    "@type": "SoftwareApplication",
-    "name": "Voice Button",
-    "applicationCategory": "UtilitiesApplication",
-    "operatingSystem": "Windows 10, Windows 11",
-    "url": "https://machine202502.github.io/voice-button/",
-    "downloadUrl": "https://github.com/machine202502/voice-button/releases/latest",
-    "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
-    "license": "https://github.com/machine202502/voice-button/blob/master/LICENSE"
-  }
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "name": "Voice Button",
+  "description": "Бесплатная диктовка для Windows 10/11: говорите, а текст появляется на компьютере. Трей, горячие клавиши, монологи с телефона, Telegram-бот. Без облака.",
+  "image": "https://machine202502.github.io/voice-button/assets/icon-512.png",
+  "applicationCategory": "UtilitiesApplication",
+  "operatingSystem": "Windows 10, Windows 11",
+  "url": "https://machine202502.github.io/voice-button/",
+  "downloadUrl": "https://github.com/machine202502/voice-button/releases/latest",
+  "inLanguage": "ru",
+  "offers": {
+    "@type": "Offer",
+    "price": "0",
+    "priceCurrency": "USD"
+  },
+  "license": "https://github.com/machine202502/voice-button/blob/master/LICENSE"
+}
   </script>
 </head>
 <body>
-  <header class="topbar">
-    <a class="brand" href="#top" aria-label="Voice Button">
-      <img src="assets/icon.png" alt="" width="36" height="36">
-      <span>VOICE BUTTON</span>
-    </a>
-    <nav class="menu" aria-label="Навигация">
-      <a href="#how">Как это работает</a>
-      <a href="#capture">Возможности</a>
-      <a href="#api">API</a>
-      <a href="#download">Скачать</a>
-    </nav>
-    <nav class="langs" aria-label="Язык">
-      <a href="./" hreflang="ru" lang="ru" data-lang-set="ru" aria-current="true">RU</a>
-      <a href="en/" hreflang="en" lang="en" data-lang-set="en">EN</a>
-      <a href="zh/" hreflang="zh" lang="zh" data-lang-set="zh">中文</a>
-    </nav>
-    <a class="github" href="https://github.com/machine202502/voice-button" target="_blank" rel="noopener">GitHub <span aria-hidden="true">↗</span></a>
+  <a class="skip-link" href="#main">Перейти к содержанию</a>
+
+  <header class="site-header">
+    <div class="wrap header-in">
+      <a class="brand" href="#top" aria-label="Voice Button">
+        <img src="assets/icon-192.png" alt="" width="30" height="30">
+        <span>VOICE BUTTON</span>
+      </a>
+      <nav class="nav" aria-label="Основная навигация">
+        <a href="#features">Возможности</a>
+        <a href="#how">Как это работает</a>
+        <a href="#phone">Телефон</a>
+        <a href="#download">Скачать</a>
+      </nav>
+      <div class="header-end">
+        <nav class="langs" aria-label="Язык">
+          <a href="./" hreflang="ru" lang="ru" data-lang-set="ru" aria-current="page">RU</a>
+          <a href="en/" hreflang="en" lang="en" data-lang-set="en">EN</a>
+          <a href="zh/" hreflang="zh" lang="zh-CN" data-lang-set="zh">中文</a>
+        </nav>
+        <a class="github-link" href="https://github.com/machine202502/voice-button" target="_blank" rel="noopener">
+          <svg width="17" height="17" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg><span>GitHub</span>
+        </a>
+      </div>
+    </div>
   </header>
 
-  <main id="top">
-    <section class="hero">
-      <div class="hero-copy">
-        <div class="eyebrow"><span class="status-dot"></span> WINDOWS 10/11 · OFFLINE</div>
-        <h1>Сказал.<br><span>Готово.</span></h1>
-        <p class="hero-lead">Голос становится текстом прямо на вашем компьютере. Нажмите микрофон в трее, говорите, заберите готовый текст из буфера обмена.</p>
-        <div class="hero-actions">
-          <a class="button primary" href="https://github.com/machine202502/voice-button/releases/latest/download/voice-button-@@VERSION@@-windows-x64-setup.exe" data-dl-setup>Скачать для Windows</a>
-          <a class="text-link" href="#how">Посмотреть, как работает <span aria-hidden="true">↓</span></a>
-        </div>
-        <p class="quiet">Бесплатно · MIT · без аккаунта · без облака</p>
-      </div>
-      <div class="hero-visual" aria-label="Идёт запись и появляется текст">
-        <div class="console-card">
-          <div class="console-head"><span>LIVE CAPTURE</span><span class="recording">REC</span></div>
-          <div class="wave" aria-hidden="true">
-            <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+  <main id="main">
+    <section class="hero" id="top">
+      <canvas class="hero-field" data-field aria-hidden="true"></canvas>
+      <div class="wrap hero-in">
+        <div class="hero-copy">
+          <p class="eyebrow"><span class="dot" aria-hidden="true"></span>Windows 10/11 · без аккаунта · без облака</p>
+          <h1>Сказал.<span class="accent">Готово.</span></h1>
+          <p class="hero-lead">Голос становится текстом на вашем компьютере. Нажмите микрофон в трее, говорите — а готовый текст заберите из буфера, вставьте в активное окно или найдите в истории.</p>
+          <div class="actions">
+            <a class="btn btn-primary" href="https://github.com/machine202502/voice-button/releases/latest/download/voice-button-@@VERSION@@-windows-x64-setup.exe" data-dl-setup>Скачать бесплатно<svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M8 2.2v8.1M4.4 6.9 8 10.5l3.6-3.6M3 13.3h10" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></a>
+            <a class="btn btn-ghost" href="#features">Что умеет<svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M8 2.6v11M3.6 9.1 8 13.5l4.4-4.4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></a>
           </div>
-          <p class="transcript">«Идея появилась — и вот она уже записана. Без переключения между окнами и без отправки голоса на сервер.»</p>
-          <div class="console-foot"><span>LOCAL ENGINE</span><span>100% ON DEVICE</span></div>
+          <p class="hero-meta">
+            <span><svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M3 8.4 6.3 11.8 13 4.4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>Бесплатно · MIT · Windows 10 и 11</span>
+          </p>
         </div>
-        <div class="orbit orbit-one" aria-hidden="true"></div>
-        <div class="orbit orbit-two" aria-hidden="true"></div>
+        <div class="stage">
+          <div class="stage-glow" aria-hidden="true"></div>
+          <span class="ring ring-1" aria-hidden="true"></span>
+          <span class="ring ring-2" aria-hidden="true"></span>
+          <figure class="frame">
+            <img src="assets/app-record.png" width="1118" height="558" alt="Voice Button: идёт запись, текст появляется в окне" fetchpriority="high" decoding="async">
+          </figure>
+          <div class="chip chip-a"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M3 8.4 6.3 11.8 13 4.4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>Текст уже в буфере</div>
+          <div class="chip chip-b"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M8 1.6 13.4 3.7v4.1c0 3.2-2.2 5.6-5.4 6.7-3.2-1.1-5.4-3.5-5.4-6.7V3.7L8 1.6Z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/><path d="m5.6 7.7 1.8 1.8 3.3-3.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>100% на устройстве</div>
+        </div>
       </div>
     </section>
 
-    <section id="how" class="ticker" aria-label="Этапы работы">
-      <div><strong>01</strong><span>Нажмите</span></div>
-      <div><strong>02</strong><span>Говорите</span></div>
-      <div><strong>03</strong><span>Вставьте текст</span></div>
-    </section>
+    <div class="ribbon" aria-hidden="true">
+      <div class="ribbon-track">
+        <div class="ribbon-group">
+          <span>Диктовка в любом приложении</span><span>Монологи с телефона</span><span>Telegram-бот</span><span>Аудио и видео</span><span>Распознавание на вашем компьютере</span><span>Без аккаунта</span>
+        </div>
+        <div class="ribbon-group" aria-hidden="true">
+          <span>Диктовка в любом приложении</span><span>Монологи с телефона</span><span>Telegram-бот</span><span>Аудио и видео</span><span>Распознавание на вашем компьютере</span><span>Без аккаунта</span>
+        </div>
+      </div>
+    </div>
 
-    <section id="capture" class="section capture-section">
-      <div class="section-heading">
-        <p class="kicker">CAPTURE</p>
-        <h2>Вы видите слова.<br>Ещё пока говорите.</h2>
-        <p>Транскрипция идёт параллельно с записью: длинная диктовка режется на паузах, и после остановки обрабатывается только последний фрагмент. Готовый файл — аудио или видео — можно расшифровать на вкладке «Файл»: из видео приложение само берёт звуковую дорожку.</p>
-      </div>
-      <div class="screen-wrap">
-        <img src="assets/capture.png" alt="Voice Button: запись с live-транскрипцией и историей" loading="lazy">
-      </div>
-      <div class="feature-grid">
-        <article><span class="feature-no">01</span><h3>Из трея или из окна</h3><p>Левый клик — новая запись, средний — запись и вставка в курсор; действия можно поменять местами. Значок показывает запись и обработку цветом.</p></article>
-        <article><span class="feature-no">02</span><h3>Whisper и GigaAM</h3><p>Выбирайте популярные мультиязычные Whisper или русские GigaAM CTC/RNN-T. Модель скачивается только по вашему действию.</p></article>
-        <article><span class="feature-no">03</span><h3>История без лишнего шума</h3><p>Дни разделены заголовками «Сегодня», «Вчера», дальше — день недели и дата. Раскрывайте и копируйте прошлые результаты; большой список отрисовывается лениво.</p></article>
-        <article><span class="feature-no">04</span><h3>Приватно по устройству</h3><p>Аудио не покидает компьютер и удаляется после расшифровки. Если текст не гарантирован, файл остаётся и открывается прямо из истории. Нет учётной записи, подписки и облачной обработки.</p></article>
-      </div>
-    </section>
-
-    <section class="section settings-section">
-      <div class="settings-shot"><img src="assets/settings.png" alt="Настройки Voice Button: модели, звук и автозапуск" loading="lazy"></div>
-      <div class="settings-copy">
-        <p class="kicker">CONTROL WITHOUT FRICTION</p>
-        <h2>Настройки применяются сразу.</h2>
-        <p>Без кнопки Save. Микрофон, его чувствительность, действия кнопок мыши, глобальные хоткеи, три звуковых сигнала с прослушиванием, громкость, язык и автозапуск меняются на месте. Если модель ещё скачивается, её выбор применится только когда она будет готова.</p>
-        <ul>
-          <li>Выбор микрофона с защитой от «тихих» виртуальных кабелей и слайдер чувствительности</li>
-          <li>Три глобальных хоткея: запись, дополнение и вставка в курсор</li>
-          <li>Прогресс скачивания и отмена</li>
-          <li>Автоопределение языка у поддерживающих моделей</li>
-          <li>Ротационные логи с кнопкой открытия папки</li>
-        </ul>
-      </div>
-    </section>
-
-    <section id="api" class="section settings-section api-section">
-      <div class="settings-shot"><img src="assets/api.png" alt="Вкладка API: включение локального сервера, хост и порт" loading="lazy"></div>
-      <div class="settings-copy">
-        <p class="kicker">LOCAL API</p>
-        <h2>Ваш голос — внутри любого приложения.</h2>
-        <p>Включите локальный HTTP-сервер и присылайте в него звук из редактора, скрипта или страницы. Приложение вернёт живой и финальный текст, а микрофон компьютера не понадобится — звук приносит клиент.</p>
-        <ul>
-          <li>Поток PCM16: живая транскрипция и готовый текст</li>
-          <li>Модель на одну сессию, не меняя ваших настроек</li>
-          <li>GET /api/help — полный контракт для агентов и интеграций</li>
-          <li>История показывает, кто начал запись: вы или сервер</li>
-        </ul>
+    <section class="section" id="features">
+      <div class="wrap">
+        <div class="sec-head" data-reveal>
+          <div>
+            <p class="kicker">Возможности</p>
+            <h2>Четыре причины держать Voice Button в трее.</h2>
+          </div>
+          <p class="sec-lead">Одна кнопка закрывает то, для чего обычно нужны несколько разных сервисов.</p>
+        </div>
+        <div class="cards">
+          <article class="card" data-reveal>
+            <div class="card-top"><span class="icon"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="9" y="2.6" width="6" height="11" rx="3" stroke="currentColor" stroke-width="1.6"/><path d="M5.6 11a6.4 6.4 0 0 0 12.8 0M12 17.4V21M8.6 21h6.8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></span><span class="card-no">01</span></div>
+            <h3>Диктовка где угодно</h3>
+            <p>Клик по микрофону в трее или горячая клавиша — и говорите. Готовый текст можно вставить в активное окно, забрать из буфера обмена или найти в истории.</p>
+          </article>
+          <article class="card" data-reveal>
+            <div class="card-top"><span class="icon"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="6.6" y="2.6" width="10.8" height="18.8" rx="2.6" stroke="currentColor" stroke-width="1.6"/><path d="M10.6 5.6h2.8M10.6 18.4h2.8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><path d="M9 9h6M9 12h6M9 15h3.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" opacity=".6"/></svg></span><span class="card-no">02</span></div>
+            <h3>Монологи с телефона</h3>
+            <p>Телефон становится вторым микрофоном. Заводите именованные монологи и диктуйте в них — расшифровка идёт на компьютере, а без связи записи ждут на телефоне.</p>
+          </article>
+          <article class="card" data-reveal>
+            <div class="card-top"><span class="icon"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m21 3-9.4 18-2.3-7.3L2.6 11.2 21 3Z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M9.3 13.7 20.4 3.6" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg></span><span class="card-no">03</span></div>
+            <h3>Telegram-бот</h3>
+            <p>Отправьте боту голосовое сообщение или файл — в ответ придёт расшифровка.</p>
+          </article>
+          <article class="card" data-reveal>
+            <div class="card-top"><span class="icon"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M14 2.9H7.2a2 2 0 0 0-2 2v14.2a2 2 0 0 0 2 2h9.6a2 2 0 0 0 2-2V7.8L14 2.9Z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M14 2.9v5.1h4.8" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M8.6 13.6v3M11.6 11.7v6.7M14.6 13.6v3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></span><span class="card-no">04</span></div>
+            <h3>Аудио и видео</h3>
+            <p>Расшифруйте аудио или видео, которое уже есть — файл обрабатывается на вашем компьютере.</p>
+          </article>
+        </div>
       </div>
     </section>
 
-    <section id="phone" class="section settings-section api-section">
-      <div class="settings-shot"><img src="assets/phone.png" alt="Раздел «Телефон»: QR-код для подключения и сообщения с телефона" loading="lazy"></div>
-      <div class="settings-copy">
-        <p class="kicker">PHONE</p>
-        <h2>Говорите с телефона — текст появляется здесь.</h2>
-        <p>Включите приём в разделе «Внешний доступ → Телефон» и наведите камеру телефона на QR-код. На телефоне открывается страница, где можно завести монологи и диктовать в них, а расшифровка идёт на компьютере — в фоне и уступая вашей диктовке.</p>
-        <ul>
-          <li>Один телефон, одноразовая ссылка, отключение в один клик</li>
-          <li>HTTPS: браузер отдаёт микрофон только в защищённом контексте</li>
-          <li>Без связи запись остаётся на телефоне и уходит позже — со временем, когда была сказана</li>
-          <li>Оригинал текста навсегда в истории, правки на телефоне живут отдельно</li>
-          <li>Доступ из интернета — две кнопки: правило брандмауэра и, если роутер умеет, проброс</li>
-        </ul>
+    <section class="section how" id="how">
+      <div class="wrap">
+        <div class="sec-head" data-reveal>
+          <div>
+            <p class="kicker">Как это работает</p>
+            <h2>Три шага. Ни одного облака.</h2>
+          </div>
+          <p class="sec-lead">Диктовка остаётся на вашем компьютере, поэтому для неё не нужен интернет.</p>
+        </div>
+        <ol class="steps">
+          <li class="step" data-reveal>
+            <span class="step-no">01</span>
+            <h3>Нажмите</h3>
+            <p>Микрофон в трее, горячая клавиша или кнопка в окне — запись начинается сразу. Действия кнопок мыши можно поменять местами.</p>
+          </li>
+          <li class="step" data-reveal>
+            <span class="step-no">02</span>
+            <h3>Говорите</h3>
+            <p>Текст растёт, пока вы говорите. Длинная диктовка режется на паузах и расшифровывается по частям, не дожидаясь остановки.</p>
+          </li>
+          <li class="step" data-reveal>
+            <span class="step-no">03</span>
+            <h3>Забирайте</h3>
+            <p>Готовый текст уже в буфере, вставлен в курсор или лежит в истории — с датой, временем и источником записи.</p>
+          </li>
+        </ol>
       </div>
     </section>
 
-    <section id="download" class="section download-section">
-      <div class="download-heading">
-        <p class="kicker">GET VOICE BUTTON <span data-version>@@VERSION@@</span></p>
-        <h2>Один маленький инструмент.<br>Весь ваш голос — под вашим контролем.</h2>
+    <section class="section" id="phone">
+      <div class="wrap">
+        <div class="phone-panel" data-reveal>
+          <div class="phone-copy">
+            <p class="kicker">Телефон</p>
+            <h2>Говорите с телефона — текст появляется на компьютере.</h2>
+            <p class="lead-sm">Включите приём в приложении и наведите камеру телефона на QR-код. На телефоне откроется страница с монологами — именованными разговорами, в которые диктуют так же, как в чат.</p>
+            <ul class="checks">
+              <li><svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M3 8.4 6.3 11.8 13 4.4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg><span>Один QR-код и одноразовая ссылка; отключить телефон можно одной кнопкой.</span></li>
+              <li><svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M3 8.4 6.3 11.8 13 4.4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg><span>Монологи: список сообщений, редактирование, удаление и архив.</span></li>
+              <li><svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M3 8.4 6.3 11.8 13 4.4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg><span>Без связи запись остаётся на телефоне и уходит позже — со временем, когда была сказана.</span></li>
+              <li><svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M3 8.4 6.3 11.8 13 4.4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg><span>Расшифровка идёт на компьютере в фоне и уступает дорогу вашей диктовке.</span></li>
+              <li><svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M3 8.4 6.3 11.8 13 4.4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg><span>Оригинал каждого сообщения остаётся в истории; правки на телефоне живут отдельно.</span></li>
+            </ul>
+          </div>
+          <figure class="shot phone-shot">
+            <img src="assets/app-phone.png" width="1118" height="1283" alt="Voice Button, раздел «Телефон»: QR-код подключения, монологи и сообщения" loading="lazy" decoding="async">
+            <figcaption>Вкладка «Внешний доступ → Телефон»: QR-код для подключения и монологи с сообщениями.</figcaption>
+          </figure>
+        </div>
       </div>
-      <div class="download-grid">
-        <article class="download-card">
-          <p class="card-label">РЕКОМЕНДУЕТСЯ</p>
-          <h3>Установщик</h3>
-          <p>Установка для всех пользователей, ярлык в меню «Пуск» и корректное удаление через Windows.</p>
-          <a class="button primary wide" href="https://github.com/machine202502/voice-button/releases/latest/download/voice-button-@@VERSION@@-windows-x64-setup.exe" data-dl-setup>Скачать Setup</a>
-          <div class="file-meta"><span data-size-setup>@@SIZE_SETUP@@ МБ</span><code data-hash-setup>@@HASH_SETUP@@</code></div>
-        </article>
-        <article class="download-card portable-card">
-          <p class="card-label">БЕЗ УСТАНОВКИ</p>
-          <h3>Portable ZIP</h3>
-          <p>Распакуйте и запустите voice-button.exe. Держите voice-button-ui.exe рядом — оба файла входят в архив.</p>
-          <a class="button secondary wide" href="https://github.com/machine202502/voice-button/releases/latest/download/voice-button-@@VERSION@@-windows-x64.zip" data-dl-zip>Скачать ZIP</a>
-          <div class="file-meta"><span data-size-zip>@@SIZE_ZIP@@ МБ</span><code data-hash-zip>@@HASH_ZIP@@</code></div>
-        </article>
+    </section>
+
+    <section class="section" id="screens">
+      <div class="wrap">
+        <div class="sec-head" data-reveal>
+          <div>
+            <p class="kicker">Внутри</p>
+            <h2>Окно, которое не мешает.</h2>
+          </div>
+          <p class="sec-lead">Приложение живёт в трее, а окно открывается, когда нужно: живая запись, история и настройки в одном месте.</p>
+        </div>
+        <div class="row" data-reveal>
+          <figure class="row-media">
+            <div class="shot">
+              <img src="assets/app-history.png" width="1118" height="755" alt="История Voice Button: раскрытая запись с добавленными частями" loading="lazy" decoding="async">
+            </div>
+            <figcaption>История: раскрытая диктовка с добавленными частями.</figcaption>
+          </figure>
+          <div class="row-copy">
+            <p class="label">История</p>
+            <h3>Возвращайтесь к любому сообщению.</h3>
+            <p>Записи сгруппированы по дням, с временем и источником. Откройте запись, чтобы увидеть отдельные куски длинной диктовки, и скопируйте её целиком или по частям.</p>
+            <ul class="checks">
+              <li><svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M3 8.4 6.3 11.8 13 4.4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg><span>Поиск по всей истории</span></li>
+              <li><svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M3 8.4 6.3 11.8 13 4.4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg><span>Копирование одним нажатием</span></li>
+              <li><svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M3 8.4 6.3 11.8 13 4.4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg><span>Фильтры по источнику: вы, сервер, файл, телефон, Telegram</span></li>
+            </ul>
+          </div>
+        </div>
+        <div class="row row-flip" data-reveal>
+          <figure class="row-media">
+            <div class="shot">
+              <img src="assets/app-settings.png" width="1118" height="1280" alt="Настройки Voice Button: модель, звуки, автозапуск и микрофон" loading="lazy" decoding="async">
+            </div>
+            <figcaption>Настройки: модель, звуки, автозапуск и микрофон.</figcaption>
+          </figure>
+          <div class="row-copy">
+            <p class="label">Настройки</p>
+            <h3>Настройки без кнопки «Сохранить».</h3>
+            <p>Микрофон, действия кнопок мыши, горячие клавиши, звуки, громкость, язык и автозапуск применяются сразу. Модель можно скачать и отменить загрузку в том же окне.</p>
+            <ul class="checks">
+              <li><svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M3 8.4 6.3 11.8 13 4.4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg><span>Выбор микрофона и чувствительность записи</span></li>
+              <li><svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M3 8.4 6.3 11.8 13 4.4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg><span>Три глобальные горячие клавиши: запись, дополнение и вставка</span></li>
+              <li><svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M3 8.4 6.3 11.8 13 4.4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg><span>Скачивание моделей с прогрессом и отменой</span></li>
+            </ul>
+          </div>
+        </div>
       </div>
-      <p class="license">Исходный код — <a href="https://github.com/machine202502/voice-button/blob/master/LICENSE">MIT License</a>. В сборку входят ONNX Runtime (MIT), sherpa-onnx (Apache-2.0) и whisper.cpp (MIT); полные тексты лицензий лежат в <code>THIRD-PARTY.txt</code> рядом с исполняемыми файлами. Модели не входят в установщик: приложение лишь предлагает ссылки для их скачивания.</p>
+    </section>
+
+    <section class="section" id="local">
+      <div class="wrap local-grid">
+        <div class="local-copy" data-reveal>
+          <p class="kicker">Приватность</p>
+          <h2>Распознавание не уходит в облако.</h2>
+          <p class="section-intro">Голос обрабатывается моделями, которые работают локально. Аккаунта и подписки нет, а записи не нужно отправлять на сервер.</p>
+          <ul class="local-points">
+            <li class="local-point">
+              <svg width="18" height="18" viewBox="0 0 20 20" fill="none" aria-hidden="true"><rect x="2.6" y="4.4" width="14.8" height="11.2" rx="2.2" stroke="currentColor" stroke-width="1.4"/><path d="M6.2 11.6v2.2M9 9.4v4.4M11.8 11v2.8M14.6 9.8v3.6" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+              <div><h3>Модели на вашем компьютере</h3><p>Whisper, GigaAM и SenseVoice работают локально. Модель выбирается в настройках и скачивается один раз.</p></div>
+            </li>
+            <li class="local-point">
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M8 1.6 13.4 3.7v4.1c0 3.2-2.2 5.6-5.4 6.7-3.2-1.1-5.4-3.5-5.4-6.7V3.7L8 1.6Z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/><path d="m5.6 7.7 1.8 1.8 3.3-3.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              <div><h3>Аудио живёт до текста</h3><p>Запись удаляется, как только текст сохранён. Если расшифровка не удалась, аудио остаётся на диске.</p></div>
+            </li>
+            <li class="local-point">
+              <svg width="18" height="18" viewBox="0 0 20 20" fill="none" aria-hidden="true"><circle cx="10" cy="6.4" r="3.1" stroke="currentColor" stroke-width="1.4"/><path d="M4.3 17c0-2.9 2.6-5 5.7-5s5.7 2.1 5.7 5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+              <div><h3>Без аккаунта и подписки</h3><p>Не нужна регистрация, нет платежей и облачной обработки. Исходный код открыт под MIT.</p></div>
+            </li>
+          </ul>
+        </div>
+        <div class="local-visual" data-reveal>
+          <div class="inside">
+            <p class="inside-label">Ваш компьютер</p>
+            <div class="flow">
+              <div class="node"><span class="node-ico"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="9" y="2.6" width="6" height="11" rx="3" stroke="currentColor" stroke-width="1.6"/><path d="M5.6 11a6.4 6.4 0 0 0 12.8 0M12 17.4V21M8.6 21h6.8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></span><span>Микрофон</span></div>
+              <span class="flow-arrow" aria-hidden="true">→</span>
+              <div class="node"><span class="node-ico"><svg width="20" height="20" viewBox="0 0 20 20" fill="none" aria-hidden="true"><rect x="5.6" y="5.6" width="8.8" height="8.8" rx="2" stroke="currentColor" stroke-width="1.4"/><path d="M8 2.4v3.2M12 2.4v3.2M8 14.4v3.2M12 14.4v3.2M2.4 8h3.2M2.4 12h3.2M14.4 8h3.2M14.4 12h3.2" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg></span><span>Модель</span></div>
+              <span class="flow-arrow" aria-hidden="true">→</span>
+              <div class="node"><span class="node-ico"><svg width="20" height="20" viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M4.2 5.4h11.6M4.2 10h11.6M4.2 14.6h7.2" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg></span><span>Текст</span></div>
+            </div>
+          </div>
+          <figure class="about-card">
+            <img src="assets/app-about.png" width="812" height="574" alt="Окно «О программе» Voice Button 0.6.0" loading="lazy" decoding="async">
+            <figcaption>О приложении: версия 0.6.0, MIT.</figcaption>
+          </figure>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="download">
+      <div class="wrap">
+        <div class="dl-panel" data-reveal>
+          <div class="dl-head">
+            <div>
+              <p class="kicker">Скачать</p>
+              <h2>Установите и говорите.</h2>
+            </div>
+            <p class="ver"><span>Версия <span data-version>@@VERSION@@</span></span></p>
+          </div>
+          <p class="dl-lead">Windows 10 и 11, 64-бит. Установщик для всех пользователей или портативный архив без установки.</p>
+          <div class="dl-grid">
+            <article class="dl-card recommended">
+              <p class="badge">Рекомендуем</p>
+              <h3>Установщик</h3>
+              <p>Устанавливает приложение для всех пользователей.</p>
+              <a class="btn btn-primary" href="https://github.com/machine202502/voice-button/releases/latest/download/voice-button-@@VERSION@@-windows-x64-setup.exe" data-dl-setup>Скачать установщик<svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M8 2.2v8.1M4.4 6.9 8 10.5l3.6-3.6M3 13.3h10" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></a>
+              <div class="file-meta">
+                <span class="size" data-size-setup>@@SIZE_SETUP@@ МБ</span>
+              </div>
+              <div class="hash-row">
+                <span class="hash-label">SHA-256</span>
+                <button type="button" class="hash" data-hash-setup title="нажмите, чтобы скопировать" aria-label="SHA-256 — нажмите, чтобы скопировать">@@HASH_SETUP@@</button>
+              </div>
+            </article>
+            <article class="dl-card">
+              <p class="badge badge-quiet">Без установки</p>
+              <h3>Портативный ZIP</h3>
+              <p>Распакуйте и запустите voice-button.exe. Держите voice-button-ui.exe рядом — оба файла в архиве.</p>
+              <a class="btn btn-secondary" href="https://github.com/machine202502/voice-button/releases/latest/download/voice-button-@@VERSION@@-windows-x64.zip" data-dl-zip>Скачать ZIP<svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M8 2.2v8.1M4.4 6.9 8 10.5l3.6-3.6M3 13.3h10" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></a>
+              <div class="file-meta">
+                <span class="size" data-size-zip>@@SIZE_ZIP@@ МБ</span>
+              </div>
+              <div class="hash-row">
+                <span class="hash-label">SHA-256</span>
+                <button type="button" class="hash" data-hash-zip title="нажмите, чтобы скопировать" aria-label="SHA-256 — нажмите, чтобы скопировать">@@HASH_ZIP@@</button>
+              </div>
+            </article>
+          </div>
+          <p class="dl-note">Модели не входят в сборку. При первом запуске приложение предложит модель под язык системы — её нужно один раз скачать.</p>
+          <p class="license">Исходный код — <a href="https://github.com/machine202502/voice-button/blob/master/LICENSE" rel="license">MIT License</a>. В сборку входят ONNX Runtime (MIT), sherpa-onnx (Apache-2.0) и whisper.cpp (MIT); полные тексты — в <code>THIRD-PARTY.txt</code> рядом с исполняемыми файлами.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="faq">
+      <div class="wrap faq-grid">
+        <div class="faq-intro" data-reveal>
+          <p class="kicker">Вопросы</p>
+          <h2>Коротко о главном.</h2>
+          <p>Если чего-то не хватает, ответы есть в README на GitHub.</p>
+          <a class="text-link" href="https://github.com/machine202502/voice-button#readme" target="_blank" rel="noopener">Открыть README<svg width="12" height="12" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M4.5 11.5 11.5 4.5M5.5 4.5h6v6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></a>
+        </div>
+        <div class="faq-list">
+          <details>
+            <summary>Нужен ли интернет?</summary>
+            <p>Для диктовки — нет: распознавание идёт на компьютере. Интернет понадобится, чтобы скачать модель, а ещё для Telegram-бота и доступа к телефону из другой сети.</p>
+          </details>
+          <details>
+            <summary>Это бесплатно?</summary>
+            <p>Да. Приложение и исходный код бесплатны, лицензия MIT. Подписки и аккаунта нет.</p>
+          </details>
+          <details>
+            <summary>Какие языки поддерживаются?</summary>
+            <p>Мультиязычные Whisper и SenseVoice (китайский, английский, японский, корейский, кантонский) и русские GigaAM. Whisper и SenseVoice определяют язык сами.</p>
+          </details>
+          <details>
+            <summary>Можно ли диктовать долго?</summary>
+            <p>Да. Речь режется на паузах и расшифровывается по ходу записи: текст растёт, пока вы говорите, а после остановки обрабатывается только последний фрагмент.</p>
+          </details>
+          <details>
+            <summary>Куда попадает текст?</summary>
+            <p>В буфер обмена, в активное окно в режиме вставки или в историю. В истории запись можно раскрыть и скопировать целиком или отдельными частями.</p>
+          </details>
+        </div>
+      </div>
     </section>
   </main>
 
-  <footer>
-    <a class="brand" href="#top"><img src="assets/icon.png" alt="" width="28" height="28"><span>VOICE BUTTON</span></a>
-    <span>© <span data-year></span> machine202502</span>
-    <a href="https://github.com/machine202502/voice-button">Исходный код ↗</a>
+  <footer class="site-footer">
+    <div class="wrap footer-in">
+      <div class="footer-brand">
+        <a class="brand" href="#top" aria-label="Voice Button">
+          <img src="assets/icon-192.png" alt="" width="26" height="26">
+          <span>VOICE BUTTON</span>
+        </a>
+        <p>Локальная диктовка для Windows.</p>
+      </div>
+      <nav class="footer-links" aria-label="Ссылки">
+        <a href="https://github.com/machine202502/voice-button" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://github.com/machine202502/voice-button/releases/latest">Релизы</a>
+        <a href="https://github.com/machine202502/voice-button/blob/master/LICENSE">Лицензия MIT</a>
+      </nav>
+      <p class="footer-note">© <span data-year>2026</span> machine202502</p>
+    </div>
   </footer>
+
   <script src="app.js"></script>
 </body>
 </html>

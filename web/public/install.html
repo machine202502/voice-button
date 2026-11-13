@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#0d120f" />
+    <link rel="icon" href="./favicon.svg" type="image/svg+xml" />
+    <title>Voice Button</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #0d120f;
+        --ink: #eef4e8;
+        --muted: #8f9c8b;
+        --line: rgba(224, 239, 211, 0.12);
+        --lime: #c7f36b;
+        --amber: #ffbd62;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0 auto;
+        max-width: 560px;
+        padding: 22px 16px 40px;
+        background: var(--bg);
+        color: var(--ink);
+        font-family: 'Segoe UI', system-ui, sans-serif;
+        font-size: 16px;
+        line-height: 1.55;
+      }
+
+      h1 {
+        margin: 0 0 0.5em;
+        font-size: 1.35em;
+      }
+
+      h2 {
+        margin: 1.2em 0 0.4em;
+        font-size: 1.05em;
+      }
+
+      p,
+      li {
+        color: #cfe0c6;
+      }
+
+      ol {
+        padding-left: 1.2em;
+      }
+
+      li {
+        margin-bottom: 0.45em;
+      }
+
+      code {
+        color: var(--lime);
+        word-break: break-all;
+      }
+
+      .big {
+        display: block;
+        margin: 18px 0;
+        padding: 14px;
+        border-radius: 14px;
+        background: var(--lime);
+        color: #17200f;
+        font-weight: 600;
+        text-align: center;
+        text-decoration: none;
+      }
+
+      .note {
+        padding: 12px 14px;
+        border: 1px solid rgba(255, 189, 98, 0.4);
+        border-radius: 14px;
+        background: rgba(255, 189, 98, 0.08);
+        color: #ffd39b;
+        font-size: 13.5px;
+      }
+
+      .back {
+        margin-top: 24px;
+      }
+
+      .back a {
+        color: var(--lime);
+      }
+    </style>
+  </head>
+  <body>
+    <section>
+      <h2>Pair this phone</h2>
+      <p>
+        Open the address Voice Button shows on the computer. The page pairs on its first load; the
+        certificate below only removes the browser warning and lets the page install as an app.
+      </p>
+    </section>
+
+    <main id="install-guide">
+      <h1>Voice Button as an app</h1>
+      <p>
+        Install the certificate on the phone once — the warning stops and the browser lets the page
+        install as an app with its own icon.
+      </p>
+      <a class="big" href="ca.crt" id="download-en" target="_blank" rel="noopener">
+        Download the certificate
+      </a>
+
+      <h2>Android</h2>
+      <ol>
+        <li>Download the certificate; it lands in “Downloads”.</li>
+        <li>
+          Settings → Security → Encryption &amp; credentials → Install a certificate →
+          <b>CA certificate</b>.
+        </li>
+        <li>Pick the downloaded <code>voice-button-ca.crt</code> and confirm.</li>
+        <li>Return here: the warning is gone, and Chrome offers “Install app”.</li>
+      </ol>
+
+      <h2>iPhone</h2>
+      <ol>
+        <li>Tap “Download the certificate” and allow the profile.</li>
+        <li>Settings → Profile Downloaded → Install.</li>
+        <li>
+          Settings → General → About → Certificate Trust Settings → enable full trust for “Voice
+          Button”.
+        </li>
+        <li>Open the page in Safari → Share → “Add to Home Screen”.</li>
+      </ol>
+
+      <p class="note" id="brave-note" hidden>
+        Brave blocks certificate downloads entirely — open this page in Chrome.
+      </p>
+      <p class="note">
+        The certificate was issued by this computer and signs only the site's address. Keep its key
+        to yourself.
+      </p>
+      <p class="back"><a href="./">&larr; Back</a></p>
+    </main>
+
+    <script>
+      // The guide text lives in lang/install.<lang>.json, copied from the
+      // current page at build time.  The markup above is the English fallback
+      // if that fetch is unavailable.
+      const guide = document.getElementById('install-guide');
+      const requested = (navigator.language || 'en').slice(0, 2).toLowerCase();
+      const languages = ['en', 'ru', 'zh'];
+      const language = languages.includes(requested) ? requested : 'en';
+
+      fetch('lang/install.' + language + '.json')
+        .then((response) => (response.ok ? response.json() : Promise.reject()))
+        .catch(() => fetch('lang/install.en.json').then((response) => response.json()))
+        .then((data) => {
+          if (typeof data.html === 'string') guide.innerHTML = data.html;
+          if (typeof data.title === 'string') document.title = data.title;
+          document.documentElement.lang = language;
+          const note = document.getElementById('brave-note');
+          if (note && /Brave/i.test(navigator.userAgent)) note.hidden = false;
+        })
+        .catch(() => {});
+    </script>
+  </body>
+</html>

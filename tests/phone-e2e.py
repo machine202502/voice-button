@@ -830,6 +830,14 @@ def main():
         else:
             raise TimeoutError("the phone page never loaded")
         browser.evaluate(f"localStorage.setItem('vb_token', {daemon.token!r})")
+        # The header exists on the pairing screen too, so wait for the app itself:
+        # the version, the manifest and the install bar are the app's, not the
+        # pairing screen's.
+        wait_for(
+            lambda: browser.evaluate("!!document.getElementById('composer')"),
+            timeout=20,
+            what="the app screen after pairing",
+        )
         version = browser.evaluate(
             "(() => { const node = document.getElementById('version');"
             " if (!node) return null; const style = getComputedStyle(node);"
@@ -892,12 +900,15 @@ def main():
             ".catch((e) => ({ ok: false, text: String(e) }))",
             await_promise=True,
         )
+        guide = install.get("text", "")
         check(
-            install.get("ok") and "css/styles.css" in install.get("text", ""),
-            "the install guide is served with its stylesheet",
+            install.get("ok") and "lang/install." in guide and "<h1" in guide,
+            "the install guide is served, styled inline and localized",
         )
+        # The new page carries its own styles and loads the guide text from
+        # lang/install.<lang>.json, so the old separate stylesheet is gone.
         sheet = browser.evaluate(
-            "fetch('/css/styles.css').then((r) => r.status).catch(() => 0)",
+            "fetch('/lang/install.en.json').then((r) => r.status).catch(() => 0)",
             await_promise=True,
         )
         check(sheet == 200, f"the page stylesheet is served ({sheet})")
@@ -905,6 +916,11 @@ def main():
         print("a note never covers the bottom bars")
         # The bug from the phone: "no connection" was drawn on top of the
         # install button. The note now lives in the flow above the footer.
+        wait_for(
+            lambda: browser.evaluate("!!document.getElementById('install')"),
+            timeout=20,
+            what="the install bar",
+        )
         browser.evaluate("document.getElementById('install').hidden = false")
         browser.evaluate("window.dispatchEvent(new Event('offline'))")
         wait_for(
