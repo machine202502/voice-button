@@ -1,0 +1,1 @@
+-- `audio.rs` owns no SQL: it writes WAV files, not database rows.

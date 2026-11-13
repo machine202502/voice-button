@@ -24,6 +24,7 @@ pub mod segmenter;
 pub mod session;
 pub mod site;
 pub mod sound;
+pub mod sql;
 pub mod state;
 pub mod store;
 pub mod stitch;

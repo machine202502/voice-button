@@ -117,8 +117,7 @@ impl Db {
             let conn = store.conn();
             let client = conn
                 .query_row(
-                    "SELECT token, paired, created, expires, last_seen, last_ip
-                     FROM site_client WHERE id = 1",
+                    crate::sql::query("site_db/client"),
                     [],
                     |row| {
                         Ok(Client {
@@ -135,7 +134,7 @@ impl Db {
             data.client = client.unwrap_or_default();
             {
                 let mut statement =
-                    conn.prepare("SELECT id, name, archived, created FROM monologs ORDER BY id")?;
+                    conn.prepare(crate::sql::query("site_db/monologs"))?;
                 data.monologues = statement
                     .query_map([], |row| {
                         Ok(Monolog {
@@ -179,11 +178,7 @@ impl Db {
         if self.dirty_client {
             let client = &self.data.client;
             transaction.execute(
-                "INSERT INTO site_client(id, token, paired, created, expires, last_seen, last_ip)
-                 VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)
-                 ON CONFLICT(id) DO UPDATE SET token = excluded.token, paired = excluded.paired,
-                    created = excluded.created, expires = excluded.expires,
-                    last_seen = excluded.last_seen, last_ip = excluded.last_ip",
+                crate::sql::query("site_db/client_put"),
                 params![
                     client.token,
                     client.paired as i64,
@@ -199,10 +194,7 @@ impl Db {
                 continue;
             }
             transaction.execute(
-                "INSERT INTO monologs(id, name, archived, created)
-                 VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(id) DO UPDATE SET name = excluded.name,
-                    archived = excluded.archived, created = excluded.created",
+                crate::sql::query("site_db/monolog_put"),
                 params![
                     monolog.id as i64,
                     monolog.name,
@@ -211,11 +203,7 @@ impl Db {
                 ],
             )?;
         }
-        transaction.execute(
-            "INSERT INTO kv(key, value) VALUES ('rev.site', '1')
-             ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1",
-            [],
-        )?;
+        transaction.execute(crate::sql::query("site_db/bump"), [])?;
         transaction.commit()?;
         self.dirty_client = false;
         self.dirty_monologs.clear();
@@ -296,8 +284,7 @@ impl Db {
                 let mut copy = monolog.clone();
                 copy.count = conn
                     .query_row(
-                        "SELECT COUNT(*) FROM site_messages
-                         WHERE monolog_id = ?1 AND deleted = 0",
+                        crate::sql::query("site_db/monolog_message_count"),
                         [monolog.id as i64],
                         |row| row.get::<_, i64>(0),
                     )
@@ -346,7 +333,7 @@ impl Db {
         let transaction = conn.transaction().ok()?;
         let exists: i64 = transaction
             .query_row(
-                "SELECT COUNT(*) FROM monologs WHERE id = ?1",
+                crate::sql::query("site_db/monolog_exists"),
                 [id as i64],
                 |row| row.get(0),
             )
@@ -356,7 +343,7 @@ impl Db {
         }
         let mut messages = Vec::new();
         if let Ok(mut statement) =
-            transaction.prepare("SELECT id FROM site_messages WHERE monolog_id = ?1")
+            transaction.prepare(crate::sql::query("site_db/monolog_message_ids"))
         {
             if let Ok(rows) = statement.query_map([id as i64], |row| row.get::<_, i64>(0)) {
                 messages = rows
@@ -366,17 +353,13 @@ impl Db {
             }
         }
         let _ = transaction.execute(
-            "DELETE FROM site_messages WHERE monolog_id = ?1",
+            crate::sql::query("site_db/monolog_messages_delete"),
             [id as i64],
         );
-        let _ = transaction.execute("DELETE FROM monologs WHERE id = ?1", [id as i64]);
+        let _ = transaction.execute(crate::sql::query("site_db/monolog_delete"), [id as i64]);
         // The window keeps one counter for message and monolog writes; the
         // delete has to move it or the list would keep showing the monolog.
-        let _ = transaction.execute(
-            "INSERT INTO kv(key, value) VALUES ('rev.site', '1')
-             ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1",
-            [],
-        );
+        let _ = transaction.execute(crate::sql::query("site_db/bump"), []);
         if transaction.commit().is_err() {
             return None;
         }
@@ -391,7 +374,7 @@ impl Db {
     pub fn add_message(&mut self, monolog: u64, recorded: &str, now: &str) -> Message {
         let conn = self.store.conn();
         let id: i64 = conn
-            .query_row("SELECT COALESCE(MAX(id), 0) + 1 FROM site_messages", [], |row| row.get(0))
+            .query_row(crate::sql::query("site_db/message_next_id"), [], |row| row.get(0))
             .unwrap_or(1);
         let message = Message {
             id: id as u64,
@@ -409,8 +392,7 @@ impl Db {
             closed: false,
         };
         let _ = conn.execute(
-            "INSERT INTO site_messages(id, monolog_id, recorded, received, stage)
-             VALUES (?1, ?2, ?3, ?4, 'draft')",
+            crate::sql::query("site_db/message_insert"),
             params![message.id as i64, monolog as i64, message.recorded, message.received],
         );
         bump(&conn);
@@ -421,9 +403,7 @@ impl Db {
         self.store
             .conn()
             .query_row(
-                "SELECT id, monolog_id, recorded, received, stage, text, original, edited,
-                    deleted, duration, segments_done, history_at, closed
-                 FROM site_messages WHERE id = ?1",
+                crate::sql::query("site_db/message_by_id"),
                 [id as i64],
                 read_message,
             )
@@ -435,14 +415,9 @@ impl Db {
     pub fn messages(&self, monolog: Option<u64>) -> Vec<Message> {
         let conn = self.store.conn();
         let sql = if monolog.is_some() {
-            "SELECT id, monolog_id, recorded, received, stage, text, original, edited,
-                deleted, duration, segments_done, history_at, closed
-             FROM site_messages WHERE deleted = 0 AND monolog_id = ?1
-             ORDER BY recorded, id"
+            crate::sql::query("site_db/messages_in_monolog")
         } else {
-            "SELECT id, monolog_id, recorded, received, stage, text, original, edited,
-                deleted, duration, segments_done, history_at, closed
-             FROM site_messages WHERE deleted = 0 ORDER BY recorded, id"
+            crate::sql::query("site_db/messages_all")
         };
         let mut statement = match conn.prepare(sql) {
             Ok(statement) => statement,
@@ -459,7 +434,7 @@ impl Db {
     pub fn close_take(&mut self, id: u64) {
         let conn = self.store.conn();
         if conn
-            .execute("UPDATE site_messages SET closed = 1 WHERE id = ?1", [id as i64])
+            .execute(crate::sql::query("site_db/message_close"), [id as i64])
             .unwrap_or(0)
             > 0
         {
@@ -471,7 +446,7 @@ impl Db {
         let conn = self.store.conn();
         let Some(current) = conn
             .query_row(
-                "SELECT stage FROM site_messages WHERE id = ?1",
+                crate::sql::query("site_db/message_stage"),
                 [id as i64],
                 |row| Ok(Stage::from_storage(&row.get::<_, String>(0)?)),
             )
@@ -491,7 +466,7 @@ impl Db {
             return false;
         }
         let _ = conn.execute(
-            "UPDATE site_messages SET stage = ?1 WHERE id = ?2",
+            crate::sql::query("site_db/message_stage_update"),
             params![stage.as_storage(), id as i64],
         );
         bump(&conn);
@@ -502,7 +477,7 @@ impl Db {
         let conn = self.store.conn();
         let Some((stage, duration)) = conn
             .query_row(
-                "SELECT stage, duration FROM site_messages WHERE id = ?1",
+                crate::sql::query("site_db/message_stage_duration"),
                 [id as i64],
                 |row| {
                     Ok((
@@ -524,7 +499,7 @@ impl Db {
             stage
         };
         let _ = conn.execute(
-            "UPDATE site_messages SET duration = ?1, stage = ?2 WHERE id = ?3",
+            crate::sql::query("site_db/message_duration_stage"),
             params![duration, stage.as_storage(), id as i64],
         );
         bump(&conn);
@@ -534,7 +509,7 @@ impl Db {
         let conn = self.store.conn();
         if conn
             .execute(
-                "UPDATE site_messages SET text = ?1, segments_done = ?2 WHERE id = ?3",
+                crate::sql::query("site_db/message_text_segments"),
                 params![text, segments_done as i64, id as i64],
             )
             .unwrap_or(0)
@@ -550,8 +525,7 @@ impl Db {
         let conn = self.store.conn();
         let changed = conn
             .execute(
-                "UPDATE site_messages SET history_at = ?1
-                 WHERE id = ?2 AND history_at IS NULL",
+                crate::sql::query("site_db/message_mark_history"),
                 params![at, id as i64],
             )
             .unwrap_or(0);
@@ -565,7 +539,7 @@ impl Db {
         let conn = self.store.conn();
         if conn
             .execute(
-                "UPDATE site_messages SET text = ?1, edited = ?2 WHERE id = ?3",
+                crate::sql::query("site_db/message_text_edited"),
                 params![text, now, id as i64],
             )
             .unwrap_or(0)
@@ -579,7 +553,7 @@ impl Db {
         let conn = self.store.conn();
         if conn
             .execute(
-                "UPDATE site_messages SET deleted = 1, stage = 'cancelled' WHERE id = ?1",
+                crate::sql::query("site_db/message_delete"),
                 [id as i64],
             )
             .unwrap_or(0)
@@ -593,7 +567,7 @@ impl Db {
     /// state. Never used to render a list.
     pub fn stages(&self) -> Vec<(u64, Stage)> {
         let conn = self.store.conn();
-        let Ok(mut statement) = conn.prepare("SELECT id, stage FROM site_messages ORDER BY id") else {
+        let Ok(mut statement) = conn.prepare(crate::sql::query("site_db/message_stages")) else {
             return Vec::new();
         };
         statement
@@ -611,7 +585,7 @@ impl Db {
         self.store
             .conn()
             .query_row(
-                "SELECT COUNT(*) FROM site_messages WHERE monolog_id = ?1 AND deleted = 0",
+                crate::sql::query("site_db/message_count"),
                 [monolog as i64],
                 |row| row.get::<_, i64>(0),
             )
@@ -630,16 +604,9 @@ impl Db {
         limit: usize,
     ) -> Vec<Message> {
         let conn = self.store.conn();
-        let select = "SELECT id, monolog_id, recorded, received, stage, text, original, edited,
-                deleted, duration, segments_done, history_at, closed
-             FROM site_messages";
-        let (sql, params): (String, Vec<Box<dyn rusqlite::ToSql>>) = match (before, after) {
+        let (sql, params): (&str, Vec<Box<dyn rusqlite::ToSql>>) = match (before, after) {
             (Some((recorded, id)), _) => (
-                format!(
-                    "{select} WHERE deleted = 0 AND monolog_id = ?1
-                     AND (recorded < ?2 OR (recorded = ?2 AND id < ?3))
-                     ORDER BY recorded DESC, id DESC LIMIT ?4"
-                ),
+                crate::sql::query("site_db/message_page_before"),
                 vec![
                     Box::new(monolog as i64),
                     Box::new(recorded.to_string()),
@@ -648,11 +615,7 @@ impl Db {
                 ],
             ),
             (_, Some((recorded, id))) => (
-                format!(
-                    "{select} WHERE deleted = 0 AND monolog_id = ?1
-                     AND (recorded > ?2 OR (recorded = ?2 AND id > ?3))
-                     ORDER BY recorded ASC, id ASC LIMIT ?4"
-                ),
+                crate::sql::query("site_db/message_page_after"),
                 vec![
                     Box::new(monolog as i64),
                     Box::new(recorded.to_string()),
@@ -661,10 +624,7 @@ impl Db {
                 ],
             ),
             _ => (
-                format!(
-                    "{select} WHERE deleted = 0 AND monolog_id = ?1
-                     ORDER BY recorded DESC, id DESC LIMIT ?2"
-                ),
+                crate::sql::query("site_db/message_page_newest"),
                 vec![Box::new(monolog as i64), Box::new(limit as i64)],
             ),
         };
@@ -688,19 +648,13 @@ impl Db {
         let conn = self.store.conn();
         let total: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM monologs WHERE archived = ?1",
+                crate::sql::query("site_db/monologs_count_archived"),
                 [archived as i64],
                 |row| row.get(0),
             )
             .unwrap_or(0);
         let mut result = Vec::new();
-        if let Ok(mut statement) = conn.prepare(
-            "SELECT m.id, m.name, m.archived, m.created,
-                (SELECT COUNT(*) FROM site_messages s
-                 WHERE s.monolog_id = m.id AND s.deleted = 0)
-             FROM monologs m WHERE m.archived = ?1
-             ORDER BY m.created DESC, m.id DESC LIMIT ?2 OFFSET ?3",
-        ) {
+        if let Ok(mut statement) = conn.prepare(crate::sql::query("site_db/monologs_page_rows")) {
             if let Ok(rows) = statement.query_map(
                 params![archived as i64, limit as i64, offset as i64],
                 |row| {
@@ -723,7 +677,7 @@ impl Db {
         self.store
             .conn()
             .query_row(
-                "SELECT COUNT(*) FROM monologs WHERE archived = ?1",
+                crate::sql::query("site_db/monologs_count_archived"),
                 [archived as i64],
                 |row| row.get::<_, i64>(0),
             )
@@ -736,11 +690,7 @@ impl Db {
         self.store
             .conn()
             .query_row(
-                "SELECT id, monolog_id, recorded, received, stage, text, original, edited,
-                    deleted, duration, segments_done, history_at, closed
-                 FROM site_messages
-                 WHERE monolog_id = ?1 AND deleted = 0 AND trim(text) <> ''
-                 ORDER BY recorded DESC, id DESC LIMIT 1",
+                crate::sql::query("site_db/message_last_text"),
                 [monolog as i64],
                 read_message,
             )
@@ -753,9 +703,7 @@ impl Db {
         self.store
             .conn()
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM site_messages
-                 WHERE monolog_id = ?1 AND deleted = 0
-                   AND stage IN ('draft','uploading','queued','transcribing'))",
+                crate::sql::query("site_db/monolog_busy"),
                 [monolog as i64],
                 |row| row.get::<_, i64>(0),
             )
@@ -767,10 +715,7 @@ impl Db {
     /// finished or closed by the worker at startup.
     pub fn unfinished(&self) -> Vec<u64> {
         let conn = self.store.conn();
-        let Ok(mut statement) = conn.prepare(
-            "SELECT id FROM site_messages
-             WHERE stage IN ('draft', 'uploading', 'queued', 'transcribing') ORDER BY id",
-        ) else {
+        let Ok(mut statement) = conn.prepare(crate::sql::query("site_db/messages_unfinished")) else {
             return Vec::new();
         };
         statement
@@ -782,11 +727,7 @@ impl Db {
 
 /// Add one to the window's revision counter after a message write.
 fn bump(conn: &rusqlite::Connection) {
-    let _ = conn.execute(
-        "INSERT INTO kv(key, value) VALUES ('rev.site', '1')
-         ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1",
-        [],
-    );
+    let _ = conn.execute(crate::sql::query("site_db/bump"), []);
 }
 
 fn read_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
@@ -812,8 +753,7 @@ pub fn client(store: &Store) -> Option<Client> {
     store
         .conn()
         .query_row(
-            "SELECT token, paired, created, expires, last_seen, last_ip
-             FROM site_client WHERE id = 1",
+            crate::sql::query("site_db/client"),
             [],
             |row| {
                 Ok(Client {
@@ -855,23 +795,17 @@ pub struct MessageRow {
 }
 
 pub fn monolog_count(store: &Store, archived: bool, needle: &str) -> usize {
-    let mut sql = String::from(
-        "SELECT COUNT(*) FROM monologs m WHERE m.archived = ?1",
-    );
     let needle = needle.trim().to_lowercase();
-    if !needle.is_empty() {
-        sql.push_str(
-            " AND (vb_lower(m.name) LIKE ?2 ESCAPE '\\' OR vb_lower(COALESCE((
-                SELECT text FROM site_messages s WHERE s.monolog_id = m.id AND s.deleted = 0
-                ORDER BY s.recorded DESC, s.id DESC LIMIT 1), '')) LIKE ?2 ESCAPE '\\')",
-        );
-    }
     let conn = store.conn();
     let result = if needle.is_empty() {
-        conn.query_row(&sql, [archived as i64], |row| row.get::<_, i64>(0))
+        conn.query_row(
+            crate::sql::query("site_db/monologs_count_archived"),
+            [archived as i64],
+            |row| row.get::<_, i64>(0),
+        )
     } else {
         conn.query_row(
-            &sql,
+            crate::sql::query("site_db/monologs_count_search"),
             params![archived as i64, format!("%{needle}%")],
             |row| row.get::<_, i64>(0),
         )
@@ -890,25 +824,13 @@ pub fn monolog_page(
     limit: usize,
 ) -> Vec<MonologRow> {
     let needle = needle.trim().to_lowercase();
-    let mut sql = String::from(
-        "SELECT m.id, m.name, m.archived, m.created,
-            (SELECT COUNT(*) FROM site_messages s WHERE s.monolog_id = m.id AND s.deleted = 0),
-            COALESCE((SELECT text FROM site_messages s WHERE s.monolog_id = m.id AND s.deleted = 0
-                ORDER BY s.recorded DESC, s.id DESC LIMIT 1), ''),
-            COALESCE((SELECT recorded FROM site_messages s WHERE s.monolog_id = m.id AND s.deleted = 0
-                ORDER BY s.recorded DESC, s.id DESC LIMIT 1), '')
-         FROM monologs m WHERE m.archived = ?1",
-    );
-    if !needle.is_empty() {
-        sql.push_str(
-            " AND (vb_lower(m.name) LIKE ?2 ESCAPE '\\' OR vb_lower(COALESCE((
-                SELECT text FROM site_messages s WHERE s.monolog_id = m.id AND s.deleted = 0
-                ORDER BY s.recorded DESC, s.id DESC LIMIT 1), '')) LIKE ?2 ESCAPE '\\')",
-        );
-    }
-    sql.push_str(" ORDER BY m.created DESC, m.id DESC LIMIT ?3 OFFSET ?4");
     let conn = store.conn();
-    let mut statement = match conn.prepare(&sql) {
+    let sql = if needle.is_empty() {
+        crate::sql::query("site_db/monolog_page")
+    } else {
+        crate::sql::query("site_db/monolog_page_search")
+    };
+    let mut statement = match conn.prepare(sql) {
         Ok(statement) => statement,
         Err(_) => return Vec::new(),
     };
@@ -924,10 +846,7 @@ pub fn monolog_page(
         })
     };
     let rows = if needle.is_empty() {
-        statement.query_map(
-            params![archived as i64, "", limit as i64, offset as i64],
-            mapper,
-        )
+        statement.query_map(params![archived as i64, limit as i64, offset as i64], mapper)
     } else {
         statement.query_map(
             params![archived as i64, format!("%{needle}%"), limit as i64, offset as i64],
@@ -941,7 +860,7 @@ pub fn message_count(store: &Store, monolog: u64) -> usize {
     store
         .conn()
         .query_row(
-            "SELECT COUNT(*) FROM site_messages WHERE monolog_id = ?1 AND deleted = 0",
+            crate::sql::query("site_db/message_count"),
             [monolog as i64],
             |row| row.get::<_, i64>(0),
         )
@@ -951,11 +870,7 @@ pub fn message_count(store: &Store, monolog: u64) -> usize {
 
 pub fn message_page(store: &Store, monolog: u64, offset: usize, limit: usize) -> Vec<MessageRow> {
     let conn = store.conn();
-    let mut statement = match conn.prepare(
-        "SELECT id, recorded, stage, text FROM site_messages
-         WHERE monolog_id = ?1 AND deleted = 0
-         ORDER BY recorded, id LIMIT ?2 OFFSET ?3",
-    ) {
+    let mut statement = match conn.prepare(crate::sql::query("site_db/message_rows")) {
         Ok(statement) => statement,
         Err(_) => return Vec::new(),
     };
@@ -979,10 +894,7 @@ pub fn message_texts(store: &Store, ids: &[u64]) -> Vec<String> {
         return Vec::new();
     }
     let marks = vec!["?"; ids.len()].join(",");
-    let sql = format!(
-        "SELECT text FROM site_messages WHERE id IN ({marks}) AND deleted = 0
-         ORDER BY recorded, id"
-    );
+    let sql = crate::sql::render("site_db/message_texts", &[("marks", &marks)]);
     let conn = store.conn();
     let Ok(mut statement) = conn.prepare(&sql) else {
         return Vec::new();
@@ -1000,13 +912,7 @@ pub fn message_texts(store: &Store, ids: &[u64]) -> Vec<String> {
 pub fn monolog_row(store: &Store, id: u64) -> Option<MonologRow> {
     let conn = store.conn();
     conn.query_row(
-        "SELECT m.id, m.name, m.archived, m.created,
-            (SELECT COUNT(*) FROM site_messages s WHERE s.monolog_id = m.id AND s.deleted = 0),
-            COALESCE((SELECT text FROM site_messages s WHERE s.monolog_id = m.id AND s.deleted = 0
-                ORDER BY s.recorded DESC, s.id DESC LIMIT 1), ''),
-            COALESCE((SELECT recorded FROM site_messages s WHERE s.monolog_id = m.id AND s.deleted = 0
-                ORDER BY s.recorded DESC, s.id DESC LIMIT 1), '')
-         FROM monologs m WHERE m.id = ?1",
+        crate::sql::query("site_db/monolog_row"),
         [id as i64],
         |row| {
             Ok(MonologRow {
@@ -1029,10 +935,7 @@ pub fn monolog_row(store: &Store, id: u64) -> Option<MonologRow> {
 /// action that deliberately touches every id; it does not load texts.
 pub fn message_ids(store: &Store, monolog: u64) -> Vec<u64> {
     let conn = store.conn();
-    let Ok(mut statement) = conn.prepare(
-        "SELECT id FROM site_messages WHERE monolog_id = ?1 AND deleted = 0
-         ORDER BY recorded, id",
-    ) else {
+    let Ok(mut statement) = conn.prepare(crate::sql::query("site_db/message_ids")) else {
         return Vec::new();
     };
     statement

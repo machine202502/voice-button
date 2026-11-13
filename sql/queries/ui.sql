@@ -1,0 +1,2 @@
+-- `ui.rs` owns no SQL: the window reads pages through `site/db.rs` and
+-- `history.rs`. Its SQL-looking names are GDI calls and UI selection helpers.

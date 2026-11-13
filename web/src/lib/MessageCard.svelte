@@ -47,6 +47,9 @@
     if (waiting) return { label: 'engine_busy', tone: 'amber' };
     if (info.tone === 'warning') return { label: 'failed', tone: 'red' };
     if (info.stage === 'done') return { label: 'done', tone: 'done' };
+    // A finished stage keeps its own word even without a connection: the
+    // computer already answered, so "waiting for connection" would be a lie.
+    if (info.stage === 'silent') return { label: 'silent', tone: 'muted' };
     if (info.stage === 'cancelled') return { label: 'cancelled', tone: 'muted' };
     if (!page.reachable) return { label: 'waiting_link', tone: 'amber' };
     return { label: 'in_progress', tone: 'amber' };

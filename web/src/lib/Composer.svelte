@@ -1,10 +1,10 @@
 <script lang="ts">
   // The round button that records, and the two lines that say what it will do.
   //
-  // Its colour is a promise about work actually happening: lime when idle, red
-  // while the take is moving, amber while the computer cannot be reached. The
-  // take is still recorded in the last case; the colour only stops pretending
-  // that it is being transcribed.
+  // Its colour is a promise about the microphone, not about the network: the
+  // button and the rings are lime whenever a take is running, online or not.
+  // The connection may change the wording below the button; it never stops the
+  // rings or recolours the button in the middle of a take.
 
   import RecordRings from './RecordRings.svelte';
   import { page } from '../state.svelte';
@@ -12,7 +12,6 @@
   import MicIcon from './MicIcon.svelte';
 
   const recording = $derived(page.recording !== null);
-  const working = $derived(recording && page.reachable);
   const offline = $derived(recording && !page.reachable);
   const disabled = $derived(page.monolog === null || page.archived);
 
@@ -33,10 +32,10 @@
 </script>
 
 <div class="vb-record-wrap">
-  <RecordRings active={working} level={page.level} size={56} halo={12} rings={3} />
+  <RecordRings active={recording} level={page.level} size={56} halo={12} rings={3} />
   <button
     class="vb-record-button"
-    class:recording={working}
+    class:recording
     class:offline
     id="record"
     type="button"

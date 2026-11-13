@@ -89,9 +89,7 @@ pub fn read(root: &Path) -> Option<State> {
     let store = crate::store::Store::open(root).ok()?;
     let conn = store.conn();
     conn.query_row(
-        "SELECT port, enabled, firewall_rule, firewall_created, upnp_router,
-            upnp_external_port, upnp_internal_ip, upnp_added, error, updated
-         FROM site_network WHERE id = 1",
+        crate::sql::query("site_network/read"),
         [],
         |row| {
             Ok(State {
@@ -125,14 +123,7 @@ pub fn read(root: &Path) -> Option<State> {
 pub fn write(root: &Path, state: &State) -> Result<()> {
     let store = crate::store::Store::open(root)?;
     store.conn().execute(
-        "INSERT INTO site_network(id, port, enabled, firewall_rule, firewall_created,
-            upnp_router, upnp_external_port, upnp_internal_ip, upnp_added, error, updated)
-         VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-         ON CONFLICT(id) DO UPDATE SET port = excluded.port, enabled = excluded.enabled,
-            firewall_rule = excluded.firewall_rule, firewall_created = excluded.firewall_created,
-            upnp_router = excluded.upnp_router, upnp_external_port = excluded.upnp_external_port,
-            upnp_internal_ip = excluded.upnp_internal_ip, upnp_added = excluded.upnp_added,
-            error = excluded.error, updated = excluded.updated",
+        crate::sql::query("site_network/write"),
         rusqlite::params![
             state.port as i64,
             state.enabled as i64,

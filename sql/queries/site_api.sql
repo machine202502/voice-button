@@ -1,0 +1,1 @@
+-- `site/api.rs` owns no SQL: it asks `site/db.rs` for everything it needs.

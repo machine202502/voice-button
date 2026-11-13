@@ -36,8 +36,7 @@ fn fifty_thousand_rows_are_read_by_window() {
         for index in 0..50_000u64 {
             transaction
                 .execute(
-                    "INSERT INTO history(at, text, model, source, state)
-                     VALUES (?1, ?2, 'model', 'user', 'complete')",
+                    voice_button::sql::query("store/test_scale_history_insert"),
                     rusqlite::params![
                         format!(
                             "2026-11-12 {:02}:{:02}:{:02}",
@@ -51,15 +50,13 @@ fn fifty_thousand_rows_are_read_by_window() {
                 .unwrap();
             transaction
                 .execute(
-                    "INSERT INTO telegram_chat(at, sender, kind, text)
-                     VALUES ('2026-11-12T10:00:00+05:00', 'Owner', 'voice', ?1)",
+                    voice_button::sql::query("store/test_scale_chat_insert"),
                     rusqlite::params![format!("telegram row {index}")],
                 )
                 .unwrap();
             transaction
                 .execute(
-                    "INSERT INTO site_messages(id, monolog_id, recorded, stage, text)
-                     VALUES (?1, ?2, ?3, 'done', ?4)",
+                    voice_button::sql::query("store/test_scale_message_insert"),
                     rusqlite::params![
                         index as i64 + 1,
                         monolog.id as i64,

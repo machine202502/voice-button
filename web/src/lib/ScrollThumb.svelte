@@ -10,6 +10,11 @@
 
   const MIN_THUMB = 36;
   const FADE_AFTER_MS = 900;
+  // The track is the whole viewport; the thumb keeps this much room at each
+  // end, so its bottom can never reach the composer, the recording plate or
+  // the install footer below the viewport.
+  const TOP_INSET = 4;
+  const BOTTOM_INSET = 6;
 
   let thumbTop = $state(0);
   let thumbHeight = $state(0);
@@ -20,11 +25,12 @@
   function measure(): void {
     if (!target) return;
     const { scrollTop, scrollHeight, clientHeight } = target;
+    const room = Math.max(0, clientHeight - TOP_INSET - BOTTOM_INSET);
     const ratio = scrollHeight > 0 ? clientHeight / scrollHeight : 1;
-    thumbHeight = Math.max(MIN_THUMB, Math.round(clientHeight * ratio));
-    const travel = Math.max(0, clientHeight - thumbHeight);
+    thumbHeight = Math.min(room, Math.max(MIN_THUMB, Math.round(room * ratio)));
+    const travel = Math.max(0, room - thumbHeight);
     const progress = scrollHeight > clientHeight ? scrollTop / (scrollHeight - clientHeight) : 0;
-    thumbTop = Math.round(travel * Math.min(1, Math.max(0, progress)));
+    thumbTop = TOP_INSET + Math.round(travel * Math.min(1, Math.max(0, progress)));
     visible = scrollHeight > clientHeight + 2;
   }
 
@@ -77,7 +83,10 @@
     visible = true;
     const startY = event.clientY;
     const startTop = target.scrollTop;
-    const travel = target.clientHeight - thumbHeight;
+    const travel = Math.max(
+      0,
+      target.clientHeight - TOP_INSET - BOTTOM_INSET - thumbHeight,
+    );
     const scrollable = target.scrollHeight - target.clientHeight;
     const handle = event.currentTarget as HTMLElement;
     handle.setPointerCapture(event.pointerId);

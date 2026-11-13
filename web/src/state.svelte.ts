@@ -278,8 +278,16 @@ class Page {
   private own: Own | null = null;
   private audio: ActiveAudio | null = null;
   private loop: number | null = null;
+  /** The open monolog's own refresh, so a queued take stops saying "not sent". */
+  private feedLoop: number | null = null;
   private started = false;
   private noteId = 0;
+  /** Bumped by every open, so a slow cache read cannot open an older monolog. */
+  private openSerial = 0;
+  /** Takes the computer accepted; a snapshot read before that must not undo it. */
+  private acceptedLocals = new Set<string>();
+  private lastToastText = '';
+  private lastToastAt = 0;
   private offlineNotedAt = 0;
   private installPrompt: InstallPrompt | null = null;
   private traces: string[] = [];
@@ -368,6 +376,7 @@ class Page {
         render: (page, pending) => this.render(page, pending),
         renderList: (page, view) => this.renderList(page, view),
         mapped: (localId, serverId) => this.mapped(localId, serverId),
+        accepted: (take) => this.acceptedTake(take),
         log: (message) => this.log(message),
         pageSize: FEED_PAGE,
         listPageSize: LIST_PAGE,
@@ -401,6 +410,7 @@ class Page {
     await this.refreshArchiveCount();
     window.app = this.handle();
     this.startLoop();
+    this.startFeedLoop();
     void this.kick();
     void this.refreshMe();
   }
@@ -577,34 +587,49 @@ class Page {
   async openMonolog(input: { id: number; name: string; local?: boolean }): Promise<void> {
     const id = Number(input.id);
     if (!Number.isFinite(id)) return;
+    // Cache first: the phone has the rows, so the screen is switched only once
+    // they are in hand. The feed gets its first paint with its messages
+    // already in it — there is no empty frame and no wait for the computer.
+    const opening = ++this.openSerial;
+    const pending = this.waitingTakes(await this.outbox.list(), id);
+    const page = await this.cache.messagePage(id, { limit: FEED_PAGE });
+    const total = Math.max(page.messages.length, await this.cache.messageCount(id));
+    if (opening !== this.openSerial) return;
     this.selection = false;
     this.selected = [];
     this.monolog = { id, name: input.name, local: input.local === true };
     this.screen = 'feed';
     this.sync.show(id);
     this.sync.archive(this.archived);
-    const feed: FeedData = {
-      loaded: [],
-      pending: [],
-      total: 0,
-      hasOlder: false,
+    this.feed = {
+      loaded: this.withPendingEdits(page.messages),
+      pending,
+      total,
+      hasOlder: page.messages.length < total || page.hasMore === true,
       loadingOlder: false,
-      scrollTick: 0,
+      scrollTick: 1,
       atBottom: true,
     };
-    this.feed = feed;
     this.pushView({ view: 'monolog', id });
-    // Cached rows and the waiting takes are on screen before the computer is
-    // asked, so opening a monolog offline is never a blank wait.
-    feed.pending = (await this.outbox.list()).filter(
-      (take) => Number(take.monolog) === id && !take.remote,
-    );
-    const page = await this.cache.messagePage(id, { limit: FEED_PAGE });
-    feed.loaded = this.withPendingEdits(page.messages);
-    feed.total = Math.max(feed.loaded.length, await this.cache.messageCount(id));
-    feed.hasOlder = feed.loaded.length < feed.total || page.hasMore === true;
-    feed.scrollTick += 1;
     void this.kick();
+  }
+
+  /**
+   * The recording plate was tapped: go where the take belongs. A take can only
+   * belong to a monolog that is not archived, so opening it from the archive
+   * leaves the read-only archive for that monolog.
+   */
+  openRecording(): void {
+    const recording = this.recording;
+    if (!recording) return;
+    if (this.screen === 'feed' && this.monolog?.id === recording.monologId) return;
+    // A take can only belong to a monolog that is not archived, so opening it
+    // from the archive leaves the archive for the writable monolog.
+    if (this.archived) {
+      this.archived = false;
+      this.sync.archive(false);
+    }
+    void this.openMonolog({ id: recording.monologId, name: recording.name });
   }
 
   leaveMonolog(): void {
@@ -1202,9 +1227,7 @@ class Page {
     const limit = Math.max(FEED_PAGE, Math.min(FEED_MAX, feed.loaded.length));
     const page = await this.cache.messagePage(monolog.id, { limit });
     feed.loaded = this.withPendingEdits(page.messages);
-    feed.pending = (await this.outbox.list()).filter(
-      (take) => Number(take.monolog) === monolog.id && !take.remote,
-    );
+    feed.pending = this.waitingTakes(await this.outbox.list(), monolog.id);
     feed.total = Math.max(feed.loaded.length, await this.cache.messageCount(monolog.id));
     feed.hasOlder = feed.loaded.length < feed.total || page.hasMore === true;
   }
@@ -1219,10 +1242,48 @@ class Page {
   }
 
   /**
+   * The waiting takes the cards should count: the one being recorded is the
+   * plate's business, not a second card that appears under the reader.
+   */
+  private async visiblePending(): Promise<Take[]> {
+    const active = this.recording?.take.localId ?? '';
+    return (await this.outbox.list()).filter((take) => take.localId !== active);
+  }
+
+  /**
+   * The takes of one monolog that are still only on the phone. A take the
+   * computer has accepted is not among them, even when a snapshot of the outbox
+   * was read just before that answer arrived.
+   */
+  private waitingTakes(takes: readonly Take[], monologId: number): Take[] {
+    // The take being recorded right now is shown by the composer and the plate,
+    // not as a second "not sent" card that would appear under the reader.
+    const active = this.recording?.take.localId ?? '';
+    return takes.filter(
+      (take) =>
+        Number(take.monolog) === monologId &&
+        take.localId !== active &&
+        !take.remote &&
+        !this.acceptedLocals.has(take.localId),
+    );
+  }
+
+  /**
    * Draw the newest page the sync loop fetched. A redraw keeps the reader's
    * place; only a reader already at the bottom follows new messages.
    */
   private async render(page: MessagePage, pending: Take[]): Promise<void> {
+    await this.mergePage(page, pending);
+  }
+
+  /**
+   * Merge one server page into the rows already on screen: the stage, the text
+   * and the `edited` flag follow the computer, rows the page did not mention
+   * stay, and the waiting takes are re-read from what was passed in. This is
+   * shared by the sync loop and the open monolog's own refresh, so both answer
+   * with the same rows.
+   */
+  private async mergePage(page: MessagePage, pending: Take[]): Promise<void> {
     const feed = this.feed;
     const monolog = this.monolog;
     if (!feed || !monolog) return;
@@ -1260,9 +1321,7 @@ class Page {
     if (page.total !== null) feed.total = Math.max(page.total, feed.loaded.length);
     feed.total = Math.max(feed.total, feed.loaded.length);
     feed.hasOlder = page.hasMore === true || feed.loaded.length < feed.total;
-    feed.pending = pending.filter(
-      (take) => Number(take.monolog) === monolog.id && !take.remote,
-    );
+    feed.pending = this.waitingTakes(pending, monolog.id);
     this.trimFeed(wasAtBottom);
     feed.atBottom = wasAtBottom;
     if (wasAtBottom) feed.scrollTick += 1;
@@ -1363,7 +1422,7 @@ class Page {
       serverTotal === null ? 0 : serverTotal + localCount,
       list.records.length,
     );
-    list.pending = await this.outbox.list();
+    list.pending = await this.visiblePending();
     if (this.archived) this.archiveCount = list.total;
   }
 
@@ -1424,7 +1483,7 @@ class Page {
       if (added === 0 && page.total <= list.records.length) {
         list.total = list.records.length;
       }
-      list.pending = await this.outbox.list();
+      list.pending = await this.visiblePending();
     } finally {
       list.loading = false;
     }
@@ -1675,6 +1734,46 @@ class Page {
     }, intervalMs);
   }
 
+  /**
+   * The open monolog's own refresh. The sync loop fetches the same page, but a
+   * long upload can keep it busy; this timer is what makes a message stop
+   * saying "not sent" a few seconds after the computer has it.
+   */
+  private async refreshOpenMonolog(): Promise<void> {
+    const feed = this.feed;
+    const monolog = this.monolog;
+    if (!this.own || !feed || !monolog || this.screen !== 'feed') return;
+    if (document.hidden || !this.reachable) return;
+    try {
+      const page = await this.sync.latest(monolog.id);
+      if (this.feed !== feed || this.monolog?.id !== monolog.id) return;
+      await this.mergePage(page, await this.outbox.list());
+    } catch (error) {
+      this.log('feed refresh failed: ' + this.reason(error));
+    }
+  }
+
+  /** Ask for the open monolog's newest page every few seconds. */
+  private startFeedLoop(intervalMs = 4000): void {
+    if (this.feedLoop !== null) return;
+    this.feedLoop = window.setInterval(() => {
+      void this.refreshOpenMonolog();
+    }, intervalMs);
+  }
+
+  /**
+   * The computer accepted a take: its local card is no longer "waiting for a
+   * connection". It leaves at once; the server row arrives with the page.
+   */
+  private acceptedTake(take: Take): void {
+    this.acceptedLocals.add(take.localId);
+    const feed = this.feed;
+    const monolog = this.monolog;
+    if (!feed || !monolog) return;
+    if (Number(take.monolog) !== monolog.id) return;
+    feed.pending = feed.pending.filter((entry) => entry.localId !== take.localId);
+  }
+
   private reportRefusals(refused: readonly MutationFailure[]): void {
     for (const failure of refused) {
       this.toast(failure.reason);
@@ -1735,12 +1834,21 @@ class Page {
     this.updateReady = true;
   }
 
+  /**
+   * One transient note. An identical note that just left is not repeated, and
+   * at most two are on screen: the oldest leaves rather than stacking.
+   */
   toast(text: string): void {
+    const now = Date.now();
+    if (this.notes.some((note) => note.text === text)) return;
+    if (text === this.lastToastText && now - this.lastToastAt < 4000) return;
+    this.lastToastText = text;
+    this.lastToastAt = now;
     const id = ++this.noteId;
-    this.notes = [...this.notes, { id, text }];
+    this.notes = [...this.notes, { id, text }].slice(-2);
     window.setTimeout(() => {
       this.notes = this.notes.filter((note) => note.id !== id);
-    }, 2200);
+    }, 3200);
   }
 
   /** The same failure repeats every tick; one note says it better than ten. */

@@ -6,6 +6,10 @@
 //!
 //! Every list is read with `LIMIT/OFFSET`, so a window can ask for one page
 //! even when a table holds tens of thousands of rows.
+//!
+//! The DDL and every statement live in `sql/`; this module only opens the
+//! connection, applies migrations and exposes it to the modules that own the
+//! data.
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension};
@@ -15,6 +19,52 @@ use std::sync::{Mutex, MutexGuard};
 pub struct Store {
     path: PathBuf,
     conn: Mutex<Connection>,
+}
+
+/// `PRAGMA user_version` as the migration cursor.
+fn user_version(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row(crate::sql::query("store/user_version"), [], |row| row.get(0))?)
+}
+
+/// Whether `table` already has a `column`, read from `PRAGMA table_info`.
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let sql = crate::sql::render("store/table_columns", &[("table", table)]);
+    let mut statement = conn.prepare(&sql)?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+    for name in rows {
+        if name? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Apply every migration whose 1-based index is above the stored version, each
+/// in its own transaction, and advance `user_version` with it.
+///
+/// The first migration repairs a missing column. SQLite has no
+/// `ADD COLUMN IF NOT EXISTS`, so the file holds both statements and Rust
+/// decides whether they are needed: an already-repaired database just records
+/// the version.
+fn migrate(conn: &Connection) -> Result<()> {
+    let current = user_version(conn)?;
+    for (index, (name, sql)) in crate::sql::migrations().iter().enumerate() {
+        let version = index as i64 + 1;
+        if version <= current {
+            continue;
+        }
+        let needed = match *name {
+            "001_telegram_added_at" => !column_exists(conn, "telegram_chat", "added_at")?,
+            _ => true,
+        };
+        let transaction = conn.unchecked_transaction()?;
+        if needed {
+            transaction.execute_batch(sql)?;
+        }
+        transaction.pragma_update(None, "user_version", version)?;
+        transaction.commit()?;
+    }
+    Ok(())
 }
 
 impl Store {
@@ -41,15 +91,16 @@ impl Store {
         )?;
         // Opening a database that already has the schema must not run the DDL
         // again: the window opens several short-lived connections per second.
+        // `history` is the marker of an initialized file.
         let ready: Option<i64> = conn
-            .query_row(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'history'",
-                [],
-                |row| row.get(0),
-            )
+            .query_row(crate::sql::query("store/schema_ready"), [], |row| row.get(0))
             .optional()?;
         if ready.is_none() {
-            conn.execute_batch(SCHEMA)?;
+            conn.execute_batch(crate::sql::schema())?;
+            // A new file already has the latest shape; migrations start above it.
+            conn.pragma_update(None, "user_version", crate::sql::migrations().len() as i64)?;
+        } else {
+            migrate(&conn)?;
         }
         Ok(Self {
             path,
@@ -69,7 +120,7 @@ impl Store {
 
     pub fn kv_get(&self, key: &str) -> Result<Option<String>> {
         let conn = self.conn();
-        conn.query_row("SELECT value FROM kv WHERE key = ?1", [key], |row| row.get(0))
+        conn.query_row(crate::sql::query("store/kv_get"), [key], |row| row.get(0))
             .optional()
             .context("cannot read the key/value table")
     }
@@ -77,8 +128,7 @@ impl Store {
     pub fn kv_put(&self, key: &str, value: &str) -> Result<()> {
         let conn = self.conn();
         conn.execute(
-            "INSERT INTO kv(key, value) VALUES (?1, ?2)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            crate::sql::query("store/kv_put"),
             rusqlite::params![key, value],
         )?;
         Ok(())
@@ -86,7 +136,7 @@ impl Store {
 
     pub fn kv_delete(&self, key: &str) -> Result<()> {
         let conn = self.conn();
-        conn.execute("DELETE FROM kv WHERE key = ?1", [key])?;
+        conn.execute(crate::sql::query("store/kv_delete"), [key])?;
         Ok(())
     }
 
@@ -95,11 +145,7 @@ impl Store {
     /// the main file's mtime).
     pub fn bump(&self, key: &str) {
         let conn = self.conn();
-        let _ = conn.execute(
-            "INSERT INTO kv(key, value) VALUES (?1, '1')
-             ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1",
-            [key],
-        );
+        let _ = conn.execute(crate::sql::query("store/kv_bump"), [key]);
     }
 
     pub fn revision(&self, key: &str) -> u64 {
@@ -116,169 +162,82 @@ impl Store {
         let conn = self.conn();
         let transaction = conn.unchecked_transaction().ok()?;
         let value: Option<String> = transaction
-            .query_row("SELECT value FROM kv WHERE key = ?1", [key], |row| row.get(0))
+            .query_row(crate::sql::query("store/kv_get"), [key], |row| row.get(0))
             .optional()
             .ok()
             .flatten();
         if value.is_some() {
-            let _ = transaction.execute("DELETE FROM kv WHERE key = ?1", [key]);
+            let _ = transaction.execute(crate::sql::query("store/kv_delete"), [key]);
         }
         transaction.commit().ok()?;
         value
     }
 }
 
-/// The whole schema. There is no migration and no backward compatibility: the
-/// app is installed fresh and owns these tables.
-const SCHEMA: &str = "
-CREATE TABLE IF NOT EXISTS kv (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-);
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-CREATE TABLE IF NOT EXISTS history (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    at TEXT NOT NULL,
-    text TEXT NOT NULL,
-    model TEXT NOT NULL DEFAULT '',
-    source TEXT NOT NULL DEFAULT 'user',
-    state TEXT NOT NULL DEFAULT 'complete',
-    audio TEXT,
-    group_name TEXT,
-    message_id INTEGER
-);
+    #[test]
+    fn an_old_database_gets_the_columns_it_is_missing() {
+        // A database exactly as an earlier release left it: the table exists, but
+        // it has no `added_at`, and every query that names it fails.
+        let root = std::env::temp_dir().join(format!(
+            "vb-store-repair-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        {
+            let conn = Connection::open(root.join("voice-button.sqlite3")).unwrap();
+            conn.execute_batch(crate::sql::query("store/test_legacy_fixture"))
+                .unwrap();
+        }
 
-CREATE TABLE IF NOT EXISTS history_parts (
-    history_id INTEGER NOT NULL,
-    position INTEGER NOT NULL,
-    at TEXT NOT NULL,
-    text TEXT NOT NULL,
-    PRIMARY KEY (history_id, position)
-);
+        let store = Store::open(&root).unwrap();
+        let conn = store.conn();
+        let backfilled: String = conn
+            .query_row(
+                crate::sql::query("store/test_legacy_added_at"),
+                [],
+                |row| row.get(0),
+            )
+            .expect("the column exists after the repair");
+        assert_eq!(backfilled, "2026-11-01T10:00:00Z", "backfilled from the date it had");
 
-CREATE TABLE IF NOT EXISTS telegram_current (
-    id INTEGER PRIMARY KEY CHECK (id = 1),
-    update_id INTEGER NOT NULL,
-    chat_id INTEGER NOT NULL,
-    message_id INTEGER NOT NULL,
-    file_id TEXT NOT NULL DEFAULT '',
-    file_name TEXT NOT NULL DEFAULT '',
-    kind TEXT NOT NULL DEFAULT '',
-    size INTEGER NOT NULL DEFAULT 0,
-    seconds REAL NOT NULL DEFAULT 0,
-    done_seconds REAL NOT NULL DEFAULT 0,
-    stage TEXT NOT NULL DEFAULT '',
-    progress REAL NOT NULL DEFAULT 0,
-    text TEXT NOT NULL DEFAULT '',
-    error TEXT,
-    sender TEXT NOT NULL DEFAULT '',
-    original_at TEXT NOT NULL DEFAULT '',
-    received_at TEXT NOT NULL DEFAULT '',
-    started_at TEXT NOT NULL DEFAULT ''
-);
+        // A new message can be stored, which is what the log needs.
+        conn.execute(crate::sql::query("store/test_legacy_insert"), [])
+            .expect("insert with the column named");
+        let count: i64 = conn
+            .query_row(crate::sql::query("store/test_legacy_count"), [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
-CREATE TABLE IF NOT EXISTS telegram_queue (
-    position INTEGER PRIMARY KEY,
-    update_id INTEGER NOT NULL,
-    chat_id INTEGER NOT NULL,
-    message_id INTEGER NOT NULL,
-    file_id TEXT NOT NULL DEFAULT '',
-    file_name TEXT NOT NULL DEFAULT '',
-    kind TEXT NOT NULL DEFAULT '',
-    size INTEGER NOT NULL DEFAULT 0,
-    seconds REAL NOT NULL DEFAULT 0,
-    done_seconds REAL NOT NULL DEFAULT 0,
-    stage TEXT NOT NULL DEFAULT '',
-    progress REAL NOT NULL DEFAULT 0,
-    text TEXT NOT NULL DEFAULT '',
-    error TEXT,
-    sender TEXT NOT NULL DEFAULT '',
-    original_at TEXT NOT NULL DEFAULT '',
-    received_at TEXT NOT NULL DEFAULT '',
-    started_at TEXT NOT NULL DEFAULT ''
-);
+    #[test]
+    fn a_new_database_starts_at_the_latest_migration() {
+        let root = std::env::temp_dir().join(format!(
+            "vb-store-fresh-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
 
-CREATE TABLE IF NOT EXISTS telegram_chat (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    update_id INTEGER NOT NULL DEFAULT 0,
-    chat_id INTEGER NOT NULL DEFAULT 0,
-    message_id INTEGER NOT NULL DEFAULT 0,
-    at TEXT NOT NULL DEFAULT '',
-    sender TEXT NOT NULL DEFAULT '',
-    kind TEXT NOT NULL DEFAULT '',
-    file_name TEXT NOT NULL DEFAULT '',
-    seconds REAL NOT NULL DEFAULT 0,
-    text TEXT NOT NULL DEFAULT '',
-    error TEXT,
-    -- When the bot handled the message, in UTC. The `at` above is the date of the
-    -- original file, which can be years old; the log and its date filter follow
-    -- the processing order, so they need this one.
-    added_at TEXT NOT NULL DEFAULT ''
-);
-
-CREATE INDEX IF NOT EXISTS telegram_chat_at ON telegram_chat(at, id);
-CREATE INDEX IF NOT EXISTS telegram_chat_added ON telegram_chat(added_at, id);
-
-CREATE TABLE IF NOT EXISTS site_client (
-    id INTEGER PRIMARY KEY CHECK (id = 1),
-    token TEXT NOT NULL DEFAULT '',
-    paired INTEGER NOT NULL DEFAULT 0,
-    created TEXT NOT NULL DEFAULT '',
-    expires TEXT NOT NULL DEFAULT '',
-    last_seen TEXT NOT NULL DEFAULT '',
-    last_ip TEXT NOT NULL DEFAULT ''
-);
-
-CREATE TABLE IF NOT EXISTS monologs (
-    id INTEGER PRIMARY KEY,
-    name TEXT NOT NULL DEFAULT '',
-    archived INTEGER NOT NULL DEFAULT 0,
-    created TEXT NOT NULL DEFAULT ''
-);
-
-CREATE TABLE IF NOT EXISTS site_messages (
-    id INTEGER PRIMARY KEY,
-    monolog_id INTEGER NOT NULL,
-    recorded TEXT NOT NULL DEFAULT '',
-    received TEXT NOT NULL DEFAULT '',
-    stage TEXT NOT NULL DEFAULT 'draft',
-    text TEXT NOT NULL DEFAULT '',
-    original TEXT NOT NULL DEFAULT '',
-    edited TEXT,
-    deleted INTEGER NOT NULL DEFAULT 0,
-    duration REAL NOT NULL DEFAULT 0,
-    segments_done INTEGER NOT NULL DEFAULT 0,
-    history_at TEXT,
-    closed INTEGER NOT NULL DEFAULT 0
-);
-
-CREATE INDEX IF NOT EXISTS site_messages_monolog
-    ON site_messages(monolog_id, recorded, id);
-
-CREATE TABLE IF NOT EXISTS recordings (
-    name TEXT PRIMARY KEY,
-    id INTEGER NOT NULL DEFAULT 0,
-    started TEXT NOT NULL DEFAULT '',
-    interactor TEXT NOT NULL DEFAULT 'user',
-    model TEXT NOT NULL DEFAULT '',
-    seconds REAL NOT NULL DEFAULT 0,
-    done INTEGER NOT NULL DEFAULT 0,
-    failed_segments INTEGER NOT NULL DEFAULT 0,
-    failed INTEGER NOT NULL DEFAULT 0,
-    kept INTEGER NOT NULL DEFAULT 0
-);
-
-CREATE TABLE IF NOT EXISTS site_network (
-    id INTEGER PRIMARY KEY CHECK (id = 1),
-    port INTEGER NOT NULL DEFAULT 0,
-    enabled INTEGER NOT NULL DEFAULT 0,
-    firewall_rule TEXT NOT NULL DEFAULT '',
-    firewall_created TEXT NOT NULL DEFAULT '',
-    upnp_router TEXT NOT NULL DEFAULT '',
-    upnp_external_port INTEGER NOT NULL DEFAULT 0,
-    upnp_internal_ip TEXT NOT NULL DEFAULT '',
-    upnp_added INTEGER NOT NULL DEFAULT 0,
-    error TEXT,
-    updated TEXT NOT NULL DEFAULT ''
-);
-";
+        let store = Store::open(&root).unwrap();
+        let version: i64 = store
+            .conn()
+            .query_row(crate::sql::query("store/user_version"), [], |row| row.get(0))
+            .unwrap();
+        // The schema already has the latest shape, so no migration may run on
+        // it: the cursor starts above every migration.
+        assert_eq!(version, crate::sql::migrations().len() as i64);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}

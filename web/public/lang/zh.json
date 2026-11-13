@@ -48,6 +48,7 @@
   "recording": "正在录音",
   "start_record": "点击开始",
   "stop_hint": "点击停止",
+  "stop": "停止",
   "dictate_hint": "向独白口述",
   "mic_denied": "没有麦克风访问权限",
   "install": "添加到主屏幕",

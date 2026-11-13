@@ -240,7 +240,7 @@ impl History {
         let store = Arc::new(Store::open(root)?);
         let len: i64 = store
             .conn()
-            .query_row("SELECT COUNT(*) FROM history", [], |row| row.get(0))?;
+            .query_row(crate::sql::query("history/count"), [], |row| row.get(0))?;
         Ok(Self {
             store: Some(store),
             inline: Vec::new(),
@@ -279,7 +279,7 @@ impl History {
             let id: i64 = store
                 .conn()
                 .query_row(
-                    "SELECT id FROM history ORDER BY at DESC, id DESC LIMIT 1 OFFSET ?1",
+                    crate::sql::query("history/id_by_index"),
                     [index as i64],
                     |row| row.get(0),
                 )
@@ -303,7 +303,7 @@ impl History {
             let conn = store.conn();
             return conn
                 .query_row(
-                    &format!("{ROW_SELECT} ORDER BY h.at DESC, h.id DESC LIMIT 1 OFFSET ?1"),
+                    crate::sql::query("history/row_by_index"),
                     [index as i64],
                     HistoryRow::from_row,
                 )
@@ -327,7 +327,7 @@ impl History {
         if let Some(store) = &self.store {
             let conn = store.conn();
             let (filter, params) = source_filter(sources, needle);
-            let sql = format!("{ROW_SELECT}{filter} ORDER BY h.at DESC, h.id DESC LIMIT ? OFFSET ?");
+            let sql = crate::sql::render("history/page_rows", &[("filter", &filter)]);
             let mut statement = match conn.prepare(&sql) {
                 Ok(statement) => statement,
                 Err(_) => return Vec::new(),
@@ -368,7 +368,7 @@ impl History {
         let store = self.store.as_ref().unwrap();
         let conn = store.conn();
         let (filter, params) = source_filter(sources, needle);
-        let sql = format!("SELECT COUNT(*) FROM history h{filter}");
+        let sql = crate::sql::render("history/count_filtered", &[("filter", &filter)]);
         let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|value| value as &dyn rusqlite::ToSql).collect();
         conn.query_row(&sql, refs.as_slice(), |row| row.get::<_, i64>(0))
             .map(|count| count as usize)
@@ -384,13 +384,12 @@ impl History {
         let store = self.store.as_ref().context("history has no backing database")?;
         let mut conn = store.conn();
         let id: i64 = conn
-            .query_row("SELECT id FROM history ORDER BY id DESC LIMIT 1", [], |row| row.get(0))
+            .query_row(crate::sql::query("history/id_newest"), [], |row| row.get(0))
             .optional()?
             .context("history is empty")?;
         let transaction = conn.transaction()?;
         transaction.execute(
-            "UPDATE history SET at = ?1, text = ?2, model = ?3, source = ?4, state = ?5,
-                audio = ?6, group_name = ?7, message_id = ?8 WHERE id = ?9",
+            crate::sql::query("history/update"),
             params![
                 entry.at,
                 entry.text,
@@ -403,20 +402,15 @@ impl History {
                 id
             ],
         )?;
-        transaction.execute("DELETE FROM history_parts WHERE history_id = ?1", [id])?;
+        transaction.execute(crate::sql::query("history/parts_delete"), [id])?;
         for (position, part) in entry.parts.iter().enumerate() {
             transaction.execute(
-                "INSERT INTO history_parts(history_id, position, at, text)
-                 VALUES (?1, ?2, ?3, ?4)",
+                crate::sql::query("history/parts_insert"),
                 params![id, position as i64, part.at, part.text],
             )?;
         }
         transaction.commit()?;
-        let _ = conn.execute(
-            "INSERT INTO kv(key, value) VALUES ('rev.history', '1')
-             ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1",
-            [],
-        );
+        let _ = conn.execute(crate::sql::query("history/bump"), []);
         Ok(HistoryRow::new(entry, id))
     }
 
@@ -425,10 +419,6 @@ impl History {
         self.len = 0;
     }
 }
-
-const ROW_SELECT: &str = "SELECT h.id, h.at, substr(h.text, 1, 240), h.model,
-    (SELECT COUNT(*) FROM history_parts p WHERE p.history_id = h.id),
-    h.source, h.state, h.audio, h.group_name FROM history h";
 
 fn source_filter(sources: &[Source], needle: &str) -> (String, Vec<String>) {
     let mut clauses: Vec<String> = Vec::new();
@@ -460,8 +450,7 @@ fn source_filter(sources: &[Source], needle: &str) -> (String, Vec<String>) {
 fn read_entry(conn: &Connection, id: i64) -> Result<Option<HistoryEntry>> {
     let mut entry = conn
         .query_row(
-            "SELECT id, at, text, model, source, state, audio, group_name, message_id
-             FROM history WHERE id = ?1",
+            crate::sql::query("history/entry"),
             [id],
             |row| {
                 Ok(HistoryEntry {
@@ -481,9 +470,7 @@ fn read_entry(conn: &Connection, id: i64) -> Result<Option<HistoryEntry>> {
     let Some(entry) = entry.as_mut() else {
         return Ok(None);
     };
-    let mut statement = conn.prepare(
-        "SELECT at, text FROM history_parts WHERE history_id = ?1 ORDER BY position",
-    )?;
+    let mut statement = conn.prepare(crate::sql::query("history/parts_by_id"))?;
     entry.parts = statement
         .query_map([id], |row| {
             Ok(HistoryChunk {
@@ -510,8 +497,7 @@ pub fn append(root: &Path, entry: &HistoryEntry) -> Result<HistoryRow> {
     let mut conn = store.conn();
     let transaction = conn.transaction()?;
     transaction.execute(
-        "INSERT INTO history(at, text, model, source, state, audio, group_name, message_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        crate::sql::query("history/insert"),
         params![
             entry.at,
             entry.text,
@@ -526,30 +512,21 @@ pub fn append(root: &Path, entry: &HistoryEntry) -> Result<HistoryRow> {
     let id = transaction.last_insert_rowid();
     for (position, part) in entry.parts.iter().enumerate() {
         transaction.execute(
-            "INSERT INTO history_parts(history_id, position, at, text)
-             VALUES (?1, ?2, ?3, ?4)",
+            crate::sql::query("history/parts_insert"),
             params![id, position as i64, part.at, part.text],
         )?;
     }
     transaction.commit()?;
-    let _ = conn.execute(
-        "INSERT INTO kv(key, value) VALUES ('rev.history', '1')
-         ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1",
-        [],
-    );
+    let _ = conn.execute(crate::sql::query("history/bump"), []);
     Ok(HistoryRow::new(entry, id))
 }
 
 pub fn clear(root: &Path) {
     if let Ok(store) = Store::open(root) {
         let conn = store.conn();
-        let _ = conn.execute("DELETE FROM history_parts", []);
-        let _ = conn.execute("DELETE FROM history", []);
-        let _ = conn.execute(
-            "INSERT INTO kv(key, value) VALUES ('rev.history', '1')
-             ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1",
-            [],
-        );
+        let _ = conn.execute(crate::sql::query("history/clear_parts"), []);
+        let _ = conn.execute(crate::sql::query("history/clear_history"), []);
+        let _ = conn.execute(crate::sql::query("history/bump"), []);
     }
 }
 

@@ -167,6 +167,17 @@ def swipe_card(browser, dx=110):
     )
 
 
+def view_geometry(browser):
+    """The viewport's own numbers: a plate or a note must not change them."""
+    return json.loads(
+        browser.evaluate(
+            "JSON.stringify((() => { const view = document.getElementById('view');"
+            " return { scrollHeight: view.scrollHeight, clientHeight: view.clientHeight,"
+            " scrollTop: view.scrollTop }; })())"
+        )
+    )
+
+
 # ---------------------------------------------------------------- diagnostics
 
 DIAG_PATH = os.path.join(ROOT, "tests", "e2e-diag.log")
@@ -650,6 +661,13 @@ class Browser:
                 "--ignore-certificate-errors",
                 "--autoplay-policy=no-user-gesture-required",
                 "--use-fake-ui-for-media-stream",
+                # A headless-agent machine often leaves the phone window behind
+                # the terminal. Chrome then pauses rAF in the occluded window,
+                # and the halo canvas would stay on its last (cleared) frame.
+                "--disable-backgrounding-occluded-windows",
+                "--disable-renderer-backgrounding",
+                "--disable-background-timer-throttling",
+                "--disable-features=CalculateNativeWinOcclusion",
                 "--window-size=430,900",
                 "about:blank",
             ],
@@ -1002,44 +1020,73 @@ def main():
         )
         check(sheet == 200, f"the page stylesheet is served ({sheet})")
 
-        print("a note never covers the bottom bars")
-        # The bug from the phone: "no connection" was drawn on top of the
-        # install button. The note now lives in the flow above the footer.
+        print("a note is an overlay that never moves the view")
+        # The old note was a row in the layout; it now floats above the dock.
+        # It must show at most one copy of the same words, fade on its own, and
+        # leave the scrolling viewport exactly as it was.
         wait_for(
             lambda: browser.evaluate("!!document.getElementById('install')"),
             timeout=20,
             what="the install bar",
         )
         browser.evaluate("document.getElementById('install').hidden = false")
+        before_note = view_geometry(browser)
         browser.evaluate("window.dispatchEvent(new Event('offline'))")
         wait_for(
             lambda: browser.evaluate("document.querySelectorAll('#notes .banner').length > 0"),
             timeout=10,
             what="the note about the lost connection",
         )
-        boxes = json.loads(
+        # The same words again, while the first note is still up: not a second
+        # copy, and definitely not a layout row.
+        browser.evaluate("window.dispatchEvent(new Event('offline'))")
+        time.sleep(0.6)
+        notes = json.loads(
             browser.evaluate(
-                "JSON.stringify((() => {"
-                " const r = (n) => { if (!n) return null;"
-                "   const b = n.getBoundingClientRect();"
-                "   return { top: Math.round(b.top), bottom: Math.round(b.bottom) }; };"
-                " return { note: r(document.querySelector('#notes .banner')),"
-                "  about: r(document.querySelector('footer.about')),"
-                "  install: r(document.getElementById('install')),"
-                "  width: document.documentElement.scrollWidth,"
-                "  page: innerWidth }; })())"
+                "JSON.stringify((() => { const notes = document.getElementById('notes');"
+                " const style = getComputedStyle(notes);"
+                " const footer = document.querySelector('footer.about');"
+                " const banner = notes.querySelector('.banner');"
+                " const inside = (node) => { if (!node) return null;"
+                "   const box = node.getBoundingClientRect();"
+                "   return { top: Math.round(box.top), bottom: Math.round(box.bottom),"
+                "     left: Math.round(box.left), right: Math.round(box.right) }; };"
+                " return { count: notes.querySelectorAll('.banner').length,"
+                "   position: style.position, pointer: style.pointerEvents,"
+                "   banner: inside(banner), footer: inside(footer),"
+                "   width: document.documentElement.scrollWidth, page: innerWidth }; })())"
             )
         )
+        after_note = view_geometry(browser)
         check(
-            boxes["note"] is not None
-            and boxes["about"] is not None
-            and boxes["note"]["bottom"] <= boxes["about"]["top"],
-            f"the note sits above the install bar, not on it ({boxes})",
+            notes["count"] == 1,
+            f"a repeated note inside four seconds is shown once ({notes['count']} banners)",
         )
         check(
-            boxes["width"] <= boxes["page"],
-            f"the note does not push the page sideways ({boxes['width']} of {boxes['page']})",
+            before_note == after_note,
+            "the note does not change the view's scrollHeight, clientHeight or scrollTop"
+            f" ({before_note} then {after_note})",
         )
+        check(
+            notes["position"] == "absolute" and notes["pointer"] == "none",
+            f"the note is an overlay, not a row ({notes['position']}, pointer {notes['pointer']})",
+        )
+        check(
+            notes["banner"] is not None
+            and notes["footer"] is not None
+            and notes["banner"]["bottom"] <= notes["footer"]["top"],
+            f"the note floats above the install bar, not on it ({notes})",
+        )
+        check(
+            notes["width"] <= notes["page"],
+            f"the note does not push the page sideways ({notes['width']} of {notes['page']})",
+        )
+        wait_for(
+            lambda: browser.evaluate("document.querySelectorAll('#notes .banner').length === 0"),
+            timeout=6,
+            what="the note to fade on its own",
+        )
+        check(True, "the note disappears on its own")
         browser.evaluate("document.getElementById('install').hidden = true")
         wait_for(lambda: daemon.api("/site/api/me").get("paired"), timeout=10, what="pairing")
 
@@ -1103,8 +1150,11 @@ def main():
             what="the recording state",
         )
         check(True, "the record button shows the recording state")
+        snapshot(browser, daemon, diag, "just after the record click")
+
+        print("the recording plate on the list")
         # Leaving the monolog must not stop the take: the list marks the monolog
-        # it is being recorded into, and tapping that card goes back to it.
+        # and the plate keeps the running take in sight outside its monolog.
         browser.evaluate("document.getElementById('back').click()")
         wait_for(
             lambda: browser.evaluate("document.getElementById('title').textContent === 'Монологи'"),
@@ -1120,7 +1170,61 @@ def main():
             "идёт расшифровка" in marked,
             f"the list marks the monolog that is being recorded ({marked!r})",
         )
-        browser.evaluate("document.querySelector('.monolog-card.active').click()")
+        plate = json.loads(
+            browser.evaluate(
+                "JSON.stringify((() => { const plate = document.getElementById('rec-plate');"
+                " if (!plate) return null;"
+                " return { monolog: plate.dataset.monolog,"
+                "   name: (plate.querySelector('.vb-plate-name') || {}).textContent || '',"
+                "   timer: (plate.querySelector('#rec-plate-timer') || {}).textContent || '',"
+                "   stop: !!document.getElementById('rec-plate-stop'),"
+                "   composerHidden: document.getElementById('composer').hidden,"
+                "   position: getComputedStyle(plate).position }; })())"
+            )
+        )
+        check(
+            plate is not None and plate["monolog"] == "1",
+            f"the plate names the monolog it records into ({plate})",
+        )
+        check(
+            plate is not None and "Проверка" in plate["name"],
+            f"the plate shows that monolog's name ({plate})",
+        )
+        check(
+            plate is not None and plate["stop"],
+            "the plate offers a Stop button",
+        )
+        check(
+            plate is not None and plate["composerHidden"],
+            "the composer is hidden on the list while the plate is up",
+        )
+        check(
+            plate is not None and plate["position"] == "absolute",
+            f"the plate is an overlay, not a list row ({plate})",
+        )
+        first_timer = plate["timer"] if plate else ""
+        check(
+            len(first_timer) == 5
+            and first_timer[2] == ":"
+            and first_timer.replace(":", "").isdigit(),
+            f"the plate has a running timer ({first_timer!r})",
+        )
+        wait_for(
+            lambda: (
+                lambda value: value != first_timer and len(value) == 5
+            )(
+                browser.evaluate(
+                    "(document.getElementById('rec-plate-timer') || {}).textContent || ''"
+                )
+            ),
+            timeout=4,
+            what="the plate timer to run",
+        )
+        check(True, "the plate timer runs")
+        with_plate = view_geometry(browser)
+        # The plate itself is the tap target; its Stop button is the one part
+        # that must not open the monolog.
+        browser.evaluate("document.getElementById('rec-plate').click()")
         wait_for(
             lambda: browser.evaluate(
                 "document.getElementById('title').textContent === 'Проверка'"
@@ -1129,9 +1233,7 @@ def main():
             timeout=10,
             what="the recording monolog again",
         )
-        check(True, "the marked monolog returns to the recording")
-        snapshot(browser, daemon, diag, "just after the record click")
-        time.sleep(3)
+        check(True, "tapping the plate opens the recording monolog")
         snapshot(browser, daemon, diag, "3 s into the recording")
 
         print("text while the recording is still running")
@@ -1176,7 +1278,51 @@ def main():
                 f"the phone shows the text while the recording is still open ({shown[:40]!r})",
             )
         time.sleep(1)
-        browser.evaluate("document.getElementById('record').click()")
+        # The plate is the only control outside the monolog: its Stop ends the
+        # take from the list, and its overlay leaves the viewport alone.
+        browser.evaluate("document.getElementById('back').click()")
+        wait_for(
+            lambda: browser.evaluate("document.getElementById('title').textContent === 'Монологи'"),
+            timeout=10,
+            what="the list to stop the take",
+        )
+        timer_now = browser.evaluate(
+            "(document.getElementById('rec-plate-timer') || {}).textContent || ''"
+        )
+        check(
+            timer_now != first_timer,
+            f"the plate timer kept running after the tap ({first_timer} then {timer_now})",
+        )
+        browser.evaluate("document.getElementById('rec-plate-stop').click()")
+        wait_for(
+            lambda: browser.evaluate("!document.getElementById('rec-plate')"),
+            timeout=10,
+            what="the plate to leave after Stop",
+        )
+        check(True, "the plate's Stop ends the take")
+        after_stop = view_geometry(browser)
+        check(
+            after_stop["clientHeight"] == with_plate["clientHeight"]
+            and after_stop["scrollTop"] == with_plate["scrollTop"],
+            "the plate does not change the view's clientHeight or scrollTop"
+            f" ({with_plate} then {after_stop})",
+        )
+        # Back into the monolog to watch the text that arrives after the stop.
+        browser.evaluate("document.querySelectorAll('.monolog-card')[0].click()")
+        wait_for(
+            lambda: browser.evaluate(
+                "document.getElementById('title').textContent === 'Проверка'"
+                " && !document.getElementById('composer').hidden"
+            ),
+            timeout=10,
+            what="the monolog after the stop",
+        )
+        check(
+            not browser.evaluate(
+                "document.getElementById('record').classList.contains('recording')"
+            ),
+            "the record button leaves the recording state after the plate's Stop",
+        )
         time.sleep(0.2)
         snapshot(browser, daemon, diag, "just after the stop click")
         time.sleep(2)
@@ -1386,10 +1532,45 @@ def main():
             what="the microphone to admit the lost connection",
         )
         check(
-            not browser.evaluate(
+            browser.evaluate(
                 "document.getElementById('record').classList.contains('recording')"
             ),
-            "the microphone is not violet while the computer is unreachable",
+            "the microphone keeps showing a live take while the computer is unreachable",
+        )
+        background = browser.evaluate(
+            "getComputedStyle(document.getElementById('record')).backgroundColor"
+        )
+        check(
+            background == "rgb(199, 243, 107)",
+            f"the record button stays lime while the take runs ({background})",
+        )
+        painted = 0
+        deadline = time.time() + 4
+        while time.time() < deadline and painted == 0:
+            painted = browser.evaluate(
+                "(() => { const canvas = document.querySelector('.vb-record-rings');"
+                " if (!canvas || !canvas.classList.contains('live')) return 0;"
+                " const context = canvas.getContext('2d');"
+                " if (!context) return 0;"
+                " const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;"
+                " let drawn = 0;"
+                " for (let index = 3; index < pixels.length; index += 4) {"
+                "   if (pixels[index] > 0) drawn += 1; }"
+                " return drawn; })()"
+            )
+            if painted:
+                break
+            time.sleep(0.2)
+        check(
+            painted > 0,
+            f"the halo rings keep drawing while the computer is unreachable"
+            f" ({painted} painted pixels)",
+        )
+        check(
+            browser.evaluate(
+                "document.getElementById('rec-title').textContent === 'Запись без связи'"
+            ),
+            "only the wording says the computer is away",
         )
         time.sleep(8)
         browser.evaluate("document.getElementById('record').click()")
@@ -1899,17 +2080,22 @@ def main():
         )
 
         def scroll_geometry():
-            """Header bottom and thumb top, in viewport pixels, plus the widths."""
+            """Header, viewport, thumb and the widths, in viewport pixels."""
             return json.loads(
                 browser.evaluate(
                     "JSON.stringify((() => {"
                     " const header = document.querySelector('.vb-shell header');"
                     " const thumb = document.querySelector('.vb-scroll-thumb');"
                     " const view = document.getElementById('view');"
+                    " const viewport = document.querySelector('.vb-viewport');"
                     " const head = header ? header.getBoundingClientRect() : null;"
                     " const bar = thumb ? thumb.getBoundingClientRect() : null;"
+                    " const box = viewport ? viewport.getBoundingClientRect() : null;"
                     " return { header: head ? head.bottom : null,"
+                    "   viewportTop: box ? box.top : null,"
+                    "   viewportBottom: box ? box.bottom : null,"
                     "   thumb: bar ? bar.top : null,"
+                    "   thumbBottom: bar ? bar.bottom : null,"
                     "   height: view.scrollHeight, room: view.clientHeight,"
                     "   top: view.scrollTop, width: view.scrollWidth,"
                     "   inner: view.clientWidth }; })())"
@@ -1942,6 +2128,18 @@ def main():
             f"the scroll indicator starts below the header ({first})",
         )
         check(
+            first["thumb"] is not None
+            and first["viewportTop"] is not None
+            and first["thumb"] >= first["viewportTop"] + 3.5,
+            f"the scroll indicator starts inside the viewport's top inset ({first})",
+        )
+        check(
+            first["thumbBottom"] is not None
+            and first["viewportBottom"] is not None
+            and first["thumbBottom"] <= first["viewportBottom"] - 5.5,
+            f"the scroll indicator keeps its bottom inset inside the viewport ({first})",
+        )
+        check(
             first["width"] == first["inner"],
             f"the list does not scroll sideways ({first['width']} of {first['inner']})",
         )
@@ -1953,6 +2151,12 @@ def main():
             and middle["header"] is not None
             and middle["thumb"] >= middle["header"] - 0.5,
             f"the scroll indicator stays below the header while scrolling ({middle})",
+        )
+        check(
+            middle["thumbBottom"] is not None
+            and middle["viewportBottom"] is not None
+            and middle["thumbBottom"] <= middle["viewportBottom"] - 5.5,
+            f"the scrolled indicator keeps its bottom inset ({middle})",
         )
         check(
             middle["width"] == middle["inner"],
@@ -2296,10 +2500,29 @@ def main():
             )
             check(True, "the phone says the recording will be kept")
             check(
-                not browser.evaluate(
+                browser.evaluate(
                     "document.getElementById('record').classList.contains('recording')"
                 ),
-                "the phone records with the computer away and does not claim to be transcribing",
+                "the microphone keeps a live take with the computer away",
+            )
+            check(
+                browser.evaluate(
+                    "getComputedStyle(document.getElementById('record')).backgroundColor"
+                )
+                == "rgb(199, 243, 107)",
+                "the record button stays lime with the computer away",
+            )
+            check(
+                browser.evaluate(
+                    "!!document.querySelector('.vb-record-rings.live')"
+                ),
+                "the halo is live with the computer away",
+            )
+            check(
+                browser.evaluate(
+                    "document.getElementById('rec-title').textContent === 'Запись без связи'"
+                ),
+                "the wording says the take is offline",
             )
             time.sleep(4)
             browser.evaluate("document.getElementById('record').click()")
@@ -2309,6 +2532,15 @@ def main():
                 what="the unsent take card",
             )
             check(True, "the offline take is shown as not sent")
+            wait_for(
+                lambda: browser.evaluate(
+                    "(document.querySelector('.message.unsent .chip') || {}).textContent"
+                    " === 'ждёт связи'"
+                ),
+                timeout=5,
+                what="the waiting chip on the offline take",
+            )
+            check(True, "the queued take says it is waiting for a connection")
             waiting_takes = summarise_outbox(outbox_state(browser))
             check(
                 len(waiting_takes) == 1 and (waiting_takes[0].get("bytes") or 0) > 0,
@@ -2316,8 +2548,27 @@ def main():
             )
 
             print("the computer comes back")
+            browser.evaluate("window.__pageKept = 'yes'")
             offline_daemon.start(pair=False)
             check(True, "the computer is back on the same port")
+            prompt_started = time.time()
+            wait_for(
+                lambda: browser.evaluate(
+                    "document.querySelectorAll('.message.unsent').length === 0"
+                ),
+                timeout=15,
+                what="the queued take to stop waiting",
+            )
+            prompt_waited = time.time() - prompt_started
+            check(
+                prompt_waited < 12,
+                "the queued take stops waiting promptly after the computer returns"
+                f" ({prompt_waited:.1f} s)",
+            )
+            check(
+                browser.evaluate("window.__pageKept === 'yes'"),
+                "the queued take stops waiting without reloading the page",
+            )
 
             def synced_offline():
                 state = daemon_db(offline_daemon)
@@ -2376,24 +2627,62 @@ def main():
             )
             check(True, "the unsent card is gone after the sync")
 
+            print("opening a monolog with the computer away")
+            # Back to the list, stop the computer, and open the synced monolog:
+            # its rows come from the cache, so its messages are on the first
+            # paint instead of after a round trip to a computer that is gone.
+            browser.evaluate("document.getElementById('back').click()")
+            wait_for(
+                lambda: browser.evaluate(
+                    "document.getElementById('title').textContent === 'Монологи'"
+                    " && document.querySelectorAll('.monolog-card').length > 0"
+                ),
+                timeout=15,
+                what="the list before the cached open",
+            )
+            offline_daemon.stop()
+            time.sleep(1)
+            check(
+                offline_daemon.page_status("/") == 0,
+                "the computer is really off for the cached monolog",
+            )
+            monolog_card = json.dumps(f'.monolog-card[data-id="{created["id"]}"]')
+            opened_at = time.time()
+            browser.evaluate(f"document.querySelector({monolog_card}).click()")
+            wait_for(
+                lambda: browser.evaluate(
+                    "document.getElementById('title').textContent === 'Офлайн'"
+                    " && !!document.querySelector('.message')"
+                ),
+                timeout=5,
+                what="the cached monolog",
+            )
+            opened_in = time.time() - opened_at
+            check(
+                browser.evaluate(
+                    "Array.from(document.querySelectorAll('.message .text'))"
+                    ".some((node) => !node.classList.contains('empty')"
+                    " && node.textContent.trim().length > 3)"
+                ),
+                "the cached messages are on screen with the computer away",
+            )
+            check(
+                opened_in < 2.5,
+                f"opening a monolog does not wait for the computer ({opened_in:.2f} s)",
+            )
+
             print("editing and deleting with the computer away")
             # The page promises local first: an edit and a delete made while the
             # computer cannot be reached stay on the phone and leave for it once
             # the connection returns. The take that just synced is the row.
             #
-            # The computer is stopped for real, not emulated: the page's service
-            # worker has a network of its own, and a page-level offline emulation
-            # leaves that one on, so the page would still get fresh answers from
-            # a computer it is supposed to have lost.
+            # The computer was stopped for the cached open above; it stays down
+            # for the edit. A page-level offline emulation is not enough here:
+            # the service worker has a network of its own and would still get
+            # fresh answers from a computer the page is supposed to have lost.
             arrived_id = int(arrived["id"])
             card = json.dumps(f'.message[data-id="{arrived_id}"]')
             edited_offline = "Правка без связи"
-            offline_daemon.stop()
-            time.sleep(1)
-            check(
-                offline_daemon.page_status("/") == 0,
-                "the computer is really off for the offline edit",
-            )
             browser.evaluate(f"document.querySelector({card}).click()")
             wait_sheet(browser)
             check(

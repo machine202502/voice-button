@@ -111,6 +111,8 @@ export interface SyncOptions {
   renderList?: (page: ListResult, archived: boolean) => void | Promise<void>;
   /** The open monolog got a server id under the reader. */
   mapped?: (localId: number, serverId: number) => void;
+  /** The computer accepted a take: it has a server id and is no longer unsent. */
+  accepted?: (take: Take) => void;
   log?: (message: string) => void;
   pageSize?: number;
   listPageSize?: number;
@@ -118,6 +120,8 @@ export interface SyncOptions {
 
 export interface Sync {
   tick(): Promise<TickResult>;
+  /** The newest feed page from the computer, also stored in the cache. */
+  latest(id: number): Promise<MessagePage>;
   /** Which monolog the page shows; the tick fetches only this one. */
   show(id: number): void;
   /** Which list the page looks at: open monologs or the archive. */
@@ -251,6 +255,7 @@ export function createSync({
   render,
   renderList,
   mapped,
+  accepted,
   log = () => {},
   pageSize = 50,
   listPageSize = 100,
@@ -330,6 +335,7 @@ export function createSync({
       if (!item.remote) {
         item.remote = await createMessage(item);
         await outbox.put(item);
+        accepted?.(item);
       }
       for (const chunk of await outbox.chunks(item.localId)) {
         let retried = false;
@@ -354,6 +360,7 @@ export function createSync({
               log('chunk ' + chunk.seq + ' refused; opening a new message for the rest: ' + status);
               item.remote = await createMessage(item);
               await outbox.put(item);
+              accepted?.(item);
               continue;
             }
             if (refused) {
@@ -713,6 +720,7 @@ export function createSync({
 
   return {
     tick,
+    latest: fetchLatest,
     /** Which monolog the page shows; the tick fetches only this one. */
     show(id) {
       monologId = Number(id) || 0;

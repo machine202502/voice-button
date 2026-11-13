@@ -48,6 +48,7 @@
   "recording": "Recording",
   "start_record": "Tap to start",
   "stop_hint": "Tap to stop",
+  "stop": "Stop",
   "dictate_hint": "Dictate into the monolog",
   "mic_denied": "No access to the microphone",
   "install": "Add to home screen",

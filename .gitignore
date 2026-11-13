@@ -2,6 +2,7 @@ target/
 dist/
 design/
 plans/
+reports/
 node_modules/
 # Written by tests/phone-e2e.py when a run fails.
 tests/e2e-diag.log

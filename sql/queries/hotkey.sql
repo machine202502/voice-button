@@ -1,0 +1,1 @@
+-- `hotkey.rs` owns no SQL: its INSERT/DELETE strings are keyboard key names.

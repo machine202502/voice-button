@@ -515,10 +515,6 @@ fn open_store(root: &Path) -> Option<crate::store::Store> {
     }
 }
 
-const JOB_COLUMNS: &str = "update_id, chat_id, message_id, file_id, file_name, kind, size,
-    seconds, done_seconds, stage, progress, text, error, sender, original_at,
-    received_at, started_at";
-
 fn read_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
     Ok(Job {
         update_id: row.get(0)?,
@@ -548,9 +544,9 @@ fn write_job(
     position: i64,
     job: &Job,
 ) -> rusqlite::Result<()> {
-    let sql = format!(
-        "INSERT OR REPLACE INTO {table}({key_column}, {JOB_COLUMNS})
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)"
+    let sql = crate::sql::render(
+        "telegram/job_write",
+        &[("table", table), ("key_column", key_column)],
     );
     transaction.execute(
         &sql,
@@ -599,15 +595,13 @@ fn load_state(dirs: &AppDirs) -> TelegramState {
     let conn = store.conn();
     state.current = conn
         .query_row(
-            &format!("SELECT {JOB_COLUMNS} FROM telegram_current WHERE id = 1"),
+            crate::sql::query("telegram/current"),
             [],
             read_job,
         )
         .optional()
         .unwrap_or(None);
-    if let Ok(mut statement) = conn.prepare(&format!(
-        "SELECT {JOB_COLUMNS} FROM telegram_queue ORDER BY position"
-    )) {
+    if let Ok(mut statement) = conn.prepare(crate::sql::query("telegram/queue")) {
         if let Ok(rows) = statement.query_map([], read_job) {
             for job in rows.flatten() {
                 state.queue.push_back(job);
@@ -626,40 +620,35 @@ fn save_state(dirs: &AppDirs, state: &TelegramState) {
         return;
     };
     let _ = transaction.execute(
-        "INSERT INTO kv(key, value) VALUES ('telegram.owner', ?1)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        [state.owner.map(|id| id.to_string()).unwrap_or_default()],
+        crate::sql::query("telegram/kv_put"),
+        rusqlite::params![
+            "telegram.owner",
+            state.owner.map(|id| id.to_string()).unwrap_or_default()
+        ],
     );
     let _ = transaction.execute(
-        "INSERT INTO kv(key, value) VALUES ('telegram.offset', ?1)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        [state.offset.to_string()],
+        crate::sql::query("telegram/kv_put"),
+        rusqlite::params!["telegram.offset", state.offset.to_string()],
     );
     let _ = transaction.execute(
-        "INSERT INTO kv(key, value) VALUES ('telegram.last_error', ?1)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        [state.last_error.as_deref().unwrap_or("")],
+        crate::sql::query("telegram/kv_put"),
+        rusqlite::params!["telegram.last_error", state.last_error.as_deref().unwrap_or("")],
     );
     let _ = transaction.execute(
-        "INSERT INTO kv(key, value) VALUES ('telegram.bot_name', ?1)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        [state.bot_name.as_str()],
+        crate::sql::query("telegram/kv_put"),
+        rusqlite::params!["telegram.bot_name", state.bot_name.as_str()],
     );
-    let _ = transaction.execute("DELETE FROM telegram_current", []);
+    let _ = transaction.execute(crate::sql::query("telegram/current_clear"), []);
     if let Some(job) = &state.current {
         let _ = write_job(&transaction, "telegram_current", "id", 1, job);
     }
     // The queue is small and changes often; replacing those rows is cheaper
     // than tracking each move. The chat grows forever and is append-only.
-    let _ = transaction.execute("DELETE FROM telegram_queue", []);
+    let _ = transaction.execute(crate::sql::query("telegram/queue_clear"), []);
     for (position, job) in state.queue.iter().enumerate() {
         let _ = write_job(&transaction, "telegram_queue", "position", position as i64, job);
     }
-    let _ = transaction.execute(
-        "INSERT INTO kv(key, value) VALUES ('rev.telegram', '1')
-         ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1",
-        [],
-    );
+    let _ = transaction.execute(crate::sql::query("telegram/bump"), []);
     let _ = transaction.commit();
 }
 
@@ -672,9 +661,7 @@ fn append_chat(root: &Path, entry: &ChatEntry) {
         return;
     };
     let _ = transaction.execute(
-        "INSERT INTO telegram_chat(update_id, chat_id, message_id, at, sender, kind,
-            file_name, seconds, text, error, added_at)
-         VALUES (0, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        crate::sql::query("telegram/chat_append"),
         rusqlite::params![
             entry.chat_id,
             entry.message_id,
@@ -688,11 +675,7 @@ fn append_chat(root: &Path, entry: &ChatEntry) {
             chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
         ],
     );
-    if let Err(error) = transaction.execute(
-        "INSERT INTO kv(key, value) VALUES ('rev.telegram', '1')
-         ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1",
-        [],
-    ) {
+    if let Err(error) = transaction.execute(crate::sql::query("telegram/bump"), []) {
         crate::log::log(&format!("telegram: cannot bump the chat revision: {error}"));
     }
     let _ = transaction.commit();
@@ -711,9 +694,6 @@ fn read_chat(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatEntry> {
         error: row.get(9)?,
     })
 }
-
-const CHAT_COLUMNS: &str = "id, chat_id, message_id, at, sender, kind, file_name,
-    seconds, text, error";
 
 pub fn reset_owner(root: &Path) {
     if let Some(store) = open_store(root) {
@@ -761,9 +741,16 @@ impl ChatRange {
             .unwrap_or_default()
     }
 
-    /// The SQL condition shared by every query: empty `since` means everything.
-    fn clause(column: &str) -> String {
-        format!("(?1 = '' OR COALESCE(NULLIF({column}, ''), at) >= ?1)")
+    /// The SQL condition shared by every chat query: an empty bound string
+    /// means everything. `param` is the placeholder's 1-based index in the
+    /// statement that receives the fragment.
+    fn clause(param: usize) -> &'static str {
+        match param {
+            1 => "(?1 = '' OR COALESCE(NULLIF(added_at, ''), at) >= ?1)",
+            2 => "(?2 = '' OR COALESCE(NULLIF(added_at, ''), at) >= ?2)",
+            4 => "(?4 = '' OR COALESCE(NULLIF(added_at, ''), at) >= ?4)",
+            _ => panic!("chat range uses ?1, ?2 or ?4"),
+        }
     }
 }
 
@@ -777,11 +764,8 @@ pub fn chat_page(
         return Vec::new();
     };
     let conn = store.conn();
-    let Ok(mut statement) = conn.prepare(&format!(
-        "SELECT {CHAT_COLUMNS} FROM telegram_chat
-         WHERE {} ORDER BY id LIMIT ?2 OFFSET ?3",
-        ChatRange::clause("added_at")
-    )) else {
+    let sql = crate::sql::render("telegram/chat_page", &[("range", ChatRange::clause(1))]);
+    let Ok(mut statement) = conn.prepare(&sql) else {
         return Vec::new();
     };
     statement
@@ -794,15 +778,13 @@ pub fn chat_page(
 }
 
 pub fn chat_count(dirs: &AppDirs, range: ChatRange) -> usize {
+    let sql = crate::sql::render("telegram/chat_count", &[("range", ChatRange::clause(1))]);
     open_store(&dirs.root)
         .and_then(|store| {
             store
                 .conn()
                 .query_row(
-                    &format!(
-                        "SELECT COUNT(*) FROM telegram_chat WHERE {}",
-                        ChatRange::clause("added_at")
-                    ),
+                    &sql,
                     rusqlite::params![range.since()],
                     |row| row.get::<_, i64>(0),
                 )
@@ -823,15 +805,11 @@ pub fn chat_search_page(
     };
     let pattern = format!("%{}%", needle.trim().replace('%', "\\%").replace('_', "\\_"));
     let conn = store.conn();
-    let Ok(mut statement) = conn.prepare(&format!(
-        "SELECT {CHAT_COLUMNS} FROM telegram_chat
-         WHERE (vb_lower(text) LIKE vb_lower(?1) ESCAPE '\\'
-            OR vb_lower(sender) LIKE vb_lower(?1) ESCAPE '\\'
-            OR vb_lower(file_name) LIKE vb_lower(?1) ESCAPE '\\')
-           AND ({range_clause})
-         ORDER BY id LIMIT ?2 OFFSET ?3",
-        range_clause = ChatRange::clause("added_at").replace("?1", "?4")
-    )) else {
+    let sql = crate::sql::render(
+        "telegram/chat_search_page",
+        &[("range", ChatRange::clause(4))],
+    );
+    let Ok(mut statement) = conn.prepare(&sql) else {
         return Vec::new();
     };
     statement
@@ -844,20 +822,17 @@ pub fn chat_search_page(
 }
 
 pub fn chat_search_count(dirs: &AppDirs, range: ChatRange, needle: &str) -> usize {
+    let sql = crate::sql::render(
+        "telegram/chat_search_count",
+        &[("range", ChatRange::clause(2))],
+    );
     open_store(&dirs.root)
         .and_then(|store| {
             let pattern = format!("%{}%", needle.trim().replace('%', "\\%").replace('_', "\\_"));
             store
                 .conn()
                 .query_row(
-                    &format!(
-                        "SELECT COUNT(*) FROM telegram_chat
-                         WHERE (vb_lower(text) LIKE vb_lower(?1) ESCAPE '\\'
-                            OR vb_lower(sender) LIKE vb_lower(?1) ESCAPE '\\'
-                            OR vb_lower(file_name) LIKE vb_lower(?1) ESCAPE '\\')
-                           AND {}",
-                        ChatRange::clause("added_at").replace("?1", "?2")
-                    ),
+                    &sql,
                     rusqlite::params![pattern, range.since()],
                     |row| row.get::<_, i64>(0),
                 )
@@ -2110,10 +2085,19 @@ mod tests {
             let conn = store.conn();
             for (index, added) in [today, three_days, long_ago].iter().enumerate() {
                 conn.execute(
-                    "INSERT INTO telegram_chat(chat_id, message_id, at, sender, kind, file_name,
-                        seconds, text, error, added_at)
-                     VALUES (1, ?1, '2001-01-01T00:00:00Z', 'User', 'voice', 'a.ogg', 1.0, ?2, NULL, ?3)",
-                    rusqlite::params![index as i64 + 1, format!("message {index}"), stamp(*added)],
+                    crate::sql::query("telegram/test_chat_insert"),
+                    rusqlite::params![
+                        1i64,
+                        index as i64 + 1,
+                        "2001-01-01T00:00:00Z",
+                        "User",
+                        "voice",
+                        "a.ogg",
+                        1.0f64,
+                        format!("message {index}"),
+                        Option::<String>::None,
+                        stamp(*added)
+                    ],
                 )
                 .expect("insert");
             }
@@ -2144,10 +2128,19 @@ mod tests {
             let conn = store.conn();
             for index in 0..3 {
                 conn.execute(
-                    "INSERT INTO telegram_chat(chat_id, message_id, at, sender, kind, file_name,
-                        seconds, text, error, added_at)
-                     VALUES (1, ?1, ?2, 'User', 'voice', 'old.ogg', 1.0, ?3, NULL, '')",
-                    rusqlite::params![index as i64 + 1, nine_days_ago, format!("old {index}")],
+                    crate::sql::query("telegram/test_chat_insert"),
+                    rusqlite::params![
+                        1i64,
+                        index as i64 + 1,
+                        nine_days_ago.as_str(),
+                        "User",
+                        "voice",
+                        "old.ogg",
+                        1.0f64,
+                        format!("old {index}"),
+                        Option::<String>::None,
+                        ""
+                    ],
                 )
                 .expect("insert");
             }

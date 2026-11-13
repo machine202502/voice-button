@@ -1,0 +1,1 @@
+-- `site/hub.rs` owns no SQL: it goes through `site/db.rs`.

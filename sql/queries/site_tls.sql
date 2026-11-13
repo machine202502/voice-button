@@ -1,0 +1,1 @@
+-- `site/tls.rs` owns no SQL: certificates live in PEM files.

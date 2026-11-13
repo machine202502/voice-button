@@ -105,13 +105,7 @@ fn write_state(dir: &Path, state: &PersistedState) {
         return;
     };
     let _ = store.conn().execute(
-        "INSERT INTO recordings(name, id, started, interactor, model, seconds, done,
-            failed_segments, failed, kept)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-         ON CONFLICT(name) DO UPDATE SET id = excluded.id, started = excluded.started,
-            interactor = excluded.interactor, model = excluded.model, seconds = excluded.seconds,
-            done = excluded.done, failed_segments = excluded.failed_segments,
-            failed = excluded.failed, kept = excluded.kept",
+        crate::sql::query("session/write"),
         rusqlite::params![
             name,
             state.id as i64,
@@ -132,8 +126,7 @@ pub fn read_state(dir: &Path) -> Option<PersistedState> {
     let store = crate::store::Store::open(root).ok()?;
     let conn = store.conn();
     conn.query_row(
-        "SELECT id, started, interactor, model, seconds, done, failed_segments, failed, kept
-         FROM recordings WHERE name = ?1",
+        crate::sql::query("session/read"),
         [name],
         |row| {
             Ok(PersistedState {
@@ -157,7 +150,7 @@ fn delete_state(dir: &Path) {
         return;
     };
     if let Ok(store) = crate::store::Store::open(root) {
-        let _ = store.conn().execute("DELETE FROM recordings WHERE name = ?1", [name]);
+        let _ = store.conn().execute(crate::sql::query("session/delete"), [name]);
     }
 }
 
