@@ -468,6 +468,7 @@ pub fn load_history(root: &std::path::Path) -> History {
 mod tests {
     use super::{Interactor, ModelChoice, Session};
     use crate::config::{Backend, Config};
+    use crate::dates::DateFilter;
     use crate::site::db::{message_count, message_page, monolog_count, monolog_page, Db};
     use crate::site::monolog::Stage;
     use crate::store::Store;
@@ -501,8 +502,8 @@ mod tests {
         }
         // The window opens the file the daemon left, never its own copy.
         let store = Store::open(&root).unwrap();
-        assert_eq!(monolog_count(&store, true, ""), 1);
-        let monolog = &monolog_page(&store, true, "", 0, 10)[0];
+        assert_eq!(monolog_count(&store, true, "", DateFilter::everything()), 1);
+        let monolog = &monolog_page(&store, true, "", DateFilter::everything(), 0, 10)[0];
         assert_eq!(monolog.name, "Работа");
         assert!(monolog.archived, "an archived monolog is still listed");
         assert_eq!(monolog.count, 1, "a deleted message is not counted");

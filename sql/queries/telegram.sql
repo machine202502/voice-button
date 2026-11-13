@@ -42,18 +42,18 @@ VALUES (0, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10);
 -- processed, not to the day printed on the file it carried. `at` is still read
 -- for older rows that predate the column, so old data keeps working. The order
 -- is the bot's own order of processing, never the date on the file.
+-- ?1 is the lower bound, ?2 the upper one (both may be empty), then the page.
 SELECT id, chat_id, message_id, at, sender, kind, file_name,
     seconds, text, error
 FROM telegram_chat
 WHERE {{range}}
-ORDER BY id LIMIT ?2 OFFSET ?3;
+ORDER BY id LIMIT ?3 OFFSET ?4;
 
 -- name: chat_count
 SELECT COUNT(*) FROM telegram_chat WHERE {{range}};
 
 -- name: chat_search_page
--- ?1 is the search pattern. The range bound is ?4 because limit and offset
--- take ?2 and ?3; `{{range}}` is rendered with that parameter number.
+-- ?1 is the search pattern, ?2 and ?3 the date bounds, then the page.
 SELECT id, chat_id, message_id, at, sender, kind, file_name,
     seconds, text, error
 FROM telegram_chat
@@ -61,7 +61,7 @@ WHERE (vb_lower(text) LIKE vb_lower(?1) ESCAPE '\'
     OR vb_lower(sender) LIKE vb_lower(?1) ESCAPE '\'
     OR vb_lower(file_name) LIKE vb_lower(?1) ESCAPE '\')
   AND {{range}}
-ORDER BY id LIMIT ?2 OFFSET ?3;
+ORDER BY id LIMIT ?4 OFFSET ?5;
 
 -- name: chat_search_count
 SELECT COUNT(*) FROM telegram_chat

@@ -76,20 +76,20 @@ fn fifty_thousand_rows_are_read_by_window() {
 
     let history = history::History::load(&root);
     assert_eq!(history.len(), 50_000);
-    let page = history.page(&[], "", 0, PAGE);
+    let page = history.page(&[], "", voice_button::dates::DateFilter::everything(), 0, PAGE);
     assert_eq!(page.len(), PAGE);
     assert_eq!(page[0].preview(), "row 49999");
-    let tail = history.page(&[], "", 49_800, PAGE);
+    let tail = history.page(&[], "", voice_button::dates::DateFilter::everything(), 49_800, PAGE);
     assert_eq!(tail[0].preview(), "row 199", "newest first: the tail is the oldest");
-    assert_eq!(history.count(&[], "row 49999"), 1);
-    assert_eq!(history.count(&[], ""), 50_000);
+    assert_eq!(history.count(&[], "row 49999", voice_button::dates::DateFilter::everything()), 1);
+    assert_eq!(history.count(&[], "", voice_button::dates::DateFilter::everything()), 50_000);
 
     let dirs = AppDirs {
         root: root.clone(),
         models: PathBuf::new(),
     };
-    assert_eq!(voice_button::telegram::chat_count(&dirs, voice_button::telegram::ChatRange::All), 50_000);
-    let chat = voice_button::telegram::chat_page(&dirs, voice_button::telegram::ChatRange::All, 200, 49_800);
+    assert_eq!(voice_button::telegram::chat_count(&dirs, voice_button::dates::DateFilter::everything()), 50_000);
+    let chat = voice_button::telegram::chat_page(&dirs, voice_button::dates::DateFilter::everything(), 200, 49_800);
     assert_eq!(chat.len(), 200);
     assert_eq!(chat[0].text, "telegram row 49800");
 

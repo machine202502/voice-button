@@ -14,6 +14,7 @@ use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use super::monolog::{Monolog, Stage};
+use crate::dates::DateFilter;
 use std::path::{Path, PathBuf};
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -663,12 +664,14 @@ impl Db {
     /// One page of monologs, newest first, with counts from SQL.
     pub fn monologs_page(&self, archived: bool, offset: usize, limit: usize) -> (Vec<Monolog>, usize) {
         let conn = self.store.conn();
+        // The API's own list is not date-filtered: the window passes empty bounds,
+        // which the condition reads as "everything".
+        let count_sql = crate::sql::render(
+            "site_db/monologs_count_archived",
+            &[("range", &DateFilter::clause("m.created", "m.created"))],
+        );
         let total: i64 = conn
-            .query_row(
-                crate::sql::query("site_db/monologs_count_archived"),
-                [archived as i64],
-                |row| row.get(0),
-            )
+            .query_row(&count_sql, params!["", "", archived as i64], |row| row.get(0))
             .unwrap_or(0);
         let mut result = Vec::new();
         if let Ok(mut statement) = conn.prepare(crate::sql::query("site_db/monologs_page_rows")) {
@@ -691,13 +694,15 @@ impl Db {
     }
 
     pub fn monolog_count(&self, archived: bool) -> usize {
+        let sql = crate::sql::render(
+            "site_db/monologs_count_archived",
+            &[("range", &DateFilter::clause("m.created", "m.created"))],
+        );
         self.store
             .conn()
-            .query_row(
-                crate::sql::query("site_db/monologs_count_archived"),
-                [archived as i64],
-                |row| row.get::<_, i64>(0),
-            )
+            .query_row(&sql, params!["", "", archived as i64], |row| {
+                row.get::<_, i64>(0)
+            })
             .map(|count| count as usize)
             .unwrap_or(0)
     }
@@ -811,19 +816,33 @@ pub struct MessageRow {
     pub text: String,
 }
 
-pub fn monolog_count(store: &Store, archived: bool, needle: &str) -> usize {
+/// The date condition for a monolog list: a monolog belongs to the day it was
+/// started, which is what its card shows.
+fn monolog_clause() -> String {
+    DateFilter::clause("m.created", "m.created")
+}
+
+pub fn monolog_count(store: &Store, archived: bool, needle: &str, range: DateFilter) -> usize {
     let needle = needle.trim().to_lowercase();
     let conn = store.conn();
+    let clause = monolog_clause();
     let result = if needle.is_empty() {
+        let sql = crate::sql::render("site_db/monologs_count_archived", &[("range", &clause)]);
         conn.query_row(
-            crate::sql::query("site_db/monologs_count_archived"),
-            [archived as i64],
+            &sql,
+            params![range.since(), range.until(), archived as i64],
             |row| row.get::<_, i64>(0),
         )
     } else {
+        let sql = crate::sql::render("site_db/monologs_count_search", &[("range", &clause)]);
         conn.query_row(
-            crate::sql::query("site_db/monologs_count_search"),
-            params![archived as i64, format!("%{needle}%")],
+            &sql,
+            params![
+                range.since(),
+                range.until(),
+                archived as i64,
+                format!("%{needle}%")
+            ],
             |row| row.get::<_, i64>(0),
         )
     };
@@ -837,17 +856,19 @@ pub fn monolog_page(
     store: &Store,
     archived: bool,
     needle: &str,
+    range: DateFilter,
     offset: usize,
     limit: usize,
 ) -> Vec<MonologRow> {
     let needle = needle.trim().to_lowercase();
     let conn = store.conn();
+    let clause = monolog_clause();
     let sql = if needle.is_empty() {
-        crate::sql::query("site_db/monolog_page")
+        crate::sql::render("site_db/monolog_page", &[("range", &clause)])
     } else {
-        crate::sql::query("site_db/monolog_page_search")
+        crate::sql::render("site_db/monolog_page_search", &[("range", &clause)])
     };
-    let mut statement = match conn.prepare(sql) {
+    let mut statement = match conn.prepare(&sql) {
         Ok(statement) => statement,
         Err(_) => return Vec::new(),
     };
@@ -863,10 +884,26 @@ pub fn monolog_page(
         })
     };
     let rows = if needle.is_empty() {
-        statement.query_map(params![archived as i64, limit as i64, offset as i64], mapper)
+        statement.query_map(
+            params![
+                range.since(),
+                range.until(),
+                archived as i64,
+                limit as i64,
+                offset as i64
+            ],
+            mapper,
+        )
     } else {
         statement.query_map(
-            params![archived as i64, format!("%{needle}%"), limit as i64, offset as i64],
+            params![
+                range.since(),
+                range.until(),
+                archived as i64,
+                format!("%{needle}%"),
+                limit as i64,
+                offset as i64
+            ],
             mapper,
         )
     };
@@ -1134,6 +1171,51 @@ mod tests {
     }
 
     #[test]
+    fn the_monolog_list_can_be_narrowed_to_a_day() {
+        // The list offers today / yesterday / this week / all time, the same
+        // choices as the Telegram log. A monolog belongs to the day it was started.
+        let root = root_for("monolog-days");
+        let mut db = Db::open(&root).unwrap();
+        let today = chrono::Local::now();
+        let stamp = |days: u64| {
+            let naive = (today.date_naive() - chrono::Days::new(days))
+                .and_hms_opt(12, 0, 0)
+                .unwrap();
+            let moment = chrono::TimeZone::from_local_datetime(&chrono::Local, &naive)
+                .earliest()
+                .unwrap();
+            moment
+                .with_timezone(&chrono::Utc)
+                .format("%Y-%m-%dT%H:%M:%S+00:00")
+                .to_string()
+        };
+        db.create_monolog("Сегодня", &stamp(0));
+        db.create_monolog("Вчера", &stamp(1));
+        db.create_monolog("Старый", &stamp(30));
+        db.save().unwrap();
+
+        let store = Store::open(&root).unwrap();
+        assert_eq!(monolog_count(&store, false, "", DateFilter::everything()), 3);
+        assert_eq!(monolog_count(&store, false, "", DateFilter::today()), 1);
+        assert_eq!(monolog_count(&store, false, "", DateFilter::yesterday()), 1);
+        assert_eq!(monolog_count(&store, false, "", DateFilter::week()), 2);
+
+        let today_rows = monolog_page(&store, false, "", DateFilter::today(), 0, 10);
+        assert_eq!(today_rows.len(), 1);
+        assert_eq!(today_rows[0].name, "Сегодня");
+        let yesterday_rows = monolog_page(&store, false, "", DateFilter::yesterday(), 0, 10);
+        assert_eq!(yesterday_rows.len(), 1, "yesterday is its own window");
+        assert_eq!(yesterday_rows[0].name, "Вчера");
+        // The search box narrows within the chosen day.
+        assert_eq!(
+            monolog_count(&store, false, "вчера", DateFilter::yesterday()),
+            1
+        );
+        assert_eq!(monolog_count(&store, false, "вчера", DateFilter::today()), 0);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn the_window_reads_pages_without_opening_a_monolog() {
         let root = root_for("pages");
         {
@@ -1147,12 +1229,12 @@ mod tests {
             db.save().unwrap();
         }
         let store = Store::open(&root).unwrap();
-        assert_eq!(monolog_count(&store, false, ""), 1);
-        let page = monolog_page(&store, false, "", 0, 10);
+        assert_eq!(monolog_count(&store, false, "", DateFilter::everything()), 1);
+        let page = monolog_page(&store, false, "", DateFilter::everything(), 0, 10);
         assert_eq!(page.len(), 1);
         assert_eq!(page[0].count, 500);
-        assert_eq!(monolog_count(&store, false, "Работа"), 1);
-        assert_eq!(monolog_count(&store, false, "nothing like this"), 0);
+        assert_eq!(monolog_count(&store, false, "Работа", DateFilter::everything()), 1);
+        assert_eq!(monolog_count(&store, false, "nothing like this", DateFilter::everything()), 0);
         assert_eq!(message_count(&store, page[0].id), 500);
         assert_eq!(message_page(&store, page[0].id, 0, 200).len(), 200);
         assert_eq!(message_page(&store, page[0].id, 400, 200).len(), 100);

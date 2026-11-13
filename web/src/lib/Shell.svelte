@@ -42,8 +42,10 @@
       hidden={!showBack}
       onclick={() => page.back()}>←</button
     >
+    <!-- The title takes every pixel the arrow and the two buttons leave: a
+         spacer next to it would split the free width in half and cut a name that
+         would have fitted. -->
     <h1 id="title">{title}</h1>
-    <span class="vb-grow"></span>
     <span class="version" id="version" aria-label={page.tr('site_version')}
       >{page.versionLabel}</span
     >

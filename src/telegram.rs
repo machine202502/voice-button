@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::config::AppDirs;
+use crate::dates::DateFilter;
 use crate::i18n::{tr, trf};
 use crate::state::{Shared, Status};
 
@@ -702,61 +703,13 @@ pub fn reset_owner(root: &Path) {
 }
 
 /// One page of the chat, oldest first, for the window's lazy list.
-/// Which slice of the chat the list shows.
 ///
 /// The bounds follow the bot's own clock: a message belongs to the day it was
 /// processed, not to the day printed on the file it carried. `at` is still read
 /// for older rows that predate the column, so old data keeps working.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub enum ChatRange {
-    #[default]
-    Today,
-    Week,
-    All,
-}
-
-impl ChatRange {
-    /// Lower bound in UTC, or `""` for "no bound". Every stored `added_at` is UTC
-    /// in the same shape, so a string comparison is a time comparison.
-    pub fn since(self) -> String {
-        let local = chrono::Local::now();
-        let start = match self {
-            Self::All => return String::new(),
-            // Midnight at the start of today: the current day runs from 00:00.
-            Self::Today => local.date_naive().and_hms_opt(0, 0, 0),
-            // Seven calendar days including today.
-            Self::Week => (local.date_naive() - chrono::Days::new(6)).and_hms_opt(0, 0, 0),
-        };
-        let Some(start) = start else {
-            return String::new();
-        };
-        let start = chrono::TimeZone::from_local_datetime(&chrono::Local, &start).earliest();
-        start
-            .map(|moment| {
-                moment
-                    .with_timezone(&chrono::Utc)
-                    .format("%Y-%m-%dT%H:%M:%SZ")
-                    .to_string()
-            })
-            .unwrap_or_default()
-    }
-
-    /// The SQL condition shared by every chat query: an empty bound string
-    /// means everything. `param` is the placeholder's 1-based index in the
-    /// statement that receives the fragment.
-    fn clause(param: usize) -> &'static str {
-        match param {
-            1 => "(?1 = '' OR COALESCE(NULLIF(added_at, ''), at) >= ?1)",
-            2 => "(?2 = '' OR COALESCE(NULLIF(added_at, ''), at) >= ?2)",
-            4 => "(?4 = '' OR COALESCE(NULLIF(added_at, ''), at) >= ?4)",
-            _ => panic!("chat range uses ?1, ?2 or ?4"),
-        }
-    }
-}
-
 pub fn chat_page(
     dirs: &AppDirs,
-    range: ChatRange,
+    range: DateFilter,
     limit: usize,
     offset: usize,
 ) -> Vec<ChatEntry> {
@@ -764,28 +717,28 @@ pub fn chat_page(
         return Vec::new();
     };
     let conn = store.conn();
-    let sql = crate::sql::render("telegram/chat_page", &[("range", ChatRange::clause(1))]);
+    let sql = crate::sql::render("telegram/chat_page", &[("range", &range_clause())]);
     let Ok(mut statement) = conn.prepare(&sql) else {
         return Vec::new();
     };
     statement
         .query_map(
-            rusqlite::params![range.since(), limit as i64, offset as i64],
+            rusqlite::params![range.since(), range.until(), limit as i64, offset as i64],
             read_chat,
         )
         .map(|rows| rows.flatten().collect())
         .unwrap_or_default()
 }
 
-pub fn chat_count(dirs: &AppDirs, range: ChatRange) -> usize {
-    let sql = crate::sql::render("telegram/chat_count", &[("range", ChatRange::clause(1))]);
+pub fn chat_count(dirs: &AppDirs, range: DateFilter) -> usize {
+    let sql = crate::sql::render("telegram/chat_count", &[("range", &range_clause())]);
     open_store(&dirs.root)
         .and_then(|store| {
             store
                 .conn()
                 .query_row(
                     &sql,
-                    rusqlite::params![range.since()],
+                    rusqlite::params![range.since(), range.until()],
                     |row| row.get::<_, i64>(0),
                 )
                 .ok()
@@ -793,9 +746,14 @@ pub fn chat_count(dirs: &AppDirs, range: ChatRange) -> usize {
         .unwrap_or(0) as usize
 }
 
+/// The date condition every chat query uses, with the chat's own columns.
+fn range_clause() -> String {
+    DateFilter::clause("added_at", "at")
+}
+
 pub fn chat_search_page(
     dirs: &AppDirs,
-    range: ChatRange,
+    range: DateFilter,
     needle: &str,
     limit: usize,
     offset: usize,
@@ -807,24 +765,24 @@ pub fn chat_search_page(
     let conn = store.conn();
     let sql = crate::sql::render(
         "telegram/chat_search_page",
-        &[("range", ChatRange::clause(4))],
+        &[("range", &range_clause())],
     );
     let Ok(mut statement) = conn.prepare(&sql) else {
         return Vec::new();
     };
     statement
         .query_map(
-            rusqlite::params![pattern, limit as i64, offset as i64, range.since()],
+            rusqlite::params![pattern, range.since(), range.until(), limit as i64, offset as i64],
             read_chat,
         )
         .map(|rows| rows.flatten().collect())
         .unwrap_or_default()
 }
 
-pub fn chat_search_count(dirs: &AppDirs, range: ChatRange, needle: &str) -> usize {
+pub fn chat_search_count(dirs: &AppDirs, range: DateFilter, needle: &str) -> usize {
     let sql = crate::sql::render(
         "telegram/chat_search_count",
-        &[("range", ChatRange::clause(2))],
+        &[("range", &range_clause())],
     );
     open_store(&dirs.root)
         .and_then(|store| {
@@ -833,7 +791,7 @@ pub fn chat_search_count(dirs: &AppDirs, range: ChatRange, needle: &str) -> usiz
                 .conn()
                 .query_row(
                     &sql,
-                    rusqlite::params![pattern, range.since()],
+                    rusqlite::params![pattern, range.since(), range.until()],
                     |row| row.get::<_, i64>(0),
                 )
                 .ok()
@@ -1865,7 +1823,7 @@ mod tests {
             Ok(me) => println!("getMe: ok, bot @{}", me["result"]["username"]),
             Err(error) => println!("getMe failed: {error:#}"),
         }
-        let entries = chat_page(&dirs, ChatRange::All, 5, 0);
+        let entries = chat_page(&dirs, DateFilter::everything(), 5, 0);
         println!("stored messages: {}", entries.len());
         for entry in &entries {
             println!(
@@ -2066,7 +2024,7 @@ mod tests {
         finish_job(&api, &dirs, &state, &job, Err(anyhow!("broken container")));
         assert!(api.sent()[0].contains(tr("Bot: could not transcribe: {error}").split("{error}").next().unwrap()));
         assert_eq!(api.reactions.lock().unwrap().last().unwrap().1, "👎");
-        let entry = chat_page(&dirs, ChatRange::All, 1, 0)[0].clone();
+        let entry = chat_page(&dirs, DateFilter::everything(), 1, 0)[0].clone();
         assert!(entry.error.is_some());
         assert!(entry.text.contains("broken container"));
         let _ = std::fs::remove_dir_all(&dirs.root);
@@ -2076,6 +2034,9 @@ mod tests {
     fn the_date_filter_counts_by_processing_time() {
         let dirs = dirs("range");
         let today = chrono::Utc::now();
+        // Yesterday is a window of its own: it must not count as today and must
+        // count as this week.
+        let yesterday = today - chrono::Duration::days(1);
         let three_days = today - chrono::Duration::days(3);
         let long_ago = today - chrono::Duration::days(40);
         let stamp = |moment: chrono::DateTime<chrono::Utc>| moment.format("%Y-%m-%dT%H:%M:%SZ").to_string();
@@ -2083,7 +2044,7 @@ mod tests {
         {
             let store = open_store(&dirs.root).expect("store");
             let conn = store.conn();
-            for (index, added) in [today, three_days, long_ago].iter().enumerate() {
+            for (index, added) in [today, yesterday, three_days, long_ago].iter().enumerate() {
                 conn.execute(
                     crate::sql::query("telegram/test_chat_insert"),
                     rusqlite::params![
@@ -2103,13 +2064,33 @@ mod tests {
             }
         }
 
-        assert_eq!(chat_count(&dirs, ChatRange::Today), 1, "only today's message");
-        assert_eq!(chat_count(&dirs, ChatRange::Week), 2, "today and three days ago");
-        assert_eq!(chat_count(&dirs, ChatRange::All), 3, "everything");
-        assert_eq!(chat_page(&dirs, ChatRange::Today, 10, 0).len(), 1);
-        assert_eq!(chat_page(&dirs, ChatRange::All, 10, 0).len(), 3);
+        assert_eq!(chat_count(&dirs, DateFilter::today()), 1, "only today's message");
+        assert_eq!(
+            chat_count(&dirs, DateFilter::yesterday()),
+            1,
+            "only yesterday's, and today's is not in it"
+        );
+        assert_eq!(
+            chat_count(&dirs, DateFilter::week()),
+            3,
+            "today, yesterday and three days ago"
+        );
+        assert_eq!(chat_count(&dirs, DateFilter::everything()), 4, "everything");
+        assert_eq!(chat_page(&dirs, DateFilter::today(), 10, 0).len(), 1);
+        assert_eq!(chat_page(&dirs, DateFilter::yesterday(), 10, 0).len(), 1);
+        assert_eq!(chat_page(&dirs, DateFilter::everything(), 10, 0).len(), 4);
+        // The windows do not overlap: a message belongs to exactly one day.
+        let today_texts: Vec<String> = chat_page(&dirs, DateFilter::today(), 10, 0)
+            .iter()
+            .map(|entry| entry.text.clone())
+            .collect();
+        let yesterday_texts: Vec<String> = chat_page(&dirs, DateFilter::yesterday(), 10, 0)
+            .iter()
+            .map(|entry| entry.text.clone())
+            .collect();
+        assert!(today_texts.iter().all(|text| !yesterday_texts.contains(text)));
         // The date on the file is 2001 and must not decide anything.
-        assert!(chat_page(&dirs, ChatRange::All, 10, 0)
+        assert!(chat_page(&dirs, DateFilter::everything(), 10, 0)
             .iter()
             .all(|entry| entry.at.starts_with("2001-")));
         let _ = std::fs::remove_dir_all(&dirs.root);
@@ -2145,10 +2126,10 @@ mod tests {
                 .expect("insert");
             }
         }
-        assert_eq!(chat_count(&dirs, ChatRange::Today), 0, "nothing was handled today");
-        assert_eq!(chat_count(&dirs, ChatRange::Week), 0);
-        assert_eq!(chat_count(&dirs, ChatRange::All), 3, "everything is still there");
-        assert_eq!(chat_page(&dirs, ChatRange::All, 10, 0).len(), 3);
+        assert_eq!(chat_count(&dirs, DateFilter::today()), 0, "nothing was handled today");
+        assert_eq!(chat_count(&dirs, DateFilter::week()), 0);
+        assert_eq!(chat_count(&dirs, DateFilter::everything()), 3, "everything is still there");
+        assert_eq!(chat_page(&dirs, DateFilter::everything(), 10, 0).len(), 3);
         let _ = std::fs::remove_dir_all(&dirs.root);
     }
 
@@ -2186,7 +2167,7 @@ mod tests {
         append_chat(&dirs.root, &ancient);
         let _ = api;
 
-        let entries = chat_page(&dirs, ChatRange::All, 10, 0);
+        let entries = chat_page(&dirs, DateFilter::everything(), 10, 0);
         let texts: Vec<&str> = entries.iter().map(|entry| entry.text.as_str()).collect();
         assert_eq!(
             texts,
@@ -2195,7 +2176,7 @@ mod tests {
         );
         // And it holds across pages: the second page continues where the first
         // stopped, whatever the dates say.
-        let second = chat_page(&dirs, ChatRange::All, 1, 1);
+        let second = chat_page(&dirs, DateFilter::everything(), 1, 1);
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].text, "processed second, dated 2019");
         let _ = std::fs::remove_dir_all(&dirs.root);

@@ -293,11 +293,30 @@ fn run_ui(config: config::Config, history: state::History, dirs: AppDirs, tab: S
     } else {
         Tab::Capture
     };
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title(WINDOW_TITLE)
+        .with_inner_size([560.0, 620.0])
+        .with_icon(crate::icons::window_icon());
+    // `VB_SHOT_AT=x,y` pins the window to a known spot and drops the OS frame, so
+    // a screenshot script can photograph one fixed rectangle of the screen. A
+    // snapshot run photographs the screen too, so it pins itself the same way.
+    let shot_at = std::env::var("VB_SHOT_AT")
+        .ok()
+        .or_else(|| Some("120,120".to_string()).filter(|_| std::env::var("VB_SNAPSHOT").is_ok()));
+    if let Some(at) = shot_at.and_then(|at| {
+        let (x, y) = at.split_once(',')?;
+        Some([x.trim().parse::<f32>().ok()?, y.trim().parse::<f32>().ok()?])
+    }) {
+        viewport = viewport
+            .with_position(at)
+            .with_decorations(false)
+            .with_resizable(false)
+            // The shot is copied from the screen, so the window has to be above
+            // whatever else is open.
+            .with_always_on_top();
+    }
     let mut options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title(WINDOW_TITLE)
-            .with_inner_size([560.0, 620.0])
-            .with_icon(crate::icons::window_icon()),
+        viewport,
         ..Default::default()
     };
     options.viewport = options.viewport.with_active(true);
@@ -322,6 +341,7 @@ fn run_ui(config: config::Config, history: state::History, dirs: AppDirs, tab: S
         show_about: false,
         expanded_history: None,
         history_filter: HistoryFilter::All,
+        history_range: crate::dates::DateFilter::everything(),
         history_search: String::new(),
         history_paged: Paged::new(),
         history_heights: crate::lazy_list::LazyList::new(0.0, 20.0),
@@ -330,13 +350,16 @@ fn run_ui(config: config::Config, history: state::History, dirs: AppDirs, tab: S
         download_done_seen: false,
         api_copied_at: 0.0,
         site_qr: None,
-        phone: PhoneState::default(),
+        phone: PhoneState {
+            monolog_range: crate::dates::DateFilter::everything(),
+            ..PhoneState::default()
+        },
         telegram_chat: Paged::new(),
         telegram_heights: crate::lazy_list::LazyList::new(8.0, 120.0),
         telegram_key: None,
         telegram_form: TelegramForm::default(),
         telegram_search: String::new(),
-        telegram_range: crate::telegram::ChatRange::default(),
+        telegram_range: crate::dates::DateFilter::default(),
         snapshot_dir: std::env::var("VB_SNAPSHOT").ok().map(PathBuf::from),
         snapshot_frame: 0,
         applied_theme: Some(theme::resolve(initial_theme)),
@@ -521,11 +544,14 @@ struct PhoneState {
     view: PhoneView,
     open: Option<u64>,
     search: String,
+    /// Which slice of time the monolog list shows: the same four choices as the
+    /// Telegram log. It opens on everything, because monologs live for months.
+    monolog_range: crate::dates::DateFilter,
     selected: std::collections::BTreeSet<u64>,
     /// One page window over `monologs`, keyed by (revision, archive, search).
     monologs: Paged<MonologRow>,
-    monolog_key: Option<(u64, bool, String)>,
-    monolog_query: Option<(bool, String)>,
+    monolog_key: Option<(u64, bool, String, crate::dates::DateFilter)>,
+    monolog_query: Option<(bool, String, crate::dates::DateFilter)>,
     /// One page window over the open monolog's messages, keyed by
     /// (revision, monolog id).
     messages: Paged<MessageRow>,
@@ -548,12 +574,15 @@ pub struct MainWindow {
     show_about: bool,
     expanded_history: Option<usize>,
     history_filter: HistoryFilter,
+    /// The same date choices as the other lists. The history opens on everything,
+    /// because it is the archive of all transcription.
+    history_range: crate::dates::DateFilter,
     history_search: String,
     history_paged: Paged<crate::history::HistoryRow>,
     /// Measured heights of the history rows: an opened row is as tall as its text.
     history_heights: crate::lazy_list::LazyList,
-    history_key: Option<(u64, HistoryFilter, String)>,
-    history_query: Option<(HistoryFilter, String)>,
+    history_key: Option<(u64, HistoryFilter, String, crate::dates::DateFilter)>,
+    history_query: Option<(HistoryFilter, String, crate::dates::DateFilter)>,
     download_done_seen: bool,
     /// egui timestamp of the last "Copy" click on the API address; drives the
     /// transient "Copied!" feedback in the API tab.
@@ -564,11 +593,11 @@ pub struct MainWindow {
     telegram_chat: Paged<crate::telegram::ChatEntry>,
     /// Measured heights of the Telegram rows: they differ by message length.
     telegram_heights: crate::lazy_list::LazyList,
-    telegram_key: Option<(u64, String, crate::telegram::ChatRange)>,
+    telegram_key: Option<(u64, String, crate::dates::DateFilter)>,
     telegram_form: TelegramForm,
     telegram_search: String,
     /// Today / week / everything: the log opens on today.
-    telegram_range: crate::telegram::ChatRange,
+    telegram_range: crate::dates::DateFilter,
     snapshot_dir: Option<PathBuf>,
     snapshot_frame: u32,
     /// Theme the visuals currently carry. A mismatch means Settings (or the
@@ -652,6 +681,7 @@ impl eframe::App for MainWindow {
                     &mut data,
                     &mut self.expanded_history,
                     &mut self.history_filter,
+                    &mut self.history_range,
                     &mut self.history_search,
                     &mut self.history_paged,
                     &mut self.history_heights,
@@ -719,15 +749,20 @@ impl MainWindow {
             self.store.revision("rev.history"),
             self.history_filter,
             self.history_search.trim().to_string(),
+            self.history_range,
         );
-        let history_query = (history_key.1, history_key.2.clone());
+        let history_query = (history_key.1, history_key.2.clone(), history_key.3);
         if self.history_query.as_ref() != Some(&history_query) {
             self.expanded_history = None;
             self.history_query = Some(history_query);
         }
         if self.history_key.as_ref() != Some(&history_key) {
             let sources = self.history_filter.sources();
-            let total = self.shared.lock().history.count(&sources, &history_key.2);
+            let total = self
+                .shared
+                .lock()
+                .history
+                .count(&sources, &history_key.2, history_key.3);
             self.history_paged.reset(total);
             self.history_key = Some(history_key);
         }
@@ -752,8 +787,9 @@ impl MainWindow {
             self.store.revision("rev.site"),
             self.phone.view == PhoneView::Archive,
             self.phone.search.trim().to_string(),
+            self.phone.monolog_range,
         );
-        let monolog_query = (monolog_key.1, monolog_key.2.clone());
+        let monolog_query = (monolog_key.1, monolog_key.2.clone(), monolog_key.3);
         if self.phone.monolog_query.as_ref() != Some(&monolog_query) {
             self.phone.monolog_query = Some(monolog_query);
             self.phone.open = None;
@@ -764,6 +800,7 @@ impl MainWindow {
                 &self.store,
                 monolog_key.1,
                 &monolog_key.2,
+                monolog_key.3,
             );
             self.phone.monologs.reset(total);
             self.phone.monolog_key = Some(monolog_key);
@@ -776,6 +813,9 @@ impl MainWindow {
         let Some(dir) = self.snapshot_dir.clone() else {
             return;
         };
+        // While a screenshot is in flight the walk must not move on: the image is
+        // encoded a few frames later, and advancing early captured the next state
+        // instead of the one that was asked for.
         self.snapshot_frame += 1;
         let frame = self.snapshot_frame;
         match frame {
@@ -986,6 +1026,85 @@ impl MainWindow {
     }
 }
 
+fn capture_window(hwnd: isize, path: &std::path::Path) {
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::Graphics::Gdi::{
+        BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC,
+        SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, HGDIOBJ, SRCCOPY,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect;
+
+    if hwnd == 0 {
+        return;
+    }
+    // SAFETY: all GDI objects created here are deleted before returning; hwnd
+    // is our own window handle; the DIB bits pointer stays valid while bmp lives.
+    unsafe {
+        let hwnd = hwnd as windows_sys::Win32::Foundation::HWND;
+        let mut rect: RECT = std::mem::zeroed();
+        if GetWindowRect(hwnd, &mut rect) == 0 {
+            return;
+        }
+        let w = (rect.right - rect.left).max(1) as u32;
+        let h = (rect.bottom - rect.top).max(1) as u32;
+        let screen_dc = GetDC(std::ptr::null_mut());
+        if screen_dc.is_null() {
+            return;
+        }
+        let mem_dc = CreateCompatibleDC(screen_dc);
+        let mut bmi: BITMAPINFO = std::mem::zeroed();
+        bmi.bmiHeader = BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: w as i32,
+            biHeight: -(h as i32), // top-down DIB
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB,
+            ..Default::default()
+        };
+        let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+        let bmp = CreateDIBSection(mem_dc, &bmi, 0, &mut bits, std::ptr::null_mut(), 0);
+        if bmp.is_null() {
+            DeleteDC(mem_dc);
+            ReleaseDC(std::ptr::null_mut(), screen_dc);
+            return;
+        }
+        let old = SelectObject(mem_dc, bmp as HGDIOBJ);
+        // Copied from the screen, not with PrintWindow: PrintWindow hands back the
+        // last frame the compositor kept, which during the fast snapshot walk is
+        // the state before the one being photographed (About came out as the
+        // History list, the plain History shot as the expanded one). The window is
+        // pinned and always on top while a snapshot run is going, so the screen
+        // holds exactly this state.
+        BitBlt(
+            mem_dc,
+            0,
+            0,
+            w as i32,
+            h as i32,
+            screen_dc,
+            rect.left,
+            rect.top,
+            SRCCOPY,
+        );
+        let n = (w * h * 4) as usize;
+        let src = std::slice::from_raw_parts(bits as *const u8, n);
+        let mut rgba = vec![0u8; n];
+        for (dst, px) in rgba.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+            // DIB is BGRA; image::save_buffer wants RGBA.
+            dst[0] = px[2];
+            dst[1] = px[1];
+            dst[2] = px[0];
+            dst[3] = 255;
+        }
+        let _ = image::save_buffer(path, &rgba, w, h, image::ColorType::Rgba8);
+        SelectObject(mem_dc, old);
+        DeleteObject(bmp as HGDIOBJ);
+        DeleteDC(mem_dc);
+        ReleaseDC(std::ptr::null_mut(), screen_dc);
+    }
+}
+
 /// Locate our own window.
 ///
 /// Not by title alone: the installed copy may be running at the same time and
@@ -1029,69 +1148,6 @@ fn find_own_window() -> isize {
 
 /// Capture a window (by HWND) into a PNG file using PrintWindow with
 /// PW_RENDERFULLCONTENT so accelerated (glow) windows render correctly.
-fn capture_window(hwnd: isize, path: &std::path::Path) {
-    use windows_sys::Win32::Foundation::RECT;
-    use windows_sys::Win32::Graphics::Gdi::{
-        CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC,
-        SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, HGDIOBJ,
-    };
-    use windows_sys::Win32::Storage::Xps::PrintWindow;
-    use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect;
-
-    if hwnd == 0 {
-        return;
-    }
-    // SAFETY: all GDI objects created here are deleted before returning; hwnd
-    // is our own window handle; the DIB bits pointer stays valid while bmp lives.
-    unsafe {
-        let hwnd = hwnd as windows_sys::Win32::Foundation::HWND;
-        let mut rect: RECT = std::mem::zeroed();
-        if GetWindowRect(hwnd, &mut rect) == 0 {
-            return;
-        }
-        let w = (rect.right - rect.left).max(1) as u32;
-        let h = (rect.bottom - rect.top).max(1) as u32;
-        let screen_dc = GetDC(std::ptr::null_mut());
-        if screen_dc.is_null() {
-            return;
-        }
-        let mem_dc = CreateCompatibleDC(screen_dc);
-        let mut bmi: BITMAPINFO = std::mem::zeroed();
-        bmi.bmiHeader = BITMAPINFOHEADER {
-            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: w as i32,
-            biHeight: -(h as i32), // top-down DIB
-            biPlanes: 1,
-            biBitCount: 32,
-            biCompression: BI_RGB,
-            ..Default::default()
-        };
-        let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
-        let bmp = CreateDIBSection(mem_dc, &bmi, 0, &mut bits, std::ptr::null_mut(), 0);
-        if bmp.is_null() {
-            DeleteDC(mem_dc);
-            ReleaseDC(std::ptr::null_mut(), screen_dc);
-            return;
-        }
-        let old = SelectObject(mem_dc, bmp as HGDIOBJ);
-        PrintWindow(hwnd, mem_dc, 2);
-        let n = (w * h * 4) as usize;
-        let src = std::slice::from_raw_parts(bits as *const u8, n);
-        let mut rgba = vec![0u8; n];
-        for (dst, px) in rgba.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
-            // DIB is BGRA; image::save_buffer wants RGBA.
-            dst[0] = px[2];
-            dst[1] = px[1];
-            dst[2] = px[0];
-            dst[3] = 255;
-        }
-        let _ = image::save_buffer(path, &rgba, w, h, image::ColorType::Rgba8);
-        SelectObject(mem_dc, old);
-        DeleteObject(bmp as HGDIOBJ);
-        DeleteDC(mem_dc);
-        ReleaseDC(std::ptr::null_mut(), screen_dc);
-    }
-}
 
 /// Progress indicator for the currently running download, shown at the top of
 /// the window regardless of which model section is open.
@@ -1688,7 +1744,7 @@ fn telegram_body(
     dirs: &AppDirs,
     chat: &mut Paged<crate::telegram::ChatEntry>,
     heights: &mut crate::lazy_list::LazyList,
-    range: &mut crate::telegram::ChatRange,
+    range: &mut crate::dates::DateFilter,
     search: &mut String,
 ) {
     let p = pal(ui);
@@ -1716,9 +1772,8 @@ fn telegram_body(
         );
         // The log opens on today: the bot handled those messages now, and the
         // date on a card is the date of the original file, which may be older.
-        ui.selectable_value(range, crate::telegram::ChatRange::Today, tr("Today"));
-        ui.selectable_value(range, crate::telegram::ChatRange::Week, tr("Week"));
-        ui.selectable_value(range, crate::telegram::ChatRange::All, tr("All time"));
+        // The same four choices as the monolog list, in the same order.
+        date_filter_row(ui, range);
         ui.label(
             RichText::new(trf("Messages: {count}", &[("count", &chat.total().to_string())]))
                 .small()
@@ -1730,19 +1785,21 @@ fn telegram_body(
         ui.label(
             RichText::new(if searching {
                 tr("No matching messages.")
-            } else if *range == crate::telegram::ChatRange::Today {
-                tr("Nothing today")
-            } else if *range == crate::telegram::ChatRange::Week {
-                tr("Nothing this week")
             } else {
-                tr("Nothing from Telegram yet.")
+                match range.preset {
+                    crate::dates::Preset::Today => tr("Nothing today"),
+                    crate::dates::Preset::Yesterday => tr("Nothing yesterday"),
+                    crate::dates::Preset::Week => tr("Nothing this week"),
+                    crate::dates::Preset::Period => tr("Nothing in this period"),
+                    crate::dates::Preset::All => tr("Nothing from Telegram yet."),
+                }
             })
             .weak(),
         );
-        if !searching && *range != crate::telegram::ChatRange::All
+        if !searching && range.preset != crate::dates::Preset::All
             && ui.button(tr("Show everything")).clicked()
         {
-            *range = crate::telegram::ChatRange::All;
+            *range = crate::dates::DateFilter::everything();
         }
         ui.separator();
         return;
@@ -1906,7 +1963,7 @@ fn external_body(
     phone: &mut PhoneState,
     telegram_chat: &mut Paged<crate::telegram::ChatEntry>,
     telegram_heights: &mut crate::lazy_list::LazyList,
-    telegram_range: &mut crate::telegram::ChatRange,
+    telegram_range: &mut crate::dates::DateFilter,
     telegram: &mut TelegramForm,
     telegram_search: &mut String,
 ) {
@@ -2273,6 +2330,73 @@ fn phone_when(monolog: &MonologRow) -> String {
     at.replace('T', " ").chars().take(16).collect()
 }
 
+/// The date row every list shares: today, yesterday, this week, a period and
+/// everything. When the period is picked, the calendar opens in place, and the
+/// two dates are the ones the person chose.
+///
+/// Returns true when the selection changed.
+fn date_filter_row(ui: &mut egui::Ui, range: &mut crate::dates::DateFilter) -> bool {
+    use crate::dates::Preset;
+    // `VB_OPEN_CALENDAR=1` chooses a period and opens its calendar once, without a
+    // click: scripts/calendar-shot.py photographs this frame.
+    if std::env::var("VB_OPEN_CALENDAR").is_ok() {
+        let done = egui::Id::new("vb-open-calendar");
+        if ui.data(|data| data.get_temp::<bool>(done).is_none()) {
+            ui.data_mut(|data| data.insert_temp(done, true));
+            let today = chrono::Local::now().date_naive();
+            range.preset = Preset::Period;
+            range.from = today - chrono::Days::new(6);
+            range.to = today;
+            crate::calendar::open_picker(ui, "period");
+            // The shot is taken from the screen, so the window must be on top of
+            // whatever the person had in front; the marker is what the script
+            // waits for instead of guessing how long a cold start needs.
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Focus);
+            crate::log::log("calendar shot: period picker opened");
+        }
+    }
+    let mut changed = false;
+    for preset in crate::dates::DateFilter::presets() {
+        let selected = range.preset == preset;
+        if ui.selectable_label(selected, tr(preset.label())).clicked() && !selected {
+            range.preset = preset;
+            // A period opens on the last seven days, so it is never empty by
+            // accident when the person first reaches it.
+            if preset == Preset::Period && range.from > range.to {
+                let today = chrono::Local::now().date_naive();
+                range.from = today - chrono::Days::new(6);
+                range.to = today;
+            }
+            changed = true;
+        }
+    }
+    if range.preset == Preset::Period {
+        changed |= period_pickers(ui, range);
+    }
+    changed
+}
+
+/// The two calendars of a period. The official `egui_extras` widget draws them:
+/// a month grid with the day already marked, so nothing here is written by hand.
+fn period_pickers(ui: &mut egui::Ui, range: &mut crate::dates::DateFilter) -> bool {
+    // One calendar, not two: the first click sets the start of the period, the
+    // second sets its end, the way a date-range input works everywhere else.
+    let mut from = range.from;
+    let mut to = range.to;
+    let picked = ui.add(
+        crate::calendar::DatePickerButton::new(&mut from)
+            .range(&mut to)
+            .id_source("period")
+            .format("%d.%m.%Y"),
+    );
+    if !picked.changed() {
+        return false;
+    }
+    range.from = from.min(to);
+    range.to = from.max(to);
+    true
+}
+
 fn phone_monologs(
     ui: &mut egui::Ui,
     store: &Store,
@@ -2289,6 +2413,7 @@ fn phone_monologs(
     });
     let showing_archive = phone.view == PhoneView::Archive;
     let query = phone.search.trim().to_string();
+    let range = phone.monolog_range;
     let total = phone.monologs.total();
     // Active and archived are two different jobs: read and archive the first,
     // only unarchive the second.
@@ -2301,16 +2426,32 @@ fn phone_monologs(
             phone.open = None;
             phone.selected.clear();
         }
+        ui.separator();
+        // The same four choices as the Telegram log, so both lists read alike.
+        date_filter_row(ui, &mut phone.monolog_range);
     });
     if total == 0 {
+        let narrowed = !query.is_empty() || phone.monolog_range.preset != crate::dates::Preset::All;
         ui.label(
-            RichText::new(if showing_archive {
+            RichText::new(if phone.monolog_range.preset == crate::dates::Preset::Today {
+                tr("Nothing today")
+            } else if phone.monolog_range.preset == crate::dates::Preset::Yesterday {
+                tr("Nothing yesterday")
+            } else if phone.monolog_range.preset == crate::dates::Preset::Week {
+                tr("Nothing this week")
+            } else if !query.is_empty() {
+                tr("No matching messages.")
+            } else if showing_archive {
                 tr("The archive is empty.")
             } else {
                 tr("No monologs yet.")
             })
             .weak(),
         );
+        if narrowed && ui.button(tr("Show everything")).clicked() {
+            phone.monolog_range = crate::dates::DateFilter::everything();
+            phone.search.clear();
+        }
         return;
     }
     // Open the newest monolog when nothing is open yet. The row itself is on
@@ -2319,7 +2460,14 @@ fn phone_monologs(
         phone
             .monologs
             .ensure(0..1, |offset, limit| {
-                crate::site::db::monolog_page(store, showing_archive, &query, offset, limit)
+                crate::site::db::monolog_page(
+                    store,
+                    showing_archive,
+                    &query,
+                    range,
+                    offset,
+                    limit,
+                )
             });
         phone.open = phone.monologs.get(0).map(|monolog| monolog.id);
         phone.selected.clear();
@@ -2357,6 +2505,7 @@ fn phone_monologs(
                                 store,
                                 showing_archive,
                                 &query,
+                                range,
                                 offset,
                                 limit,
                             )
@@ -3428,6 +3577,31 @@ fn weekday_name(day: chrono::Weekday) -> &'static str {
     }
 }
 
+#[cfg(test)]
+mod date_row_tests {
+    use super::*;
+
+    /// The row draws with every preset, including the period, whose two calendars
+    /// are the official `egui_extras` widget. This runs headlessly: it proves the
+    /// widget is wired and cannot panic, which a screenshot of this window cannot
+    /// show (the window renders through a swapchain that blocks screen capture).
+    #[test]
+    fn the_date_row_draws_every_preset() {
+        for preset in crate::dates::DateFilter::presets() {
+            let mut filter = crate::dates::DateFilter {
+                preset,
+                from: chrono::Local::now().date_naive() - chrono::Days::new(6),
+                to: chrono::Local::now().date_naive(),
+            };
+            let before = filter;
+            let _ = egui::__run_test_ui(|ui| {
+                date_filter_row(ui, &mut filter);
+            });
+            assert_eq!(filter, before, "drawing alone changes nothing: {preset:?}");
+        }
+    }
+}
+
 fn history_entry_for(
     history: &state::History,
     row: &crate::history::HistoryRow,
@@ -3445,12 +3619,15 @@ fn history_body(
     data: &mut Data,
     expanded: &mut Option<usize>,
     filter: &mut HistoryFilter,
+    range: &mut crate::dates::DateFilter,
     search: &mut String,
     paged: &mut Paged<crate::history::HistoryRow>,
     heights: &mut crate::lazy_list::LazyList,
 ) {
     let p = pal(ui);
-    ui.horizontal(|ui| {
+    // Wrapped, so a longer translation moves a filter to the next line instead of
+    // pushing the row out of a 560-point window.
+    ui.horizontal_wrapped(|ui| {
         ui.heading(tr("History"));
         ui.add_space(10.0);
         ui.label(RichText::new(tr("show:")).weak());
@@ -3465,11 +3642,23 @@ fn history_body(
             *filter = next;
             *expanded = None;
         }
-        ui.add(
-            egui::TextEdit::singleline(search)
-                .hint_text(tr("Search"))
-                .desired_width(200.0),
-        );
+    });
+    // The same date row as the phone list and the Telegram log; the search box
+    // sits at its right edge, where the filter row above leaves room.
+    ui.horizontal(|ui| {
+        if date_filter_row(ui, range) {
+            *expanded = None;
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // The search takes whatever the period row leaves, so a two-ended
+            // date ("17.11.2026 – 26.11.2026") never pushes it out of the window.
+            let width = ui.available_width().max(90.0);
+            ui.add(
+                egui::TextEdit::singleline(search)
+                    .hint_text(tr("Search"))
+                    .desired_width(width),
+            );
+        });
     });
     ui.separator();
     if paged.is_empty() {
@@ -3491,7 +3680,7 @@ fn history_body(
     // to draw the scrollbar.
     if let Some(open) = *expanded {
         paged.ensure(open..(open + 1).min(paged.total()), |offset, limit| {
-            data.history.page(&sources, &needle, offset, limit)
+            data.history.page(&sources, &needle, *range, offset, limit)
         });
     }
     let total = paged.total();
@@ -3517,7 +3706,7 @@ fn history_body(
                 return;
             }
             paged.ensure(first..last, |offset, limit| {
-                data.history.page(&sources, &needle, offset, limit)
+                data.history.page(&sources, &needle, *range, offset, limit)
             });
             let content_top = ui.max_rect().top();
             for index in first..last {

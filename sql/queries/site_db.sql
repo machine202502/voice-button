@@ -119,7 +119,8 @@ WHERE deleted = 0 AND monolog_id = ?1
 ORDER BY recorded DESC, id DESC LIMIT ?2;
 
 -- name: monologs_count_archived
-SELECT COUNT(*) FROM monologs WHERE archived = ?1;
+-- ?1 and ?2 are the date bounds (both may be empty), ?3 the archive flag.
+SELECT COUNT(*) FROM monologs m WHERE {{range}} AND m.archived = ?3;
 
 -- name: monologs_page_rows
 SELECT m.id, m.name, m.archived, m.created,
@@ -145,10 +146,11 @@ SELECT id FROM site_messages
 WHERE stage IN ('draft', 'uploading', 'queued', 'transcribing') ORDER BY id;
 
 -- name: monologs_count_search
-SELECT COUNT(*) FROM monologs m WHERE m.archived = ?1
-  AND (vb_lower(m.name) LIKE ?2 ESCAPE '\' OR vb_lower(COALESCE((
+-- ?1 and ?2 are the date bounds, ?3 the archive flag, ?4 the pattern.
+SELECT COUNT(*) FROM monologs m WHERE {{range}} AND m.archived = ?3
+  AND (vb_lower(m.name) LIKE ?4 ESCAPE '\' OR vb_lower(COALESCE((
       SELECT text FROM site_messages s WHERE s.monolog_id = m.id AND s.deleted = 0
-      ORDER BY s.recorded DESC, s.id DESC LIMIT 1), '')) LIKE ?2 ESCAPE '\');
+      ORDER BY s.recorded DESC, s.id DESC LIMIT 1), '')) LIKE ?4 ESCAPE '\');
 
 -- name: monolog_page
 SELECT m.id, m.name, m.archived, m.created,
@@ -157,8 +159,8 @@ SELECT m.id, m.name, m.archived, m.created,
         ORDER BY s.recorded DESC, s.id DESC LIMIT 1), ''),
     COALESCE((SELECT recorded FROM site_messages s WHERE s.monolog_id = m.id AND s.deleted = 0
         ORDER BY s.recorded DESC, s.id DESC LIMIT 1), '')
-FROM monologs m WHERE m.archived = ?1
-ORDER BY m.created DESC, m.id DESC LIMIT ?2 OFFSET ?3;
+FROM monologs m WHERE {{range}} AND m.archived = ?3
+ORDER BY m.created DESC, m.id DESC LIMIT ?4 OFFSET ?5;
 
 -- name: monolog_page_search
 SELECT m.id, m.name, m.archived, m.created,
@@ -167,11 +169,11 @@ SELECT m.id, m.name, m.archived, m.created,
         ORDER BY s.recorded DESC, s.id DESC LIMIT 1), ''),
     COALESCE((SELECT recorded FROM site_messages s WHERE s.monolog_id = m.id AND s.deleted = 0
         ORDER BY s.recorded DESC, s.id DESC LIMIT 1), '')
-FROM monologs m WHERE m.archived = ?1
-  AND (vb_lower(m.name) LIKE ?2 ESCAPE '\' OR vb_lower(COALESCE((
+FROM monologs m WHERE {{range}} AND m.archived = ?3
+  AND (vb_lower(m.name) LIKE ?4 ESCAPE '\' OR vb_lower(COALESCE((
       SELECT text FROM site_messages s WHERE s.monolog_id = m.id AND s.deleted = 0
-      ORDER BY s.recorded DESC, s.id DESC LIMIT 1), '')) LIKE ?2 ESCAPE '\')
-ORDER BY m.created DESC, m.id DESC LIMIT ?3 OFFSET ?4;
+      ORDER BY s.recorded DESC, s.id DESC LIMIT 1), '')) LIKE ?4 ESCAPE '\')
+ORDER BY m.created DESC, m.id DESC LIMIT ?5 OFFSET ?6;
 
 -- name: message_rows
 SELECT id, recorded, stage, text FROM site_messages

@@ -321,12 +321,13 @@ impl History {
         &self,
         sources: &[Source],
         needle: &str,
+        range: crate::dates::DateFilter,
         offset: usize,
         limit: usize,
     ) -> Vec<HistoryRow> {
         if let Some(store) = &self.store {
             let conn = store.conn();
-            let (filter, params) = source_filter(sources, needle);
+            let (filter, params) = source_filter(sources, needle, range);
             let sql = crate::sql::render("history/page_rows", &[("filter", &filter)]);
             let mut statement = match conn.prepare(&sql) {
                 Ok(statement) => statement,
@@ -355,7 +356,7 @@ impl History {
             .collect()
     }
 
-    pub fn count(&self, sources: &[Source], needle: &str) -> usize {
+    pub fn count(&self, sources: &[Source], needle: &str, range: crate::dates::DateFilter) -> usize {
         if self.store.is_none() {
             let needle = needle.to_lowercase();
             return self
@@ -367,7 +368,7 @@ impl History {
         }
         let store = self.store.as_ref().unwrap();
         let conn = store.conn();
-        let (filter, params) = source_filter(sources, needle);
+        let (filter, params) = source_filter(sources, needle, range);
         let sql = crate::sql::render("history/count_filtered", &[("filter", &filter)]);
         let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|value| value as &dyn rusqlite::ToSql).collect();
         conn.query_row(&sql, refs.as_slice(), |row| row.get::<_, i64>(0))
@@ -420,9 +421,25 @@ impl History {
     }
 }
 
-fn source_filter(sources: &[Source], needle: &str) -> (String, Vec<String>) {
+fn source_filter(
+    sources: &[Source],
+    needle: &str,
+    range: crate::dates::DateFilter,
+) -> (String, Vec<String>) {
     let mut clauses: Vec<String> = Vec::new();
     let mut params: Vec<String> = Vec::new();
+    // The date window first: its two parameters stay at the front of the list.
+    let since = range.since();
+    let until = range.until();
+    if !since.is_empty() || !until.is_empty() {
+        // The fragment names each bound twice (once per side of the comparison),
+        // and a positional statement needs one value per `?`.
+        clauses.push(crate::dates::DateFilter::clause_anonymous("h.at", "h.at"));
+        params.push(since.clone());
+        params.push(since);
+        params.push(until.clone());
+        params.push(until);
+    }
     if !sources.is_empty() {
         let marks: Vec<&str> = sources.iter().map(|_| "?").collect();
         clauses.push(format!("h.source IN ({})", marks.join(",")));
@@ -600,6 +617,64 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// An entry with a real timestamp, so the date filter can parse it.
+    fn dated(day: u32, text: &str) -> HistoryEntry {
+        HistoryEntry {
+            at: format!("2026-11-{day:02} 10:00:00"),
+            text: text.to_string(),
+            model: "model".to_string(),
+            parts: Vec::new(),
+            source: Source::User,
+            state: EntryState::Complete,
+            audio: None,
+            message: None,
+            group: None,
+        }
+    }
+
+    #[test]
+    fn the_history_can_be_narrowed_to_a_period() {
+        // The same filter the other two lists use: a period the person picked
+        // covers exactly those days, and a period that misses them finds none.
+        let root = test_root("history-period");
+        append(&root, &dated(6, "первое")).unwrap();
+        append(&root, &dated(7, "второе")).unwrap();
+        append(&root, &dated(7, "третье")).unwrap();
+        let loaded = History::load(&root);
+        let all = crate::dates::DateFilter::everything();
+        assert_eq!(loaded.count(&[], "", all), 3);
+
+        let only_sixth = crate::dates::DateFilter {
+            preset: crate::dates::Preset::Period,
+            from: chrono::NaiveDate::from_ymd_opt(2026, 11, 6).unwrap(),
+            to: chrono::NaiveDate::from_ymd_opt(2026, 11, 6).unwrap(),
+        };
+        assert_eq!(loaded.count(&[], "", only_sixth), 1, "one entry on the 6th");
+        assert_eq!(loaded.page(&[], "", only_sixth, 0, 10).len(), 1);
+
+        let both_days = crate::dates::DateFilter {
+            preset: crate::dates::Preset::Period,
+            from: chrono::NaiveDate::from_ymd_opt(2026, 11, 6).unwrap(),
+            to: chrono::NaiveDate::from_ymd_opt(2026, 11, 7).unwrap(),
+        };
+        assert_eq!(loaded.count(&[], "", both_days), 3, "both days, inclusive");
+
+        let elsewhere = crate::dates::DateFilter {
+            preset: crate::dates::Preset::Period,
+            from: chrono::NaiveDate::from_ymd_opt(2026, 11, 20).unwrap(),
+            to: chrono::NaiveDate::from_ymd_opt(2026, 11, 21).unwrap(),
+        };
+        assert_eq!(loaded.count(&[], "", elsewhere), 0);
+        assert!(loaded.page(&[], "", elsewhere, 0, 10).is_empty());
+        // The source filter still applies inside the period.
+        assert_eq!(
+            loaded.count(&[Source::Server], "", both_days),
+            0,
+            "these entries came from the user"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn update_last_merges_into_the_newest_row_only() {
         let root = test_root("history-append");
@@ -659,7 +734,7 @@ mod tests {
         let loaded = History::load(&root);
         assert_eq!(loaded.len(), 20);
         assert_eq!(loaded.row(0).unwrap().preview(), entry(19).text);
-        assert_eq!(loaded.page(&[], "", 0, 5).len(), 5);
+        assert_eq!(loaded.page(&[], "", crate::dates::DateFilter::everything(), 0, 5).len(), 5);
         loaded.entry(10).unwrap();
         let _ = std::fs::remove_dir_all(root);
     }
@@ -673,11 +748,11 @@ mod tests {
         append(&root, &entry(2)).unwrap();
         append(&root, &entry(3)).unwrap();
         let loaded = History::load(&root);
-        assert_eq!(loaded.count(&[Source::Server], ""), 1);
-        assert_eq!(loaded.count(&[], "номер 2"), 1);
-        assert_eq!(loaded.count(&[Source::User], "номер 2"), 1);
-        assert_eq!(loaded.page(&[], "номер 2", 0, 10)[0].preview(), entry(2).text);
-        assert_eq!(loaded.page(&[Source::Server], "", 0, 10)[0].source(), Source::Server);
+        assert_eq!(loaded.count(&[Source::Server], "", crate::dates::DateFilter::everything()), 1);
+        assert_eq!(loaded.count(&[], "номер 2", crate::dates::DateFilter::everything()), 1);
+        assert_eq!(loaded.count(&[Source::User], "номер 2", crate::dates::DateFilter::everything()), 1);
+        assert_eq!(loaded.page(&[], "номер 2", crate::dates::DateFilter::everything(), 0, 10)[0].preview(), entry(2).text);
+        assert_eq!(loaded.page(&[Source::Server], "", crate::dates::DateFilter::everything(), 0, 10)[0].source(), Source::Server);
         let _ = std::fs::remove_dir_all(root);
     }
 

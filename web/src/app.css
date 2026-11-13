@@ -171,7 +171,9 @@ textarea:focus-visible,
 }
 
 .vb-shell header h1 {
-  flex: 1;
+  /* All the room the fixed controls leave. `flex: 1` here would compete with the
+     growth spacer and halve the title's width for no reason. */
+  flex: 1 1 auto;
   min-width: 0;
   margin: 0;
   overflow: hidden;
