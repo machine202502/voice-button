@@ -8,9 +8,9 @@
 // overrides in the `local` store, keyed by `[kind, id]`, and every read lays
 // them over the row before returning it:
 //
-//   * a deleted message is a tombstone: hidden from pages, from `message` and
-//     from the count, while the cached row stays on disk so the next server
-//     page cannot make it reappear;
+//   * a deleted message or monolog is a tombstone: hidden from every read while
+//     the cached row stays on disk so the next server page cannot make it
+//     reappear;
 //   * an edited message returns the phone's text;
 //   * a renamed monolog returns the phone's name;
 //   * an archived monolog belongs to the archive list, not the open one.
@@ -146,6 +146,12 @@ export interface Cache {
    */
   deleteMessage(monologId: number, messageId: MessageIdLike): Promise<void>;
   /**
+   * Remove one monolog the computer confirmed is gone, with its cached
+   * messages and the tombstones that hid them. A local delete never calls
+   * this — it applies a tombstone.
+   */
+  deleteMonolog(monologId: number): Promise<void>;
+  /**
    * The computer accepted a local edit: write the accepted text into the
    * cached row, then drop the override. A page read between the two steps sees
    * the override's own (accepted) text, never the stale server row.
@@ -159,6 +165,8 @@ export interface Cache {
   applyEdit(message: MessageInput, text: string): Promise<Override>;
   applyDelete(message: MessageInput): Promise<Override>;
   applyArchive(monolog: MonologInput, archived: boolean): Promise<Override>;
+  /** Hide a monolog on this phone. The computer has no delete route for it. */
+  applyDeleteMonolog(monolog: MonologInput): Promise<Override>;
   applyRename(monolog: MonologInput, name: string): Promise<Override>;
   clearOverride(kind: OverrideKind, id: EntityId): Promise<void>;
   overrides(): Promise<Override[]>;
@@ -183,8 +191,9 @@ function overrideKey(kind: OverrideKind, id: EntityId): [OverrideKind, EntityId]
 }
 
 /** A name or archive state from an override wins over the stored server value. */
-function withMonologOverride(monolog: Monolog, override: Override | undefined): Monolog {
+function withMonologOverride(monolog: Monolog, override: Override | undefined): Monolog | null {
   if (!override) return monolog;
+  if (override.deleted === true) return null;
   const next: Monolog = { ...monolog };
   if (typeof override.name === 'string') next.name = override.name;
   if (typeof override.archived === 'boolean') next.archived = override.archived;
@@ -253,7 +262,7 @@ export function createCache({
         { ...record, id, local: false },
         await findOverride('monolog', id),
       );
-      if (Boolean(applied.archived) !== Boolean(archived)) continue;
+      if (!applied || Boolean(applied.archived) !== Boolean(archived)) continue;
       found.push(applied);
     }
     return found;
@@ -302,6 +311,7 @@ export function createCache({
           { ...record, id: localId, localId, local: true, serverId },
           await findOverride('monolog', serverId ?? localId),
         );
+        if (!applied) continue;
         found.push({ ...applied, id: localId, localId, local: true, serverId });
       }
       // Oldest first, like the takes: -2 was made after -1.
@@ -555,6 +565,25 @@ export function createCache({
     },
 
     /**
+     * Remove one monolog the computer confirmed is gone, with every message
+     * cached under it and the overrides that hid them. The row goes before its
+     * tombstone: a read between the two steps still sees the tombstone, never
+     * a server row the delete already removed.
+     */
+    async deleteMonolog(monologId: number): Promise<void> {
+      const monolog = Number(monologId);
+      if (!Number.isFinite(monolog)) return;
+      const ids = await messages.ids(monolog);
+      // The server can reuse an id after deleting the last monolog, so its
+      // cached feed must not become the new monolog's feed.
+      await messages.removeMonolog(monolog);
+      for (const id of ids) await this.clearOverride('message', id);
+      const found = await this.find(monolog);
+      if (found) await monologs.remove(found.key);
+      await this.clearOverride('monolog', monolog);
+    },
+
+    /**
      * The computer accepted a local edit.
      *
      * The row is written first, then the override is dropped: if a page read
@@ -611,6 +640,11 @@ export function createCache({
     /** Record the list a monolog belongs to, before the computer answers. */
     async applyArchive(monolog: MonologInput, archived: boolean): Promise<Override> {
       return writeOverride('monolog', monolog.id, { archived: Boolean(archived) });
+    },
+
+    /** Hide one monolog on this phone until the computer confirms the delete. */
+    async applyDeleteMonolog(monolog: MonologInput): Promise<Override> {
+      return writeOverride('monolog', monolog.id, { deleted: true });
     },
 
     /** Record a local name for a monolog. */

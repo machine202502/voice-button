@@ -8,12 +8,6 @@ import type { Message } from '../data/types';
 
 // ---------------------------------------------------------------- time
 
-/** `2026-11-12T15:08:41+05:00` → `2026-11-12T15:08`, for a list card. */
-export function cardDate(value: string | undefined): string {
-  if (!value) return '';
-  return String(value).replace('T', ' ').slice(0, 16);
-}
-
 /** The wall-clock time of a take: `15:08`. An unreadable stamp is empty. */
 export function shortTime(iso: string | undefined): string {
   if (!iso) return '';
@@ -52,7 +46,7 @@ export function dayLabel(key: string, lang: string): string {
   const date = new Date(`${key}T00:00:00`);
   if (Number.isNaN(date.getTime())) return key;
   try {
-    return date.toLocaleDateString(lang, { weekday: 'short', day: '2-digit', month: '2-digit' });
+    return date.toLocaleDateString(lang, { day: 'numeric', month: 'long' });
   } catch {
     return key;
   }
@@ -64,14 +58,23 @@ export function dayLabel(key: string, lang: string): string {
  * has to be named here.
  */
 export function pluralKey(count: number, lang: string): string {
-  let form = 'many';
+  return 'messages_' + pluralForm(count, lang);
+}
+
+/** The plural form for a count of monologs, for the archive notice. */
+export function monologPluralKey(count: number, lang: string): string {
+  return 'monologs_' + pluralForm(count, lang);
+}
+
+function pluralForm(count: number, lang: string): 'one' | 'few' | 'many' {
+  let form: 'one' | 'few' | 'many' = 'many';
   try {
     const chosen = new Intl.PluralRules(lang).select(count);
     if (chosen === 'one' || chosen === 'few' || chosen === 'many') form = chosen;
   } catch {
     // An unknown locale means the simple many form.
   }
-  return 'messages_' + form;
+  return form;
 }
 
 // ---------------------------------------------------------------- stages

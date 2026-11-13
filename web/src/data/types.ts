@@ -125,6 +125,7 @@ export interface Override {
 export type MutationKind =
   | 'monolog.rename'
   | 'monolog.archive'
+  | 'monolog.delete'
   | 'message.edit'
   | 'message.delete';
 

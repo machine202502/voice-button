@@ -36,7 +36,7 @@ import { openStorage } from './data/storage';
 import type { Storage } from './data/storage';
 import type { Message, Monolog, Take } from './data/types';
 import { language, setLanguage, t } from './i18n';
-import { messageId, textOf } from './lib/format';
+import { messageId, shortTime, textOf } from './lib/format';
 import { applyTheme, readTheme } from './lib/theme';
 import type { ThemeMode } from './lib/theme';
 import { version as pageVersion } from './lib/version';
@@ -92,7 +92,15 @@ export interface RecordingView {
   started: number;
 }
 
-export type SheetKind = 'create' | 'menu' | 'edit' | 'delete';
+export type SheetKind =
+  | 'create'
+  | 'rename'
+  | 'list-menu'
+  | 'monolog-menu'
+  | 'message-menu'
+  | 'delete-message'
+  | 'delete-monolog'
+  | 'delete-take';
 
 /** One open sheet. Data only: `SheetHost` decides the buttons for each kind. */
 export interface SheetData {
@@ -105,6 +113,7 @@ export interface SheetData {
   /** The row the sheet acts on. */
   monolog: Monolog | null;
   message: Message | null;
+  take: Take | null;
   /** The sheet was opened from the archive, where the monolog is read-only. */
   archivedView: boolean;
 }
@@ -115,7 +124,7 @@ export interface Note {
 }
 
 export type PageMode = 'boot' | 'pair' | 'app';
-export type Screen = 'list' | 'feed';
+export type Screen = 'list' | 'feed' | 'settings' | 'edit';
 
 interface HistoryView {
   view?: string;
@@ -228,9 +237,20 @@ class Page {
   screen = $state<Screen>('list');
   archived = $state(false);
   monolog = $state<MonologRef | null>(null);
+  /** The message the full-screen editor is open on. */
+  editing = $state<Message | null>(null);
+
+  /** The archive's size, kept for the list menu's "Archive" line. */
+  archiveCount = $state(0);
+  /** Multi-select on the list; the selected monolog ids live beside it. */
+  selection = $state(false);
+  selected = $state<number[]>([]);
 
   notes = $state<Note[]>([]);
   sheet = $state<SheetData | null>(null);
+
+  /** Edits the phone has made but the computer has not confirmed yet. */
+  private pendingEdits = $state<number[]>([]);
 
   recording = $state<RecordingView | null>(null);
   elapsed = $state(0);
@@ -363,8 +383,22 @@ class Page {
     this.hookWindow();
     this.sync.archive(false);
     this.sync.show(0);
+    // A reload starts at the list. Old history entries belong to the document
+    // that was replaced, and letting one of them answer a back gesture would
+    // put the title and the screen out of step.
+    try {
+      history.replaceState({ view: 'list' }, '');
+    } catch {
+      // A browser without history still works.
+    }
     // The cache is on screen before anything is asked of the computer.
     await this.reloadList();
+    const waiting = await this.mutations.list();
+    this.pendingEdits = waiting
+      .filter((mutation) => mutation.kind === 'message.edit')
+      .map((mutation) => Number(mutation.target.message))
+      .filter((id) => Number.isFinite(id));
+    await this.refreshArchiveCount();
     window.app = this.handle();
     this.startLoop();
     void this.kick();
@@ -462,23 +496,53 @@ class Page {
   private onPopState(): void {
     // One rule: the browser says which screen we are back on, and the page
     // follows it. A sheet is closed first and the screen underneath stays.
-    if (this.sheet) {
-      this.sheet = null;
-      return;
+    if (this.sheet) this.sheet = null;
+    if (this.selection) {
+      this.selection = false;
+      this.selected = [];
     }
     const state = historyView();
-    if (state?.view === 'monolog') return;
-    if (state?.view === 'archive') {
-      this.archived = true;
-      if (this.monolog) this.leaveMonolog();
-      else {
-        this.sync.archive(true);
-        void this.reloadList();
-      }
+
+    if (this.screen === 'edit') {
+      this.editing = null;
+      this.screen = this.monolog ? 'feed' : 'list';
+    } else if (this.screen === 'settings') {
+      this.screen = 'list';
+    }
+
+    if (state?.view === 'sheet' || state?.view === 'edit') return;
+    if (state?.view === 'settings') {
+      this.screen = 'settings';
+      this.sync.show(0);
+      this.sync.archive(this.archived);
       return;
     }
-    if (this.monolog) this.leaveMonolog();
-    else if (this.archived) this.leaveArchive();
+    if (state?.view === 'monolog') {
+      this.screen = this.monolog ? 'feed' : 'list';
+      return;
+    }
+
+    this.screen = 'list';
+    if (state?.view === 'archive') {
+      this.archived = true;
+      this.monolog = null;
+      this.feed = null;
+      this.sync.show(0);
+      this.sync.archive(true);
+      void this.reloadList();
+      void this.kick();
+      return;
+    }
+
+    this.archived = false;
+    if (this.monolog) {
+      this.monolog = null;
+      this.feed = null;
+      this.sync.show(0);
+    }
+    this.sync.archive(false);
+    void this.reloadList();
+    void this.kick();
   }
 
   // ------------------------------------------------------------ navigation
@@ -489,18 +553,32 @@ class Page {
       this.dismissSheet();
       return;
     }
+    if (this.selection) {
+      this.cancelSelection();
+      return;
+    }
+    if (this.screen === 'edit') {
+      this.closeEdit();
+      return;
+    }
+    if (this.screen === 'settings') {
+      this.leaveSettings();
+      return;
+    }
     const state = historyView();
     if (state && state.view && state.view !== 'list') {
       history.back();
       return;
     }
-    if (this.monolog) this.leaveMonolog();
+    if (this.screen === 'feed') this.leaveMonolog();
     else if (this.archived) this.leaveArchive();
   }
 
   async openMonolog(input: { id: number; name: string; local?: boolean }): Promise<void> {
     const id = Number(input.id);
     if (!Number.isFinite(id)) return;
+    this.selection = false;
+    this.selected = [];
     this.monolog = { id, name: input.name, local: input.local === true };
     this.screen = 'feed';
     this.sync.show(id);
@@ -522,7 +600,7 @@ class Page {
       (take) => Number(take.monolog) === id && !take.remote,
     );
     const page = await this.cache.messagePage(id, { limit: FEED_PAGE });
-    feed.loaded = page.messages;
+    feed.loaded = this.withPendingEdits(page.messages);
     feed.total = Math.max(feed.loaded.length, await this.cache.messageCount(id));
     feed.hasOlder = feed.loaded.length < feed.total || page.hasMore === true;
     feed.scrollTick += 1;
@@ -532,6 +610,7 @@ class Page {
   leaveMonolog(): void {
     this.monolog = null;
     this.feed = null;
+    this.editing = null;
     this.screen = 'list';
     this.sync.show(0);
     this.sync.archive(this.archived);
@@ -539,27 +618,33 @@ class Page {
     void this.kick();
   }
 
-  openArchive(): void {
-    if (this.archived) return;
-    this.archived = true;
-    this.sync.archive(true);
-    this.pushView({ view: 'archive' });
-    void this.reloadList();
-    void this.kick();
-  }
-
   leaveArchive(): void {
     this.archived = false;
+    this.screen = 'list';
     this.sync.archive(false);
     void this.reloadList();
     void this.kick();
   }
 
-  /** The recording continues on every screen; this bar brings the person back. */
-  openRecordingMonolog(): void {
-    const recording = this.recording;
-    if (!recording) return;
-    void this.openMonolog({ id: recording.monologId, name: recording.name });
+  leaveSettings(): void {
+    if (this.screen !== 'settings') return;
+    const state = historyView();
+    if (state?.view === 'settings') {
+      history.back();
+      return;
+    }
+    this.screen = 'list';
+    this.sync.archive(this.archived);
+    void this.reloadList();
+  }
+
+  /** The open monolog's own ⋯, or the list's if no monolog is open. */
+  openHeaderMenu(): void {
+    if (this.screen === 'feed') this.openMonologMenu();
+    else if (this.screen === 'list') {
+      if (this.archived) this.openArchiveMenu();
+      else this.openListMenu();
+    }
   }
 
   private pushView(view: HistoryView): void {
@@ -570,70 +655,224 @@ class Page {
     }
   }
 
+  private replaceView(view: HistoryView): void {
+    try {
+      history.replaceState(view, '');
+    } catch {
+      // A browser that refuses history still works.
+    }
+  }
+
   // ------------------------------------------------------------ sheets
 
-  openCreate(): void {
-    this.pushSheet({
-      kind: 'create',
-      title: this.tr('new_monolog'),
+  private openSheet(data: SheetData, replace = false): void {
+    const hadSheet = this.sheet !== null;
+    this.sheet = data;
+    if (replace || hadSheet) this.replaceView({ view: 'sheet' });
+    else this.pushView({ view: 'sheet' });
+  }
+
+  openListMenu(): void {
+    this.openSheet({
+      kind: 'list-menu',
+      title: this.tr('more'),
       hint: '',
-      field: '',
-      placeholder: this.tr('monolog_name'),
+      field: null,
+      placeholder: '',
       monolog: null,
       message: null,
+      take: null,
       archivedView: false,
+    });
+    void this.refreshArchiveCount(true);
+  }
+
+  openArchiveMenu(): void {
+    this.openSheet({
+      kind: 'list-menu',
+      title: this.tr('more'),
+      hint: '',
+      field: null,
+      placeholder: '',
+      monolog: null,
+      message: null,
+      take: null,
+      archivedView: true,
     });
   }
 
-  /** The header's ⋯ on the open monolog. */
-  openMenu(): void {
+  /** The open monolog's ⋯. */
+  openMonologMenu(): void {
     const monolog = this.findOpenMonolog();
-    if (monolog) this.openCardMenu(monolog);
-  }
-
-  /** A card's ⋯: the same sheet, opened without entering the monolog. */
-  openCardMenu(monolog: Monolog): void {
-    this.pushSheet({
-      kind: 'menu',
+    if (!monolog) return;
+    this.openSheet({
+      kind: 'monolog-menu',
       title: monolog.name,
       hint: this.archived ? this.tr('archive_read_only') : '',
-      field: this.archived ? null : monolog.name,
+      field: null,
       placeholder: '',
       monolog,
       message: null,
+      take: null,
+      archivedView: this.archived,
+    });
+  }
+
+  openCreate(replace = false): void {
+    this.openSheet(
+      {
+        kind: 'create',
+        title: this.tr('new_monolog'),
+        hint: '',
+        field: '',
+        placeholder: this.tr('monolog_name'),
+        monolog: null,
+        message: null,
+        take: null,
+        archivedView: false,
+      },
+      replace,
+    );
+  }
+
+  openRenameFromMenu(): void {
+    const monolog = this.sheet?.monolog;
+    if (!monolog) return;
+    this.openSheet(
+      {
+        kind: 'rename',
+        title: this.tr('rename'),
+        hint: '',
+        field: monolog.name,
+        placeholder: this.tr('monolog_name'),
+        monolog,
+        message: null,
+        take: null,
+        archivedView: this.archived,
+      },
+      true,
+    );
+  }
+
+  openMessageSheet(message: Message): void {
+    this.openSheet({
+      kind: 'message-menu',
+      title: this.tr('message') + ' · ' + shortTime(message.recorded),
+      hint: '',
+      field: null,
+      placeholder: '',
+      monolog: null,
+      message,
+      take: null,
       archivedView: this.archived,
     });
   }
 
   openEdit(message: Message): void {
-    this.pushSheet({
-      kind: 'edit',
-      title: this.tr('edit_title'),
-      hint: this.tr('edit_hint'),
-      field: textOf(message),
-      placeholder: '',
-      monolog: null,
-      message,
-      archivedView: this.archived,
-    });
+    this.sheet = null;
+    this.editing = message;
+    this.screen = 'edit';
+    if (historyView()?.view === 'sheet') this.replaceView({ view: 'edit' });
+    else this.pushView({ view: 'edit' });
   }
 
-  openDelete(message: Message): void {
-    this.pushSheet({
-      kind: 'delete',
+  confirmDeleteMessage(message: Message): void {
+    this.openSheet({
+      kind: 'delete-message',
       title: this.tr('delete_title'),
       hint: this.tr('delete_hint'),
       field: null,
       placeholder: '',
       monolog: null,
       message,
+      take: null,
       archivedView: this.archived,
     });
   }
 
-  private pushSheet(sheet: SheetData): void {
-    this.sheet = sheet;
-    this.pushView({ view: 'sheet' });
+  confirmDeleteTake(take: Take): void {
+    this.openSheet({
+      kind: 'delete-take',
+      title: this.tr('delete_recording_title'),
+      hint: this.tr('delete_recording_hint'),
+      field: null,
+      placeholder: '',
+      monolog: null,
+      message: null,
+      take,
+      archivedView: this.archived,
+    });
+  }
+
+  confirmDeleteMonolog(monolog: Monolog): void {
+    this.openSheet({
+      kind: 'delete-monolog',
+      title: this.tr('delete_monolog_title'),
+      hint: this.tr('delete_monolog_hint'),
+      field: null,
+      placeholder: '',
+      monolog,
+      message: null,
+      take: null,
+      archivedView: this.archived,
+    });
+  }
+
+  openArchiveFromMenu(): void {
+    this.sheet = null;
+    this.archived = true;
+    this.screen = 'list';
+    this.selection = false;
+    this.selected = [];
+    this.sync.show(0);
+    this.sync.archive(true);
+    this.replaceView({ view: 'archive' });
+    void this.reloadList();
+    void this.kick();
+  }
+
+  openSettingsFromMenu(): void {
+    this.sheet = null;
+    this.screen = 'settings';
+    this.sync.show(0);
+    this.sync.archive(this.archived);
+    this.replaceView({ view: 'settings' });
+  }
+
+  beginSelection(): void {
+    this.sheet = null;
+    this.selection = true;
+    this.selected = [];
+    this.screen = 'list';
+    this.monolog = null;
+    this.feed = null;
+    this.editing = null;
+    this.sync.show(0);
+    this.sync.archive(this.archived);
+    this.replaceView({ view: this.archived ? 'archive' : 'list' });
+  }
+
+  cancelSelection(): void {
+    this.selection = false;
+    this.selected = [];
+  }
+
+  isSelected(id: number): boolean {
+    return this.selected.includes(Number(id));
+  }
+
+  toggleSelected(id: number): void {
+    const value = Number(id);
+    this.selected = this.selected.includes(value)
+      ? this.selected.filter((entry) => entry !== value)
+      : [...this.selected, value];
+  }
+
+  async archiveSelection(): Promise<void> {
+    const ids = new Set(this.selected);
+    const rows = this.list.records.filter((monolog) => ids.has(Number(monolog.id)));
+    for (const monolog of rows) await this.setArchived(monolog, !this.archived);
+    this.cancelSelection();
   }
 
   /**
@@ -648,59 +887,143 @@ class Page {
     this.sheet = null;
   }
 
-  /** The primary button of whichever sheet is open. */
-  async submitSheet(text: string): Promise<void> {
+  /** Close a sheet in favour of the screen underneath, without a back event. */
+  private closeSheetForAction(): void {
+    if (historyView()?.view === 'sheet') {
+      this.replaceView(
+        this.screen === 'feed' && this.monolog
+          ? { view: 'monolog', id: this.monolog.id }
+          : { view: this.archived ? 'archive' : 'list' },
+      );
+    }
+    this.sheet = null;
+  }
+
+  /**
+   * Pop the confirmation sheet back to the screen it was opened over.
+   *
+   * The delete actions keep acting on that screen (the feed). Replacing the
+   * sheet entry with a second copy of the screen would make the next back stay
+   * on it instead of leaving.
+   */
+  private popSheetForDelete(): void {
+    this.sheet = null;
+    if (historyView()?.view === 'sheet') history.back();
+  }
+
+  async createFromSheet(name: string): Promise<void> {
+    const value = name.trim();
+    if (!value) return;
+    // The sheet was opened over the list; replace its history entry instead of
+    // walking back to it, so creating from the archive can switch views cleanly.
+    this.closeSheetForAction();
+    await this.createMonolog(value);
+  }
+
+  async renameFromSheet(name: string): Promise<void> {
+    const monolog = this.sheet?.monolog;
+    const value = name.trim();
+    if (!monolog || !value || value === monolog.name) return;
+    this.closeSheetForAction();
+    await this.renameMonolog(monolog, value);
+  }
+
+  async deleteMessageConfirmed(): Promise<void> {
+    const message = this.sheet?.message;
+    if (!message) return;
+    this.popSheetForDelete();
+    await this.deleteMessage(message);
+  }
+
+  async deleteTakeConfirmed(): Promise<void> {
+    const take = this.sheet?.take;
+    if (!take) return;
+    this.popSheetForDelete();
+    await this.discardTake(take);
+  }
+
+  async deleteMonologConfirmed(): Promise<void> {
     const sheet = this.sheet;
-    if (!sheet) return;
-    const value = text.trim();
-    if (sheet.kind === 'create') {
-      if (!value) return;
-      this.dismissSheet();
-      await this.createMonolog(value);
-      return;
+    const monolog = sheet?.monolog;
+    if (!sheet || !monolog) return;
+    const id = Number(monolog.id);
+    const wasOpen = this.monolog !== null && this.monolog.id === id;
+    this.sheet = null;
+    // The tombstone hides it here at once. A monolog the computer knows also
+    // queues the real delete, replayed by the sync loop like any other change;
+    // one that never reached the computer has nothing to delete there.
+    await this.cache.applyDeleteMonolog(monolog);
+    if (id >= 0) {
+      await this.mutations.put({
+        kind: 'monolog.delete',
+        target: { monolog: monolog.id },
+        payload: {},
+        local: false,
+      });
     }
-    if (sheet.kind === 'menu') {
-      const monolog = sheet.monolog;
-      this.dismissSheet();
-      if (monolog && value && value !== monolog.name) await this.renameMonolog(monolog, value);
-      return;
+    if (wasOpen) {
+      this.monolog = null;
+      this.feed = null;
+      this.editing = null;
+      this.screen = 'list';
+      this.sync.show(0);
+      this.sync.archive(this.archived);
     }
-    if (sheet.kind === 'edit') {
-      const message = sheet.message;
-      this.dismissSheet();
-      if (message && value && value !== textOf(message)) await this.editMessage(message, value);
-      return;
-    }
-    if (sheet.kind === 'delete') {
-      const message = sheet.message;
-      this.dismissSheet();
-      if (message) await this.deleteMessage(message);
-    }
+    await this.reloadList();
+    await this.refreshArchiveCount();
+    void this.kick();
+    if (wasOpen && historyView()?.view === 'sheet') history.go(-2);
+    else if (wasOpen) this.replaceView({ view: this.archived ? 'archive' : 'list' });
+    else if (historyView()?.view === 'sheet') history.back();
+  }
+
+  /** Take the open archived monolog back out, from its message sheet. */
+  async restoreFromMessageSheet(): Promise<void> {
+    const monolog = this.findOpenMonolog();
+    if (!monolog) return;
+    this.sheet = null;
+    await this.setArchived(monolog, false);
+    this.archived = true;
+    this.monolog = null;
+    this.feed = null;
+    this.editing = null;
+    this.screen = 'list';
+    this.sync.show(0);
+    this.sync.archive(true);
+    await this.reloadList();
+    void this.kick();
+    if (historyView()?.view === 'sheet') history.go(-2);
+    else this.replaceView({ view: 'archive' });
   }
 
   /** Archive (from the open list) or unarchive (from the archive) one monolog. */
-  async archiveFromSheet(): Promise<void> {
+  async archiveFromMenu(): Promise<void> {
     const sheet = this.sheet;
-    if (!sheet || sheet.kind !== 'menu') return;
+    if (!sheet || sheet.kind !== 'monolog-menu') return;
     const monolog = sheet.monolog;
-    const archived = !sheet.archivedView;
-    const wasOpen = monolog !== null && this.monolog !== null && this.monolog.id === monolog.id;
-    this.dismissSheet();
     if (!monolog) return;
-    await this.setArchived(monolog, archived);
-    if (wasOpen) {
-      // The open monolog is no longer in the list it belongs to: leave the chat
-      // and let the list (without it) be what back lands on.
-      this.archived = false;
-      this.monolog = null;
-      this.feed = null;
-      this.screen = 'list';
-      this.sync.show(0);
-      this.sync.archive(false);
-      if (historyView()?.view === 'monolog') history.back();
-      await this.reloadList();
-      void this.kick();
+    const archived = !sheet.archivedView;
+    const wasOpen = this.monolog !== null && this.monolog.id === Number(monolog.id);
+    if (!wasOpen) {
+      this.dismissSheet();
+      await this.setArchived(monolog, archived);
+      return;
     }
+    // The open monolog is leaving the list it belongs to: close the sheet and
+    // the monolog together, and let the list without it be what back lands on.
+    this.sheet = null;
+    await this.setArchived(monolog, archived);
+    this.archived = !archived;
+    this.monolog = null;
+    this.feed = null;
+    this.editing = null;
+    this.screen = 'list';
+    this.sync.show(0);
+    this.sync.archive(this.archived);
+    await this.reloadList();
+    void this.kick();
+    if (historyView()?.view === 'sheet') history.go(-2);
+    else this.replaceView({ view: this.archived ? 'archive' : 'list' });
   }
 
   // ------------------------------------------------------------ manual changes
@@ -713,8 +1036,14 @@ class Page {
     // A monolog is made on the phone first: it gets a negative id, shows up in
     // the list at once, and the sync loop creates it on the computer.
     await this.cache.allocate(name);
-    await this.reloadList();
+    this.archived = false;
+    this.screen = 'list';
+    this.monolog = null;
+    this.feed = null;
+    this.sync.show(0);
     this.sync.archive(false);
+    if (historyView()?.view === 'archive') this.replaceView({ view: 'list' });
+    await this.reloadList();
     void this.kick();
   }
 
@@ -745,6 +1074,7 @@ class Page {
       local: Number(monolog.id) < 0,
     });
     await this.reloadList();
+    await this.refreshArchiveCount();
     void this.kick();
   }
 
@@ -759,7 +1089,11 @@ class Page {
     });
     // The cache decides what the feed shows: it lays the override over the row.
     const accepted = await this.cache.message(monologId, message.id);
-    if (accepted) this.replaceLoaded(accepted);
+    if (accepted) {
+      const id = messageId(accepted);
+      if (!this.pendingEdits.includes(id)) this.pendingEdits = [...this.pendingEdits, id];
+      this.replaceLoaded({ ...accepted, edited: true, editPending: true });
+    }
     void this.kick();
   }
 
@@ -775,6 +1109,7 @@ class Page {
     // A tombstone: the cache read answers `null`, so the row leaves the feed.
     const gone = await this.cache.message(monologId, message.id);
     if (gone === null) this.dropLoaded(message.id);
+    this.pendingEdits = this.pendingEdits.filter((id) => id !== messageId(message));
     void this.kick();
   }
 
@@ -806,6 +1141,29 @@ class Page {
     } catch (error) {
       this.toast(this.reason(error));
     }
+  }
+
+  /** Try again now; the queue keeps the take if the computer is still away. */
+  retryTake(): void {
+    void this.kick();
+    this.toast(this.tr('waiting_connection'));
+  }
+
+  async saveEdit(text: string): Promise<void> {
+    const message = this.editing;
+    if (!message || text === textOf(message)) return;
+    await this.editMessage(message, text);
+    this.closeEdit();
+  }
+
+  closeEdit(): void {
+    const state = historyView();
+    if (state?.view === 'edit') {
+      history.back();
+      return;
+    }
+    this.editing = null;
+    this.screen = this.monolog ? 'feed' : 'list';
   }
 
   async copyText(text: string): Promise<void> {
@@ -843,7 +1201,7 @@ class Page {
     if (!feed || !monolog) return;
     const limit = Math.max(FEED_PAGE, Math.min(FEED_MAX, feed.loaded.length));
     const page = await this.cache.messagePage(monolog.id, { limit });
-    feed.loaded = page.messages;
+    feed.loaded = this.withPendingEdits(page.messages);
     feed.pending = (await this.outbox.list()).filter(
       (take) => Number(take.monolog) === monolog.id && !take.remote,
     );
@@ -851,24 +1209,54 @@ class Page {
     feed.hasOlder = feed.loaded.length < feed.total || page.hasMore === true;
   }
 
+  /** Lay the unconfirmed phone edits over whatever row was just read. */
+  private withPendingEdits(messages: readonly Message[]): Message[] {
+    if (this.pendingEdits.length === 0) return [...messages];
+    const pending = new Set(this.pendingEdits);
+    return messages.map((message) =>
+      pending.has(messageId(message)) ? { ...message, editPending: true } : message,
+    );
+  }
+
   /**
    * Draw the newest page the sync loop fetched. A redraw keeps the reader's
    * place; only a reader already at the bottom follows new messages.
    */
-  private render(page: MessagePage, pending: Take[]): void {
+  private async render(page: MessagePage, pending: Take[]): Promise<void> {
     const feed = this.feed;
     const monolog = this.monolog;
     if (!feed || !monolog) return;
     const wasAtBottom = feed.atBottom;
+    // The computer's `edited` flag means the queued edit has arrived.
+    const confirmed = new Set(
+      page.messages.filter((row) => row.edited === true).map((row) => messageId(row)),
+    );
+    if (confirmed.size > 0) {
+      this.pendingEdits = this.pendingEdits.filter((id) => !confirmed.has(id));
+    }
+    // A page can be older than the phone: while the connection is away the
+    // HTTP cache may answer with the text from before an edit. Until the
+    // computer confirms it, the phone's own text wins over the page.
+    const unconfirmed = new Map<number, string>();
+    for (const id of this.pendingEdits) {
+      const local = await this.cache.message(monolog.id, id);
+      if (local && typeof local.text === 'string') unconfirmed.set(id, local.text);
+    }
+    if (this.feed !== feed || this.monolog?.id !== monolog.id) return;
     const merged = new Map<number, Message>();
     for (const row of feed.loaded) merged.set(messageId(row), row);
     for (const row of page.messages) merged.set(messageId(row), row);
-    feed.loaded = [...merged.values()].sort((left, right) => {
-      const a = String(left.recorded || '');
-      const b = String(right.recorded || '');
-      if (a !== b) return a < b ? -1 : 1;
-      return messageId(left) - messageId(right);
-    });
+    feed.loaded = this.withPendingEdits([...merged.values()])
+      .map((row) => {
+        const text = unconfirmed.get(messageId(row));
+        return text === undefined ? row : { ...row, text };
+      })
+      .sort((left, right) => {
+        const a = String(left.recorded || '');
+        const b = String(right.recorded || '');
+        if (a !== b) return a < b ? -1 : 1;
+        return messageId(left) - messageId(right);
+      });
     if (page.total !== null) feed.total = Math.max(page.total, feed.loaded.length);
     feed.total = Math.max(feed.total, feed.loaded.length);
     feed.hasOlder = page.hasMore === true || feed.loaded.length < feed.total;
@@ -911,7 +1299,9 @@ class Page {
       if (this.feed !== feed) return;
       if (page.total !== null) feed.total = Math.max(feed.total, page.total);
       const seen = new Set(feed.loaded.map((row) => messageId(row)));
-      const older = page.messages.filter((row) => !seen.has(messageId(row)));
+      const older = this.withPendingEdits(
+        page.messages.filter((row) => !seen.has(messageId(row))),
+      );
       if (older.length > 0) {
         feed.loaded = [...older, ...feed.loaded].sort((left, right) => {
           const a = String(left.recorded || '');
@@ -938,20 +1328,17 @@ class Page {
     }
   }
 
-  jumpToNewest(): void {
-    const feed = this.feed;
-    if (!feed) return;
-    feed.atBottom = true;
-    feed.scrollTick += 1;
-  }
-
   /** Called by the scroll container for every scroll event. */
   handleScroll(): void {
     const view = viewNode();
     if (!view) return;
     const feed = this.feed;
     if (feed) {
-      feed.atBottom = view.scrollTop + view.clientHeight >= view.scrollHeight - 48;
+      // A nearly-full viewport must still be able to sit at its top: with more
+      // than a few pixels of content, "near the bottom" would otherwise pull
+      // the first row back under the header on every sync tick.
+      const slack = Math.min(48, Math.max(0, (view.scrollHeight - view.clientHeight) / 2));
+      feed.atBottom = view.scrollTop + view.clientHeight >= view.scrollHeight - slack;
       if (view.scrollTop < LOAD_MORE_PX && feed.hasOlder && !feed.loadingOlder) {
         void this.loadOlder();
       }
@@ -977,6 +1364,19 @@ class Page {
       list.records.length,
     );
     list.pending = await this.outbox.list();
+    if (this.archived) this.archiveCount = list.total;
+  }
+
+  /** Keep the "Archive N" line honest, from the cache and then the computer. */
+  private async refreshArchiveCount(askServer = false): Promise<void> {
+    if (!this.own) return;
+    if (askServer) await this.sync.fetchMonologPage(true, 0, 1);
+    const page = await this.cache.monologPage(true, 0, 1);
+    const server = this.sync.monologTotal(true);
+    const local = (await this.cache.localMonologs()).filter(
+      (monolog) => monolog.archived === true,
+    ).length;
+    this.archiveCount = Math.max(page.total, (server ?? 0) + local);
   }
 
   private appendRecords(list: ListData, rows: readonly Monolog[]): number {

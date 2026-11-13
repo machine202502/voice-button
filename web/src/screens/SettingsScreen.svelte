@@ -1,5 +1,6 @@
 <script lang="ts">
-  // The third tab: the phone's side of the setup.
+  // The settings screen, reached from the list's "⋯" menu. It has the same
+  // header as the rest of the page, with back instead of a menu.
   //
   // Theme, language, the computer this phone is paired with, the page's own
   // version, the install guide and a reload. There is no unpair button because

@@ -142,6 +142,11 @@ function messageStore(): FakeMessageStore {
     async remove(monolog, recorded, id) {
       rows.delete(monolog + '|' + recorded + '|' + id);
     },
+    async removeMonolog(monolog) {
+      for (const [key, message] of rows) {
+        if (message.monolog === monolog) rows.delete(key);
+      }
+    },
     async any() {
       return rows.size > 0;
     },
@@ -511,6 +516,29 @@ describe('a delete', () => {
     expect(await cache.overrides()).toEqual([]);
     expect((await cache.messagePage(4, { limit: 10 })).messages.map((m) => m.id)).toEqual([8]);
     expect(await cache.messageCount(4)).toBe(1);
+  });
+
+  it('hides a monolog tombstone from a later page, then drops row and tombstone', async () => {
+    const monologs = bag<Monolog>();
+    const messages = messageStore();
+    const cache = cacheWith(monologs, messages);
+    await cache.putServerMonologs([{ id: 3, name: 'Работа' }], false);
+    await cache.putMessages(3, [{ id: 7, monolog: 3, recorded, text: 'текст' }]);
+    await cache.applyDeleteMonolog({ id: 3 });
+
+    expect((await cache.monologPage(false, 0, 100)).monologs).toEqual([]);
+    expect(await cache.serverMonologCount(false)).toBe(0);
+
+    // A complete page fetched after the tombstone cannot bring it back.
+    await cache.putServerMonologs([{ id: 3, name: 'Работа' }], false, { complete: true });
+    expect((await cache.monologPage(false, 0, 100)).monologs).toEqual([]);
+
+    // The computer accepted: the row, its cached messages and both tombstones
+    // go together.
+    await cache.deleteMonolog(3);
+    expect(await cache.overrides()).toEqual([]);
+    expect(await messages.find(3, 7)).toBeNull();
+    expect(monologs.rows.size).toBe(0);
   });
 });
 

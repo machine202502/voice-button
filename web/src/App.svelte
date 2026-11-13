@@ -1,41 +1,28 @@
 <script lang="ts">
-  // The page: the pairing screen until the phone is paired, then the shell with
-  // its three tabs, the composer and whatever sheet is open.
-  //
-  // The tabs are the shell's own; the open monolog, the archive and the sheets
-  // are state, so switching tabs never loses a take and the recording keeps
-  // running wherever the person goes.
+  // The page: the pairing screen until the phone is paired, then the one shell
+  // every screen lives in. There are no tabs; the open monolog, the archive,
+  // settings and the editor are the page's own state, so recording and queued
+  // work survive navigation.
 
-  import { Tabs } from '@skeletonlabs/skeleton-svelte';
   import { onMount } from 'svelte';
-  import Composer from './lib/Composer.svelte';
   import Shell from './lib/Shell.svelte';
   import SheetHost from './lib/SheetHost.svelte';
-  import MonologsScreen from './screens/MonologsScreen.svelte';
+  import EditScreen from './screens/EditScreen.svelte';
+  import FeedScreen from './screens/FeedScreen.svelte';
+  import MonologList from './screens/MonologList.svelte';
   import PairScreen from './screens/PairScreen.svelte';
-  import RecordScreen from './screens/RecordScreen.svelte';
   import SettingsScreen from './screens/SettingsScreen.svelte';
   import { page } from './state.svelte';
-
-  type TabName = 'monologs' | 'record' | 'settings';
-
-  let tab = $state<TabName>('monologs');
 
   const title = $derived(
     page.screen === 'feed' && page.monolog
       ? page.monolog.name
-      : page.tr(page.archived ? 'archive' : 'monologs'),
+      : page.screen === 'settings'
+        ? page.tr('settings')
+        : page.archived
+          ? page.tr('archive')
+          : page.tr('monologs'),
   );
-
-  function selectTab(value: string): void {
-    if (value === 'monologs' || value === 'record' || value === 'settings') tab = value;
-  }
-
-  /** Back leaves the monolog (or the archive) and lands on the list tab. */
-  function back(): void {
-    tab = 'monologs';
-    page.back();
-  }
 
   onMount(() => {
     void page.boot();
@@ -52,34 +39,18 @@
 {#if page.mode === 'pair'}
   <PairScreen />
 {:else if page.mode === 'app'}
-  <Tabs value={tab} onValueChange={(details) => selectTab(details.value)} class="contents">
-    <Shell {title} onback={back} composerVisible={tab === 'monologs'}>
-      {#snippet tabs()}
-        <div class="vb-tabs-wrap">
-          <Tabs.List class="vb-tabs" aria-label={page.tr('monologs')}>
-            <Tabs.Trigger value="monologs" class="vb-tab">{page.tr('monologs')}</Tabs.Trigger>
-            <Tabs.Trigger value="record" class="vb-tab">{page.tr('record')}</Tabs.Trigger>
-            <Tabs.Trigger value="settings" class="vb-tab" title="⚙">⚙</Tabs.Trigger>
-          </Tabs.List>
-        </div>
-      {/snippet}
-
-      {#snippet children()}
-        <Tabs.Content value="monologs">
-          <MonologsScreen />
-        </Tabs.Content>
-        <Tabs.Content value="record">
-          <RecordScreen />
-        </Tabs.Content>
-        <Tabs.Content value="settings">
-          <SettingsScreen />
-        </Tabs.Content>
-      {/snippet}
-
-      {#snippet composer()}
-        <Composer />
-      {/snippet}
+  {#if page.screen === 'edit' && page.editing}
+    <EditScreen />
+  {:else}
+    <Shell {title}>
+      {#if page.screen === 'settings'}
+        <SettingsScreen />
+      {:else if page.screen === 'feed' && page.feed}
+        <FeedScreen />
+      {:else}
+        <MonologList />
+      {/if}
     </Shell>
-  </Tabs>
-  <SheetHost />
+    <SheetHost />
+  {/if}
 {/if}

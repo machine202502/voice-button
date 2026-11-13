@@ -1,31 +1,28 @@
 <script lang="ts">
-  // An overlay scroll indicator for the one scrolling container.
+  // The scroll indicator for the one scrolling container.
   //
-  // The native scrollbar is hidden: on a phone it takes width away from the
-  // content, and its look is the browser's, not ours. This bar floats above the
-  // content, never changes the layout, fades away when nothing moves and can be
-  // dragged like the real thing.
+  // It is rendered beside `#view` inside the viewport wrapper, never inside the
+  // header or the composer, so its geometry cannot reach either of them. The
+  // native scrollbar stays hidden, so showing or hiding the thumb never takes
+  // width away from a card.
 
   let { target }: { target: HTMLElement | null } = $props();
 
   const MIN_THUMB = 36;
   const FADE_AFTER_MS = 900;
 
-  let trackHeight = $state(0);
   let thumbTop = $state(0);
   let thumbHeight = $state(0);
   let visible = $state(false);
   let dragging = $state(false);
-
   let hideTimer: number | undefined;
 
   function measure(): void {
     if (!target) return;
     const { scrollTop, scrollHeight, clientHeight } = target;
-    trackHeight = clientHeight;
     const ratio = scrollHeight > 0 ? clientHeight / scrollHeight : 1;
     thumbHeight = Math.max(MIN_THUMB, Math.round(clientHeight * ratio));
-    const travel = clientHeight - thumbHeight;
+    const travel = Math.max(0, clientHeight - thumbHeight);
     const progress = scrollHeight > clientHeight ? scrollTop / (scrollHeight - clientHeight) : 0;
     thumbTop = Math.round(travel * Math.min(1, Math.max(0, progress)));
     visible = scrollHeight > clientHeight + 2;
@@ -40,42 +37,37 @@
   }
 
   function wake(): void {
-    visible = true;
-    scheduleHide();
+    measure();
+    if (visible) scheduleHide();
   }
 
   $effect(() => {
     const element = target;
     if (!element) return;
+    window.clearTimeout(hideTimer);
     measure();
-    const onScroll = (): void => {
-      measure();
+    if (visible) scheduleHide();
+
+    const onScroll = (): void => wake();
+    const observer = new ResizeObserver(() => wake());
+    const watch = (): void => {
+      observer.disconnect();
+      observer.observe(element);
+      if (element.firstElementChild) observer.observe(element.firstElementChild);
       wake();
     };
-    const onResize = (): void => {
-      measure();
-      wake();
-    };
+    const mutations = new MutationObserver(watch);
     element.addEventListener('scroll', onScroll, { passive: true });
-    const observer = new ResizeObserver(onResize);
-    observer.observe(element);
-    if (element.firstElementChild) observer.observe(element.firstElementChild);
+    mutations.observe(element, { childList: true });
+    watch();
+
     return () => {
       window.clearTimeout(hideTimer);
       element.removeEventListener('scroll', onScroll);
       observer.disconnect();
+      mutations.disconnect();
     };
   });
-
-  function jumpTo(event: PointerEvent): void {
-    if (!target) return;
-    const box = (event.currentTarget as HTMLElement).getBoundingClientRect();
-    const offset = event.clientY - box.top - thumbHeight / 2;
-    const travel = box.height - thumbHeight;
-    if (travel <= 0) return;
-    const ratio = Math.min(1, Math.max(0, offset / travel));
-    target.scrollTop = ratio * (target.scrollHeight - target.clientHeight);
-  }
 
   function startDrag(event: PointerEvent): void {
     if (!target) return;
@@ -85,7 +77,7 @@
     visible = true;
     const startY = event.clientY;
     const startTop = target.scrollTop;
-    const travel = trackHeight - thumbHeight;
+    const travel = target.clientHeight - thumbHeight;
     const scrollable = target.scrollHeight - target.clientHeight;
     const handle = event.currentTarget as HTMLElement;
     handle.setPointerCapture(event.pointerId);
@@ -108,13 +100,8 @@
   }
 </script>
 
-{#if visible && trackHeight > 0}
-  <div
-    class="vb-scroll-track"
-    role="presentation"
-    onpointerdown={jumpTo}
-    style:height="{trackHeight}px"
-  >
+{#if visible}
+  <div class="vb-scroll-track" role="presentation">
     <div
       class="vb-scroll-thumb"
       class:dragging

@@ -140,6 +140,7 @@ interface FakeCache extends SyncCache {
   rows: Map<string, Message>;
   monologs: Map<number, Monolog>;
   deleted: Array<{ monolog: number; id: number }>;
+  deletedMonologs: number[];
   commits: Commit[];
   /** Called at the start of every commit; lets a test look at the queue then. */
   onCommit?: () => void | Promise<void>;
@@ -165,6 +166,7 @@ function fakeCache(): FakeCache {
     rows: new Map(),
     monologs: new Map(),
     deleted: [],
+    deletedMonologs: [],
     commits: [],
     async localMonologs() {
       const found: LocalMonolog[] = [];
@@ -243,6 +245,12 @@ function fakeCache(): FakeCache {
       for (const [key, row] of cache.rows) {
         if (row.monolog === monologId && row.id === id) cache.rows.delete(key);
       }
+    },
+    async deleteMonolog(monologId) {
+      await cache.onCommit?.();
+      const id = Number(monologId);
+      cache.deletedMonologs.push(id);
+      cache.monologs.delete(id);
     },
     async commitEdit(monologId, messageId, text) {
       await cache.onCommit?.();
@@ -1001,6 +1009,94 @@ describe('the change queue in the loop', () => {
     expect(result.failed).not.toBe(true);
     expect(await mutations.count()).toBe(0);
     expect(cache.deleted).toEqual([{ monolog: 1, id: 5 }]);
+  });
+
+  it('replays a monolog delete and clears its tombstone when accepted', async () => {
+    const cache = fakeCache();
+    cache.monologs.set(9, { id: 9, name: 'Работа' });
+    const { mutations } = mutationQueue();
+    await mutations.put({
+      kind: 'monolog.delete',
+      target: { monolog: 9 },
+      payload: {},
+      local: false,
+    });
+    const recorder = recordingApi();
+    const sync = emptySync({ api: recorder.api, cache, mutations, renderList: () => {} });
+    const result = await sync.tick();
+    expect(result.refused).toEqual([]);
+    expect(recorder.sent()).toEqual([
+      { method: 'DELETE', path: '/monologues/9', body: undefined },
+    ]);
+    expect(await mutations.count()).toBe(0);
+    // The confirmed delete removes the cached row and its tombstone together.
+    expect(cache.deletedMonologs).toEqual([9]);
+    expect(cache.monologs.has(9)).toBe(false);
+  });
+
+  it('treats a monolog the computer already deleted as accepted', async () => {
+    const cache = fakeCache();
+    cache.monologs.set(9, { id: 9, name: 'Уже нет' });
+    const { mutations } = mutationQueue();
+    await mutations.put({
+      kind: 'monolog.delete',
+      target: { monolog: 9 },
+      payload: {},
+      local: false,
+    });
+    const recorder = recordingApi((call) => {
+      if (call.method === 'DELETE') {
+        return Object.assign(new Error('no such monolog'), { status: 404 });
+      }
+      return { ok: true };
+    });
+    const sync = emptySync({ api: recorder.api, cache, mutations, renderList: () => {} });
+    const result = await sync.tick();
+    // A monolog that is already gone is the outcome the person asked for.
+    expect(result.refused).toEqual([]);
+    expect(result.failed).not.toBe(true);
+    expect(await mutations.count()).toBe(0);
+    expect(cache.deletedMonologs).toEqual([9]);
+  });
+
+  it('keeps the monolog tombstone and reports a refused delete', async () => {
+    const cache = fakeCache();
+    cache.monologs.set(9, { id: 9, name: 'Работа' });
+    const { mutations } = mutationQueue();
+    await mutations.put({
+      kind: 'monolog.delete',
+      target: { monolog: 9 },
+      payload: {},
+      local: false,
+    });
+    await mutations.put({
+      kind: 'message.edit',
+      target: { monolog: 1, message: 5 },
+      payload: { text: 'после' },
+      local: false,
+    });
+    const recorder = recordingApi((call) => {
+      if (call.method === 'DELETE') {
+        return Object.assign(new Error('this monolog cannot be deleted'), { status: 400 });
+      }
+      return { ok: true };
+    });
+    const sync = emptySync({ api: recorder.api, cache, mutations, renderList: () => {} });
+    const result = await sync.tick();
+    expect(result.failed).not.toBe(true);
+    expect(result.refused).toEqual([
+      { seq: 1, kind: 'monolog.delete', reason: 'this monolog cannot be deleted' },
+    ]);
+    // The refusal is final for the change, so the entry is dropped; the
+    // tombstone the person made stays, and the later change is not blocked.
+    expect(await mutations.count()).toBe(0);
+    expect(cache.deletedMonologs).toEqual([]);
+    expect(cache.monologs.has(9)).toBe(true);
+    expect(recorder.sent().map((call) => call.method + ' ' + call.path)).toEqual([
+      'DELETE /monologues/9',
+      'PATCH /messages/5',
+    ]);
+    expect(cache.commits).toEqual([{ method: 'edit', monolog: 1, message: 5, value: 'после' }]);
   });
 
   it('refuses a rename or an edit on any 4xx without committing it', async () => {

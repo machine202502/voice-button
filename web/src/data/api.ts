@@ -121,6 +121,11 @@ export function createApi({
         headers,
         body: payload,
         signal: controller.signal,
+        // The computer's answer is live state, not a document: a cached copy
+        // would let an offline page undo a delete or an edit that the phone
+        // already made. Offline it must fail, and the page then reads its own
+        // cache (with the phone's changes applied) instead.
+        cache: 'no-store',
       });
     } catch (error) {
       // No response at all: the computer is away, nothing was refused.

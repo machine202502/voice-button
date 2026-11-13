@@ -134,6 +134,7 @@ pub fn handle(request: &Request, ctx: &Ctx) -> Response {
         ("GET", ["site", "api", "monologues"]) => list_monologs(ctx, request),
         ("POST", ["site", "api", "monologues"]) => create_monolog(ctx, request),
         ("PATCH", ["site", "api", "monologues", id]) => rename_monolog(ctx, id, request),
+        ("DELETE", ["site", "api", "monologues", id]) => delete_monolog(ctx, id),
         ("POST", ["site", "api", "monologues", id, "archive"]) => {
             archive_monolog(ctx, id, request)
         }
@@ -272,6 +273,25 @@ fn archive_monolog(ctx: &Ctx, id: &str, request: &Request) -> Response {
     db.archive_monolog(id, archived);
     let _ = db.save();
     json(200, serde_json::json!({ "ok": true, "archived": archived }))
+}
+
+fn delete_monolog(ctx: &Ctx, id: &str) -> Response {
+    let Ok(id) = id.parse::<u64>() else {
+        return error(400, "the monolog id is not a number");
+    };
+    let messages = {
+        let mut db = ctx.db.lock().unwrap();
+        let Some(messages) = db.delete_monolog(id) else {
+            return error(404, "no such monolog");
+        };
+        messages
+    };
+    // The rows are gone; the audio files and any queue work belong to the
+    // engine. A message whose audio cannot be removed is already unreachable.
+    for message in messages {
+        ctx.engine.cancel(message);
+    }
+    json(200, serde_json::json!({ "ok": true }))
 }
 
 fn list_messages(ctx: &Ctx, id: &str, request: &Request) -> Response {
@@ -762,6 +782,107 @@ mod tests {
             .unwrap()
             .is_empty());
         assert_eq!(status_of(&db, &engine, "DELETE", &format!("/site/api/messages/{id}"), b""), 200);
+    }
+
+    #[test]
+    fn deleting_a_monolog_removes_it_and_its_messages() {
+        let (db, engine) = setup();
+        let first = ask(
+            &db,
+            &engine,
+            "POST",
+            "/site/api/messages",
+            br#"{"monolog":1}"#,
+        )["message"]["id"]
+            .as_u64()
+            .expect("the first message id");
+        let second = ask(
+            &db,
+            &engine,
+            "POST",
+            "/site/api/messages",
+            br#"{"monolog":1}"#,
+        )["message"]["id"]
+            .as_u64()
+            .expect("the second message id");
+        let before = db.lock().unwrap().store().revision("rev.site");
+        let deleted = ask(&db, &engine, "DELETE", "/site/api/monologues/1", b"");
+        assert_eq!(deleted["ok"], true);
+        assert_eq!(
+            engine.cancel.load(Ordering::SeqCst),
+            2,
+            "both takes lose their audio and queue work"
+        );
+        let after = db.lock().unwrap().store().revision("rev.site");
+        assert!(
+            after > before,
+            "the window must be told to read the list again"
+        );
+        {
+            let db = db.lock().unwrap();
+            assert!(db.monolog(1).is_none(), "the monolog row is gone");
+            assert!(db.message(first).is_none(), "the first message row is gone");
+            assert!(
+                db.message(second).is_none(),
+                "the second message row is gone"
+            );
+            assert_eq!(db.message_count(1), 0);
+        }
+        assert_eq!(
+            status_of(&db, &engine, "GET", "/site/api/monologues/1/messages", b""),
+            404
+        );
+        assert_eq!(
+            ask(&db, &engine, "GET", "/site/api/monologues", b"")["total"],
+            0,
+            "the list no longer has it"
+        );
+        assert_eq!(
+            status_of(&db, &engine, "DELETE", "/site/api/monologues/1", b""),
+            404,
+            "a second delete finds nothing"
+        );
+    }
+
+    #[test]
+    fn deleting_a_monolog_needs_the_bearer_token() {
+        let (db, engine) = setup();
+        {
+            let mut db = db.lock().unwrap();
+            db.start_pairing("secret", NOW);
+            db.save().unwrap();
+        }
+        let root = db.lock().unwrap().root().to_path_buf();
+        let ca = root.join("ca.crt");
+        let gate = crate::site::gate::Gate {
+            db: &db,
+            engine: &engine,
+            static_dir: &root,
+            ca: &ca,
+            now: NOW,
+        };
+        let ask_gate = |token: Option<&str>| {
+            let headers = match token {
+                Some(token) => vec![("Authorization".to_string(), format!("Bearer {token}"))],
+                None => Vec::new(),
+            };
+            let request = Request {
+                method: "DELETE".to_string(),
+                path: "/site/api/monologues/1".to_string(),
+                query: String::new(),
+                headers,
+                body: Vec::new(),
+            };
+            crate::site::gate::answer(&request, &gate).status
+        };
+        assert_eq!(ask_gate(None), 401, "no token, no delete");
+        assert_eq!(ask_gate(Some("wrong")), 401, "a wrong token is not a token");
+        assert!(
+            db.lock().unwrap().monolog(1).is_some(),
+            "a refused call changed nothing"
+        );
+        assert_eq!(ask_gate(Some("secret")), 200, "the right token deletes it");
+        assert!(db.lock().unwrap().monolog(1).is_none());
     }
 
     #[test]

@@ -75,6 +75,7 @@ export type SyncCache = Pick<
   | 'messageCount'
   | 'putServerMonologs'
   | 'deleteMessage'
+  | 'deleteMonolog'
   | 'commitEdit'
   | 'commitRename'
   | 'commitArchive'
@@ -175,8 +176,12 @@ export function asMessages(value: unknown, monolog: number): Message[] {
     const id = Number(record.id);
     if (!Number.isFinite(id)) continue;
     const owner = Number(record.monolog);
+    // The computer stamps an edit with its time, the page only asks whether
+    // there is one: normalize the stamp to the boolean every screen reads.
+    const edited = record.edited === true || (typeof record.edited === 'string' && record.edited !== '');
     found.push({
       ...record,
+      edited,
       id,
       monolog: Number.isFinite(owner) ? owner : monolog,
       recorded: String(record.recorded ?? ''),
@@ -396,7 +401,11 @@ export function createSync({
     }
     if (monolog <= 0) return null;
 
-    if (mutation.kind === 'monolog.rename' || mutation.kind === 'monolog.archive') {
+    if (
+      mutation.kind === 'monolog.rename' ||
+      mutation.kind === 'monolog.archive' ||
+      mutation.kind === 'monolog.delete'
+    ) {
       return { monolog, message: null };
     }
 
@@ -427,6 +436,8 @@ export function createSync({
           body: { archived: value },
         };
       }
+      case 'monolog.delete':
+        return { method: 'DELETE', path: '/monologues/' + target.monolog };
       case 'message.edit': {
         const { text } = mutation.payload;
         if (target.message === null || typeof text !== 'string') return null;
@@ -473,9 +484,11 @@ export function createSync({
       try {
         await api(request.method, request.path, request.body);
       } catch (error) {
-        // A message the computer already deleted is the outcome we wanted: a
-        // 404 is acceptance, not a refusal.
-        const alreadyGone = mutation.kind === 'message.delete' && statusOf(error) === 404;
+        // A row the computer already deleted is the outcome we wanted: a 404 is
+        // acceptance, not a refusal.
+        const alreadyGone =
+          (mutation.kind === 'message.delete' || mutation.kind === 'monolog.delete') &&
+          statusOf(error) === 404;
         if (!alreadyGone) {
           if (!isRefusal(error)) {
             log('mutation ' + mutation.seq + ' failed: ' + String(error));
@@ -507,6 +520,11 @@ export function createSync({
         if (target.message !== null) {
           await cache.deleteMessage(target.monolog, target.message);
         }
+        return;
+      case 'monolog.delete':
+        // Same rule for the monolog: row and tombstone go together, so a list
+        // page that still has it cannot bring it back.
+        await cache.deleteMonolog(target.monolog);
         return;
       case 'message.edit': {
         const { text } = mutation.payload;

@@ -81,6 +81,10 @@ impl Engine for LiveEngine {
     }
 
     fn finish(&self, id: u64) {
+        // The take is over: forget that a cutter was registered for it. An id
+        // may be reused after a delete, and a stale entry here would make the
+        // next take with that id send its audio to no cutter at all.
+        self.listening.lock().unwrap().remove(&id);
         self.hub.finish(id);
     }
 
@@ -89,6 +93,7 @@ impl Engine for LiveEngine {
     }
 
     fn cancel(&self, id: u64) {
+        self.listening.lock().unwrap().remove(&id);
         self.hub.cancel(id);
     }
 

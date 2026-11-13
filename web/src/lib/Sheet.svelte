@@ -1,18 +1,20 @@
 <script lang="ts">
   // One bottom sheet: a title, an optional line of explanation, one text field
-  // and its buttons. What the buttons do belongs to the caller (`SheetHost`);
-  // this file only owns the look and the focus.
+  // or a stack of named actions. What the actions do belongs to the caller
+  // (`SheetHost`); this file owns the look and the focus.
   //
-  // The field is a textarea even for a monolog name, as on the old page: Chrome
-  // offers the address book, cards and passwords over a text input no matter
-  // what `autocomplete` says, and a textarea never does.
+  // The field is a textarea even for a monolog name: Chrome offers the address
+  // book and passwords over a text input no matter what `autocomplete` says,
+  // and a textarea never does.
 
   import { untrack } from 'svelte';
 
-  interface Button {
+  interface SheetItem {
     label: string;
+    detail?: string;
     style?: 'primary' | 'danger';
-    action: (text: string) => void;
+    className?: string;
+    action: () => void;
   }
 
   interface Props {
@@ -22,10 +24,12 @@
     field: string | null;
     placeholder: string;
     /** A monolog name is one line high; an edit is a paragraph. */
-    oneLine: boolean;
+    oneLine?: boolean;
     cancel: string;
-    primary: Button | null;
-    secondary: Button | null;
+    items?: SheetItem[];
+    submitLabel?: string;
+    submitDisabled?: boolean;
+    onsubmit?: (text: string) => void;
     ondismiss: () => void;
   }
 
@@ -34,10 +38,12 @@
     hint,
     field,
     placeholder,
-    oneLine,
+    oneLine = false,
     cancel,
-    primary,
-    secondary,
+    items = [],
+    submitLabel = '',
+    submitDisabled = false,
+    onsubmit,
     ondismiss,
   }: Props = $props();
 
@@ -81,21 +87,39 @@
         spellcheck="false"
         aria-label={title}
       ></textarea>
-    {/if}
-    <div class="buttons">
-      <button type="button" onclick={ondismiss}>{cancel}</button>
-      {#if primary}
-        <button type="button" class={primary.style} onclick={() => primary?.action(draft)}>
-          {primary.label}
-        </button>
-      {/if}
-    </div>
-    {#if secondary}
       <div class="buttons">
-        <button type="button" class={secondary.style} onclick={() => secondary?.action(draft)}>
-          {secondary.label}
-        </button>
+        <button type="button" onclick={ondismiss}>{cancel}</button>
+        {#if submitLabel}
+          <button
+            class="primary"
+            type="button"
+            disabled={submitDisabled}
+            onclick={() => onsubmit?.(draft)}>{submitLabel}</button
+          >
+        {/if}
       </div>
+    {:else}
+      <div class="sheet-items">
+        {#each items as item (item.label)}
+          <button
+            type="button"
+            class={item.className}
+            class:primary={item.style === 'primary'}
+            class:danger={item.style === 'danger'}
+            onclick={() => item.action()}
+          >
+            <span>{item.label}</span>
+            {#if item.detail}
+              <span class="detail">{item.detail}</span>
+            {/if}
+          </button>
+        {/each}
+      </div>
+      {#if items.length === 0}
+        <div class="buttons">
+          <button type="button" onclick={ondismiss}>{cancel}</button>
+        </div>
+      {/if}
     {/if}
   </div>
 </div>

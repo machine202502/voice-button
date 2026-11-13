@@ -5,52 +5,41 @@
 @import './theme.css';
 
 /*
- * Shell for the phone page: one fixed-height column, one scrolling area.
- * The header and the composer never move; only .vb-main scrolls.  There is
- * no backdrop-filter and no transform on the header, which is what used to
- * make the old header flicker on a phone while the feed scrolled.
- */
-/*
- * Two modes, one palette.
+ * The phone page: one fixed-height column, one scrolling viewport, and the
+ * header and composer outside it. That separation is structural, not a visual
+ * promise: the scroll indicator is a child of the viewport, so it cannot reach
+ * the header or the composer.
  *
- * The dark values are the page as it ships; the light ones are fixed so the
- * phone, the desktop app and the promo site stay one product. `data-theme`
- * belongs to Skeleton and keeps naming the theme; the mode is the `dark` or
- * `light` class on <html>, which Tailwind's dark variant reads as well.
- *
- * No rule below this block may name a colour: every component reads these
- * tokens, so flipping the class flips the whole page without a reload.
+ * No rule below names a colour directly; every screen reads these tokens, so
+ * flipping `<html>` between `dark` and `light` flips the whole page.
  */
 :root {
   color-scheme: dark;
-  --bg: #111713;
-  --panel: #182019;
-  --panel-2: #1d271e;
-  --panel-sheet: #1b2419;
-  --composer: #121a14;
+  --bg: #0b100c;
+  --panel: #111713;
+  --panel-2: #182019;
+  --panel-3: #1d271e;
+  --panel-sheet: #141b15;
+  --composer: #182019;
   --ink: #f0f4e9;
   --muted: #8f9c8b;
+  --soft: #aebcac;
+  --dim: #6f7c6c;
   --line: rgba(224, 239, 211, 0.12);
-  /* The accent fills buttons and icons; its ink is the text-safe tone. */
   --accent: #c7f36b;
   --accent-ink: #c7f36b;
-  --on-accent: #17200f;
+  --on-accent: #141c0a;
   --amber: #ffbd62;
   --violet: #b9a2f0;
   --red: #ff8f8f;
   --success: #c7f36b;
   --info: #b9a2f0;
-  --soft: #aebcac;
-  --dim: #6f7c6c;
   --action-ink: #cfe0c6;
   --switch-off: #26332a;
-  --offline-accent: #e0a13a;
-  --rec-bar-bg: #241a2e;
-  --rec-bar-ink: #e8dcff;
   --swipe-archive-bg: #3a2433;
   --swipe-archive-ink: #ffb4b4;
   --swipe-unarchive-bg: #26361f;
-  --scrim: rgba(6, 10, 8, 0.66);
+  --scrim: rgba(8, 12, 9, 0.72);
   --shadow: rgba(0, 0, 0, 0.35);
   --radius: 16px;
 }
@@ -60,10 +49,13 @@ html.light {
   --bg: #f4f7ef;
   --panel: #ffffff;
   --panel-2: #eaf0e2;
+  --panel-3: #e0e8d8;
   --panel-sheet: #ffffff;
   --composer: #eaf0e2;
   --ink: #17200f;
   --muted: #5d6b57;
+  --soft: #46543f;
+  --dim: #7b8a73;
   --line: rgba(23, 32, 15, 0.12);
   --accent: #6a9422;
   --accent-ink: #4f7a12;
@@ -73,23 +65,15 @@ html.light {
   --red: #b3403f;
   --success: #337a40;
   --info: #2f6fb0;
-  --soft: #46543f;
-  --dim: #7b8a73;
   --action-ink: #33452c;
   --switch-off: #d7e0cf;
-  --offline-accent: #956310;
-  --rec-bar-bg: #efe7fb;
-  --rec-bar-ink: #3a2a55;
   --swipe-archive-bg: #f7e7e4;
   --swipe-archive-ink: #8c2f2b;
   --swipe-unarchive-bg: #e7f0da;
-  --scrim: rgba(23, 32, 15, 0.3);
+  --scrim: rgba(23, 32, 15, 0.32);
   --shadow: rgba(23, 32, 15, 0.18);
 
-  /* Skeleton's own tokens, so the kit's components follow the mode too. The
-     pairs theme.css already defines (the typography colour and the page
-     background) flip with `color-scheme`; these single values do not, so they
-     are restated here. */
+  /* Skeleton's own tokens, so the kit's components follow the mode too. */
   --color-surface-50: #17200f;
   --color-surface-100: #26331f;
   --color-surface-200: #3d4a35;
@@ -136,7 +120,8 @@ body {
 }
 
 button,
-select {
+select,
+textarea {
   font: inherit;
   color: inherit;
 }
@@ -148,7 +133,9 @@ button {
 }
 
 button:focus-visible,
-select:focus-visible {
+select:focus-visible,
+textarea:focus-visible,
+[role='button']:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
@@ -173,10 +160,8 @@ select:focus-visible {
 /* ---------- header ---------- */
 
 .vb-shell header {
-  position: sticky;
-  top: 0;
-  z-index: 5;
   display: flex;
+  flex: 0 0 auto;
   align-items: center;
   gap: 10px;
   min-height: 60px;
@@ -186,6 +171,7 @@ select:focus-visible {
 }
 
 .vb-shell header h1 {
+  flex: 1;
   min-width: 0;
   margin: 0;
   overflow: hidden;
@@ -193,12 +179,6 @@ select:focus-visible {
   font-weight: 650;
   letter-spacing: -0.01em;
   text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.vb-shell .sub {
-  font-size: 12px;
-  color: var(--muted);
   white-space: nowrap;
 }
 
@@ -210,117 +190,39 @@ select:focus-visible {
   height: 34px;
   border: 1px solid var(--line);
   border-radius: 10px;
+  background: var(--panel-2);
   color: var(--ink);
-}
-
-.vb-header-slot {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-left: auto;
+  font-size: 15px;
 }
 
 .vb-shell .version,
 .vb-version {
+  color: var(--muted);
   font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
   line-height: 1;
   letter-spacing: 0.02em;
-  color: var(--muted);
-  font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
 
 .vb-version {
-  font-size: 11px;
   color: var(--accent-ink);
+  font-size: 11px;
 }
 
 .vb-grow {
   flex: 1;
 }
 
-/* The recording continues when another tab is opened; this bar stays tied to
-   the shell, as it was on the old page. */
-.rec-bar {
+/* ---------- the one scrolling viewport ---------- */
+
+.vb-viewport {
+  position: relative;
   display: flex;
-  flex: 0 0 auto;
-  align-items: center;
-  gap: 8px;
-  width: 100%;
-  padding: 8px 14px;
-  border: 0;
-  border-bottom: 1px solid color-mix(in srgb, var(--accent) 18%, transparent);
-  background: var(--rec-bar-bg);
-  color: var(--rec-bar-ink);
-  font-size: 13px;
-  text-align: left;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-height: 0;
 }
-
-.rec-bar .dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--red);
-  animation: pulse 1.4s ease-in-out infinite;
-}
-
-.rec-bar .open {
-  margin-left: auto;
-  color: var(--accent-ink);
-  font-size: 12.5px;
-}
-
-@keyframes pulse {
-  0%,
-  100% {
-    opacity: 0.45;
-  }
-  50% {
-    opacity: 1;
-  }
-}
-
-/* ---------- tabs ---------- */
-
-.vb-tabs-wrap {
-  padding: 10px 16px 0;
-  background: var(--bg);
-}
-
-.vb-tabs-wrap .vb-tabs {
-  display: flex;
-  gap: 4px;
-  padding: 4px;
-  border: 1px solid var(--line);
-  border-radius: 14px;
-  background: var(--panel);
-}
-
-.vb-tabs-wrap .vb-tab {
-  flex: 1;
-  padding: 7px 10px;
-  border-radius: 10px;
-  color: var(--muted);
-  font-size: 13px;
-  font-weight: 550;
-  text-align: center;
-  transition:
-    background-color 0.15s,
-    color 0.15s;
-}
-
-.vb-tabs-wrap .vb-tab:hover {
-  color: var(--ink);
-}
-
-.vb-tabs-wrap .vb-tab[data-selected],
-.vb-tabs-wrap .vb-tab[data-state='active'] {
-  background: var(--accent);
-  color: var(--on-accent);
-  font-weight: 650;
-}
-
-/* ---------- scrolling content ---------- */
 
 .vb-main {
   flex: 1 1 auto;
@@ -329,9 +231,7 @@ select:focus-visible {
   overflow-y: auto;
   overscroll-behavior: contain;
   -webkit-overflow-scrolling: touch;
-  padding: 12px 16px 10px;
-  /* The bar is ours and floats above the content: the browser's would take
-     width away from the cards and change the layout when it appears. */
+  padding: 10px 14px 14px;
   scrollbar-width: none;
 }
 
@@ -340,29 +240,40 @@ select:focus-visible {
   height: 0;
 }
 
+/*
+ * The indicator is a sibling of #view inside .vb-viewport. Its absolute box is
+ * the viewport, never the shell, so it physically cannot cover the header above
+ * it or the composer below it. The native scrollbar is hidden, so the thumb is
+ * an overlay and the content width does not change when it appears.
+ */
 .vb-scroll-track {
   position: absolute;
-  top: 0;
-  right: 3px;
-  width: 14px;
-  z-index: 30;
-  touch-action: none;
+  top: 8px;
+  right: 2px;
+  bottom: 8px;
+  z-index: 5;
+  width: 10px;
+  pointer-events: none;
 }
 
 .vb-scroll-thumb {
   position: absolute;
-  right: 5px;
-  width: 4px;
+  right: 3px;
+  width: 3px;
   border-radius: 999px;
-  background: color-mix(in srgb, var(--color-accent, #c7f36b) 42%, transparent);
-  transition: background 140ms ease, width 140ms ease;
+  background: color-mix(in srgb, var(--accent) 38%, transparent);
+  pointer-events: auto;
+  touch-action: none;
   cursor: grab;
+  transition:
+    background 140ms ease,
+    width 140ms ease;
 }
 
 .vb-scroll-thumb:hover,
 .vb-scroll-thumb.dragging {
-  width: 6px;
-  background: color-mix(in srgb, var(--color-accent, #c7f36b) 72%, transparent);
+  width: 5px;
+  background: color-mix(in srgb, var(--accent) 72%, transparent);
 }
 
 .vb-screen {
@@ -378,70 +289,144 @@ select:focus-visible {
   letter-spacing: 0.02em;
 }
 
-/* ---------- monolog cards (same states as the current page) ---------- */
+.vb-archive-note {
+  padding: 2px 2px 2px;
+  text-align: left;
+}
+
+.empty {
+  padding: 32px 10px;
+  color: var(--muted);
+  font-size: 14px;
+  text-align: center;
+}
+
+/* ---------- list cards ---------- */
+
+.swipe-row {
+  position: relative;
+  touch-action: pan-y;
+}
+
+.swipe-action {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  padding: 0 20px;
+  border-radius: var(--radius);
+  background: var(--swipe-archive-bg);
+  color: var(--swipe-archive-ink);
+  font-size: 13px;
+  font-weight: 600;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.swipe-action.out {
+  background: var(--swipe-unarchive-bg);
+  color: var(--accent-ink);
+}
+
+.swipe-row.dragging .swipe-action {
+  opacity: 1;
+}
 
 .monolog-card {
+  position: relative;
   width: 100%;
-  padding: 14px 16px;
+  padding: 12px 14px;
   border: 1px solid var(--line);
-  border-radius: 18px;
+  border-radius: var(--radius);
   background: var(--panel);
   color: var(--ink);
   text-align: left;
   cursor: pointer;
+  will-change: transform;
 }
 
 .monolog-card.active {
-  border-color: color-mix(in srgb, var(--accent) 85%, transparent);
-  box-shadow:
-    0 0 0 2px color-mix(in srgb, var(--accent) 30%, transparent),
-    0 0 22px color-mix(in srgb, var(--accent) 14%, transparent);
-  animation: card-working 2.4s ease-in-out infinite;
+  border-color: color-mix(in srgb, var(--accent) 58%, transparent);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 24%, transparent);
 }
 
 .monolog-card.unsent {
-  border-color: color-mix(in srgb, var(--amber) 85%, transparent);
-  box-shadow:
-    0 0 0 2px color-mix(in srgb, var(--amber) 26%, transparent),
-    0 0 20px color-mix(in srgb, var(--amber) 10%, transparent);
-  animation: none;
+  border-color: color-mix(in srgb, var(--amber) 55%, transparent);
 }
 
-.monolog-card.active strong::after {
-  content: ' ●';
-  color: var(--accent-ink);
-  font-size: 10px;
-  vertical-align: middle;
+.monolog-card.selected {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 55%, transparent);
 }
 
-.monolog-card.unsent strong::after {
-  content: ' ●';
-  color: var(--amber);
-  font-size: 10px;
-  vertical-align: middle;
+.swipe-row.dragging .monolog-card {
+  transition: none;
 }
 
-.monolog-card .top {
+.swipe-row.leaving .monolog-card {
+  opacity: 0;
+  transition:
+    transform 0.19s ease-out,
+    opacity 0.19s ease-out;
+}
+
+.monolog-card .name-row {
   display: flex;
-  align-items: baseline;
+  align-items: center;
   gap: 8px;
+  min-height: 22px;
 }
 
-.monolog-card strong {
-  font-size: 16.5px;
+.monolog-card .name-row strong {
+  min-width: 0;
+  overflow: hidden;
+  font-size: 15px;
   font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.monolog-card .when {
+.monolog-card .dot {
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+.monolog-card .dot.amber {
+  background: var(--amber);
+}
+
+.monolog-card .check {
+  display: grid;
+  flex: 0 0 auto;
+  place-items: center;
+  width: 20px;
+  height: 20px;
   margin-left: auto;
-  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  color: var(--on-accent);
   font-size: 12px;
 }
 
-.monolog-card .last {
+.monolog-card.selected .check {
+  border-color: var(--accent);
+  background: var(--accent);
+}
+
+.monolog-card .meta {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.monolog-card .preview {
   display: -webkit-box;
   min-height: 2.9em;
-  margin-top: 5px;
+  margin: 4px 0 0;
   overflow: hidden;
   color: var(--soft);
   font-size: 13px;
@@ -449,70 +434,368 @@ select:focus-visible {
   -webkit-line-clamp: 2;
 }
 
-.monolog-card .count {
-  margin-top: 2px;
-  color: var(--dim);
-  font-size: 11.5px;
+.monolog-card .chip {
+  margin-top: 8px;
 }
 
-.new-monolog {
-  margin-top: 4px;
-  padding: 14px;
-  border: 1px dashed color-mix(in srgb, var(--accent) 45%, transparent);
-  border-radius: 16px;
-  color: var(--accent-ink);
-  font-size: 15px;
-  text-align: center;
-}
-
-.day {
-  margin: 8px 0 2px;
-  color: var(--muted);
-  font-size: 12px;
-  text-align: center;
-}
-
-.message {
-  padding: 12px 14px;
+.monolog-card .restore {
+  margin-top: 9px;
+  padding: 7px 12px;
   border: 1px solid var(--line);
-  border-radius: var(--radius);
-  background: var(--panel);
+  border-radius: 10px;
+  background: var(--panel-2);
+  color: var(--ink);
+  font-size: 12.5px;
 }
 
-.message .time {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  color: var(--muted);
-  font-size: 11.5px;
-}
-
-.message .text {
-  margin-top: 6px;
-  font-size: 15px;
-  overflow-wrap: anywhere;
-  white-space: pre-wrap;
-}
-
-.message .actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin-top: 10px;
-}
+/* ---------- chips ---------- */
 
 .chip {
+  display: inline-block;
   padding: 2px 8px;
-  border: 1px solid;
+  border: 1px solid var(--line);
   border-radius: 999px;
-  font-size: 10.5px;
+  color: var(--muted);
+  font-size: 11.5px;
   white-space: nowrap;
+}
+
+.chip.lime {
+  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+  color: var(--accent-ink);
+}
+
+.chip.amber,
+.chip.busy {
+  border-color: color-mix(in srgb, var(--amber) 40%, transparent);
+  color: var(--amber);
 }
 
 .chip.unsent {
   border-color: color-mix(in srgb, var(--amber) 45%, transparent);
   background: color-mix(in srgb, var(--amber) 8%, transparent);
   color: var(--amber);
+}
+
+.chip.red,
+.chip.failed {
+  border-color: color-mix(in srgb, var(--red) 40%, transparent);
+  color: var(--red);
+}
+
+.chip.live {
+  border-color: color-mix(in srgb, var(--violet) 45%, transparent);
+  color: var(--violet);
+}
+
+.chip.edited {
+  border-color: var(--line);
+  color: var(--muted);
+}
+
+.chip.edited-waiting {
+  border-color: color-mix(in srgb, var(--amber) 40%, transparent);
+  color: var(--amber);
+}
+
+/* ---------- the message feed ---------- */
+
+.vb-feed {
+  gap: 0;
+}
+
+.day {
+  margin: 14px 2px 8px;
+  color: var(--muted);
+  font-size: 11.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.day:first-child {
+  margin-top: 2px;
+}
+
+.message {
+  margin-bottom: 10px;
+  padding: 11px 13px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--panel);
+  cursor: pointer;
+}
+
+.message.live {
+  border-color: color-mix(in srgb, var(--violet) 35%, transparent);
+}
+
+.message.failed {
+  border-color: color-mix(in srgb, var(--red) 42%, transparent);
+}
+
+.message.unsent {
+  border-color: color-mix(in srgb, var(--amber) 45%, transparent);
+}
+
+.message .time {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 18px;
+  color: var(--muted);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* A status is a word on the time line, not a badge over the message. */
+.message .time .chip {
+  padding: 0;
+  border: 0;
+  background: none;
+  font-size: 11.5px;
+}
+
+.message .time .chip.status.amber {
+  color: var(--amber);
+}
+
+.message .time .chip.red {
+  color: var(--red);
+}
+
+.message .time .chip.edited {
+  color: var(--muted);
+}
+
+.message .time .chip.edited-waiting {
+  color: var(--amber);
+}
+
+.message .copy {
+  margin-left: auto;
+  padding: 0 0 0 8px;
+  color: var(--accent-ink);
+  font-size: 12px;
+}
+
+.message .text {
+  margin-top: 4px;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.message .text.empty {
+  margin-top: 5px;
+  padding: 0;
+  color: var(--muted);
+  font-size: 13px;
+  text-align: left;
+}
+
+.message .more {
+  margin-top: 6px;
+  padding: 0;
+  color: var(--accent-ink);
+  font-size: 12.5px;
+}
+
+.message .actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.message .actions button {
+  padding: 6px 11px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--panel-2);
+  color: var(--ink);
+  font-size: 12px;
+}
+
+.message .actions button.danger {
+  padding-inline: 0;
+  border: 0;
+  background: none;
+  color: var(--red);
+}
+
+.message .actions button:focus-visible {
+  outline-color: var(--accent);
+}
+
+/* ---------- composer ---------- */
+
+.vb-composer {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 12px;
+  min-height: 82px;
+  padding: 10px 14px calc(16px + env(safe-area-inset-bottom));
+  border-top: 1px solid var(--line);
+  background: var(--composer);
+  overflow: hidden;
+}
+
+.vb-record-wrap {
+  position: relative;
+  display: grid;
+  flex: 0 0 auto;
+  place-items: center;
+}
+
+.vb-record-rings {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: var(--rings-side, 180px);
+  height: var(--rings-side, 180px);
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 180ms ease;
+  z-index: 0;
+}
+
+.vb-record-rings.live {
+  opacity: 1;
+}
+
+.vb-record-button {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  place-items: center;
+  width: 54px;
+  height: 54px;
+  border-radius: 50%;
+  background: var(--accent);
+  color: var(--on-accent);
+}
+
+.vb-record-button.recording,
+.vb-record-button.offline {
+  background: var(--accent);
+  color: var(--on-accent);
+}
+
+.vb-record-button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.vb-composer-hint {
+  color: var(--muted);
+  font-size: 12.5px;
+}
+
+.vb-composer-hint b {
+  display: block;
+  color: var(--ink);
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.vb-composer-timer {
+  margin-left: auto;
+  color: var(--red);
+  font-size: 15px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------- multi-select toolbar ---------- */
+
+.vb-select-bar {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  border-top: 1px solid var(--line);
+  background: var(--panel-2);
+}
+
+.vb-select-count {
+  color: var(--muted);
+  font-size: 12.5px;
+}
+
+.vb-select-action,
+.vb-select-cancel {
+  margin-left: auto;
+  padding: 7px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  font-size: 13px;
+}
+
+.vb-select-action {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--on-accent);
+  font-weight: 600;
+}
+
+.vb-select-action:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.vb-select-cancel {
+  margin-left: 0;
+  color: var(--muted);
+}
+
+/* ---------- notes, footer and install ---------- */
+
+.notes {
+  display: flex;
+  flex: 0 0 auto;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px 16px;
+}
+
+.notes:empty {
+  display: none;
+}
+
+.banner {
+  margin: 0;
+  padding: 10px 14px;
+  border: 1px solid color-mix(in srgb, var(--amber) 40%, transparent);
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--amber) 8%, transparent);
+  color: var(--amber);
+  font-size: 13px;
+}
+
+.banner b {
+  color: var(--amber);
+}
+
+footer.about {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 16px;
+  border-top: 1px solid var(--line);
+  background: var(--bg);
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.footer-link {
+  padding: 6px 2px;
+  color: var(--accent-ink);
+  font-size: 13.5px;
+  text-decoration: none;
 }
 
 .action {
@@ -523,83 +806,134 @@ select:focus-visible {
   font-size: 12px;
 }
 
-.action.danger {
-  border-color: color-mix(in srgb, var(--red) 30%, transparent);
+#install {
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  color: var(--accent-ink);
+}
+
+/* ---------- bottom sheets ---------- */
+
+.sheet-backdrop {
+  position: fixed;
+  inset: 0 0 var(--keyboard, 0px) 0;
+  z-index: 30;
+  display: flex;
+  align-items: flex-end;
+  background: var(--scrim);
+}
+
+.sheet {
+  width: 100%;
+  max-width: 560px;
+  max-height: 100%;
+  margin: 0 auto;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 16px 16px calc(22px + env(safe-area-inset-bottom));
+  border-top: 1px solid var(--line);
+  border-radius: 18px 18px 0 0;
+  background: var(--panel-sheet);
+}
+
+.sheet h2 {
+  margin: 0 0 10px;
+  font-size: 16px;
+  font-weight: 650;
+}
+
+.sheet .hint {
+  margin: -4px 0 10px;
+  color: var(--muted);
+  font-size: 12.5px;
+}
+
+.sheet-items {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.sheet-items button {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--panel-2);
+  color: var(--ink);
+  font-size: 14px;
+  text-align: left;
+}
+
+.sheet-items button.primary {
+  border-color: var(--accent);
+  color: var(--accent-ink);
+}
+
+.sheet-items button.danger {
   color: var(--red);
 }
 
-@keyframes card-working {
-  0%,
-  100% {
-    box-shadow:
-      0 0 0 2px color-mix(in srgb, var(--accent) 26%, transparent),
-      0 0 16px color-mix(in srgb, var(--accent) 10%, transparent);
-  }
-  50% {
-    box-shadow:
-      0 0 0 2px color-mix(in srgb, var(--accent) 58%, transparent),
-      0 0 26px color-mix(in srgb, var(--accent) 22%, transparent);
-  }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .monolog-card.active {
-    animation: none;
-  }
-}
-
-/* ---------- record screen ---------- */
-
-.vb-record-stage {
-  display: flex;
-  flex: 1;
-  flex-direction: column;
-  gap: 14px;
-  align-items: center;
-  justify-content: center;
-  min-height: 46vh;
-  padding: 24px 0;
-}
-
-.vb-record-big {
-  position: relative;
-  z-index: 1;
-  display: grid;
-  place-items: center;
-  width: 96px;
-  height: 96px;
-  border-radius: 50%;
-  background: var(--accent);
-  color: var(--on-accent);
-  transition:
-    background-color 0.15s,
-    box-shadow 0.15s,
-    transform 0.15s;
-}
-
-/* Same rule as the small button: the colour never changes with the state. */
-.vb-record-big.recording {
-  background: var(--accent);
-  color: var(--on-accent);
-}
-
-.vb-record-big:active {
-  transform: scale(0.97);
-}
-
-.vb-timer {
-  color: var(--ink);
-  font-size: 28px;
-  font-weight: 600;
-  letter-spacing: 0.02em;
+.sheet-items button .detail {
+  color: var(--muted);
   font-variant-numeric: tabular-nums;
 }
 
-.vb-record-hint {
-  margin: 0;
-  color: var(--muted);
-  font-size: 13px;
+.sheet-items button.new-monolog {
+  color: var(--accent-ink);
+}
+
+.sheet textarea {
+  width: 100%;
+  min-height: 132px;
+  margin-top: 2px;
+  padding: 12px;
+  border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
+  border-radius: 14px;
+  background: var(--bg);
+  color: var(--ink);
+  resize: vertical;
+}
+
+.sheet textarea.name {
+  height: 46px;
+  min-height: 0;
+  padding-top: 12px;
+  padding-bottom: 12px;
+  overflow: hidden;
+  resize: none;
+  white-space: pre-wrap;
+}
+
+.sheet .buttons {
+  display: flex;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.sheet .buttons button {
+  flex: 1;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  color: var(--action-ink);
   text-align: center;
+}
+
+.sheet .buttons .primary {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--on-accent);
+  font-weight: 600;
+}
+
+.sheet .buttons .primary:disabled {
+  opacity: 0.4;
+  cursor: default;
 }
 
 /* ---------- settings ---------- */
@@ -676,22 +1010,6 @@ select:focus-visible {
   transform: translateX(18px);
 }
 
-.vb-field {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  padding: 14px 16px;
-  border: 1px solid var(--line);
-  border-radius: 18px;
-  background: var(--panel);
-}
-
-.vb-field-label {
-  color: var(--ink);
-  font-size: 14px;
-  font-weight: 600;
-}
-
 .vb-select {
   width: 100%;
   padding: 10px 12px;
@@ -700,410 +1018,6 @@ select:focus-visible {
   background: var(--bg);
   color: var(--ink);
 }
-
-/* ---------- composer ---------- */
-
-.vb-composer {
-  display: flex;
-  flex: 0 0 auto;
-  align-items: center;
-  gap: 12px;
-  min-height: 88px;
-  padding: 12px 16px calc(16px + env(safe-area-inset-bottom));
-  border-top: 1px solid var(--line);
-  background: var(--composer);
-  /* The halo around the button is clipped by the bar instead of spilling over
-     the footer and the last message: inside a fixed-height bar that reads as a
-     deliberate edge, outside it looks like a rendering mistake. */
-  overflow: hidden;
-}
-
-/* The halo around the record button: a canvas behind it, never in the layout. */
-.vb-record-wrap {
-  position: relative;
-  display: grid;
-  flex: 0 0 auto;
-  place-items: center;
-}
-
-.vb-record-rings {
-  position: absolute;
-  left: 50%;
-  top: 50%;
-  width: var(--rings-side, 180px);
-  height: var(--rings-side, 180px);
-  transform: translate(-50%, -50%);
-  pointer-events: none;
-  opacity: 0;
-  transition: opacity 180ms ease;
-  z-index: 0;
-}
-
-.vb-record-rings.live {
-  opacity: 1;
-}
-
-.vb-record-button {
-  position: relative;
-  z-index: 1;
-  display: grid;
-  flex: 0 0 auto;
-  place-items: center;
-  width: 56px;
-  height: 56px;
-  border-radius: 50%;
-  background: var(--accent);
-  color: var(--on-accent);
-  transition: background-color 0.15s;
-}
-
-/* The record button keeps its colour while working. The red was a second signal
-   next to the halo, and it fought with it: the rings around the button are lime,
-   so the button stays lime and the state is told by the hint, the timer and the
-   halo itself. */
-.vb-record-button.recording {
-  background: var(--accent);
-  color: var(--on-accent);
-}
-
-.vb-composer-hint {
-  color: var(--muted);
-  font-size: 12.5px;
-}
-
-.vb-composer-hint b {
-  display: block;
-  color: var(--ink);
-  font-size: 14.5px;
-  font-weight: 600;
-}
-
-.vb-composer-timer {
-  margin-left: auto;
-  color: var(--red);
-  font-size: 15px;
-  font-variant-numeric: tabular-nums;
-}
-
-/* ---------- notes, footer and the install row ---------- */
-
-.notes {
-  display: flex;
-  flex: 0 0 auto;
-  flex-direction: column;
-  gap: 8px;
-  padding: 8px 16px;
-}
-
-.notes:empty {
-  display: none;
-}
-
-.banner {
-  margin: 0;
-  padding: 10px 14px;
-  border: 1px solid color-mix(in srgb, var(--amber) 40%, transparent);
-  border-radius: 14px;
-  background: color-mix(in srgb, var(--amber) 8%, transparent);
-  color: var(--amber);
-  font-size: 13px;
-}
-
-.banner b {
-  color: var(--amber);
-}
-
-footer.about {
-  display: flex;
-  flex: 0 0 auto;
-  align-items: center;
-  gap: 10px;
-  padding: 10px 16px;
-  border-top: 1px solid var(--line);
-  background: var(--bg);
-  color: var(--muted);
-  font-size: 12px;
-}
-
-.footer-link {
-  padding: 6px 2px;
-  color: var(--accent-ink);
-  font-size: 13.5px;
-  text-decoration: none;
-}
-
-#install {
-  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
-  background: color-mix(in srgb, var(--accent) 10%, transparent);
-  color: var(--accent-ink);
-}
-
-/* ---------- placeholder sheet ---------- */
-
-.sheet-backdrop {
-  position: fixed;
-  inset: 0 0 var(--keyboard, 0px) 0;
-  z-index: 20;
-  display: flex;
-  align-items: flex-end;
-  background: var(--scrim);
-}
-
-.sheet {
-  width: 100%;
-  max-width: 560px;
-  max-height: 100%;
-  margin: 0 auto;
-  overflow-y: auto;
-  overscroll-behavior: contain;
-  padding: 18px 18px calc(20px + env(safe-area-inset-bottom));
-  border-top: 1px solid var(--line);
-  border-radius: 22px 22px 0 0;
-  background: var(--panel-sheet);
-}
-
-.sheet h2 {
-  margin: 0;
-  font-size: 18px;
-  font-weight: 650;
-}
-
-.sheet .hint {
-  margin-top: 4px;
-  color: var(--muted);
-  font-size: 12.5px;
-}
-
-.sheet textarea,
-.sheet input[type='text'] {
-  width: 100%;
-  margin-top: 12px;
-  padding: 12px;
-  border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
-  border-radius: 14px;
-  background: var(--bg);
-  color: var(--ink);
-  font: inherit;
-  resize: vertical;
-}
-
-.sheet textarea {
-  min-height: 132px;
-}
-
-.sheet input[type='text'] {
-  min-height: 0;
-}
-
-.sheet .buttons {
-  display: flex;
-  gap: 10px;
-  margin-top: 14px;
-}
-
-.sheet .buttons button {
-  flex: 1;
-  padding: 12px;
-  border: 1px solid var(--line);
-  border-radius: 12px;
-  color: var(--action-ink);
-  text-align: center;
-}
-
-.sheet .buttons .primary {
-  border-color: var(--accent);
-  background: var(--accent);
-  color: var(--on-accent);
-  font-weight: 600;
-}
-
-/* ---------- the rest of the live page's look ---------- */
-
-/* Nothing here is new design: these are the states the old page painted, kept
-   so the rewrite cannot quietly lose one. */
-
-.empty {
-  padding: 32px 10px;
-  color: var(--muted);
-  font-size: 14px;
-  text-align: center;
-}
-
-.monolog-card .top .chip {
-  align-self: center;
-}
-
-.message.live {
-  border-color: color-mix(in srgb, var(--violet) 40%, transparent);
-}
-
-.message.failed {
-  border-color: color-mix(in srgb, var(--red) 35%, transparent);
-}
-
-.message.unsent {
-  border-color: color-mix(in srgb, var(--amber) 40%, transparent);
-}
-
-.message .text.empty {
-  color: var(--dim);
-}
-
-.message .more {
-  margin-top: 4px;
-  padding: 0;
-  border: 0;
-  background: none;
-  color: var(--accent-ink);
-  font-size: 12.5px;
-}
-
-.chip.live {
-  border-color: color-mix(in srgb, var(--violet) 45%, transparent);
-  background: color-mix(in srgb, var(--violet) 10%, transparent);
-  color: var(--violet);
-}
-
-.chip.busy {
-  border-color: color-mix(in srgb, var(--amber) 45%, transparent);
-  background: color-mix(in srgb, var(--amber) 8%, transparent);
-  color: var(--amber);
-}
-
-.chip.failed {
-  border-color: color-mix(in srgb, var(--red) 40%, transparent);
-  background: color-mix(in srgb, var(--red) 8%, transparent);
-  color: var(--red);
-}
-
-.chip.edited {
-  border-color: var(--line);
-  color: var(--muted);
-}
-
-/* A card pulled aside: the row holds the action underneath, the card moves. */
-.swipe-row {
-  position: relative;
-  /* No clipping here: the card keeps its own shadow and its exact size. */
-  touch-action: pan-y;
-}
-
-.swipe-action {
-  position: absolute;
-  inset: 0;
-  display: flex;
-  align-items: center;
-  padding: 0 20px;
-  border-radius: 18px;
-  background: var(--swipe-archive-bg);
-  color: var(--swipe-archive-ink);
-  font-size: 13px;
-  font-weight: 600;
-  opacity: 0;
-  pointer-events: none;
-}
-
-.swipe-action.out {
-  background: var(--swipe-unarchive-bg);
-  color: var(--accent-ink);
-}
-
-.swipe-row.dragging .swipe-action {
-  opacity: 1;
-}
-
-.swipe-row .monolog-card {
-  position: relative;
-  width: 100%;
-  will-change: transform;
-}
-
-.swipe-row.dragging .monolog-card {
-  transition: none;
-}
-
-.swipe-row.leaving .monolog-card {
-  opacity: 0;
-  transition:
-    transform 0.19s ease-out,
-    opacity 0.19s ease-out;
-}
-
-.vb-record-button.offline,
-.vb-record-big.offline {
-  background: var(--accent);
-  color: var(--on-accent);
-}
-
-.vb-record-button:disabled,
-.vb-record-big:disabled {
-  opacity: 0.45;
-  cursor: default;
-}
-
-.vb-record-name {
-  color: var(--ink);
-  font-size: 14px;
-}
-
-/* The way back to the newest message while reading older ones. */
-.jump-newest {
-  position: sticky;
-  bottom: 4px;
-  align-self: flex-end;
-  width: 38px;
-  height: 38px;
-  margin-top: -46px;
-  border: 1px solid color-mix(in srgb, var(--accent) 50%, transparent);
-  border-radius: 50%;
-  background: var(--panel-2);
-  color: var(--accent-ink);
-  font-size: 17px;
-  line-height: 1;
-  box-shadow: 0 6px 18px var(--shadow);
-}
-
-.sheet textarea.name {
-  height: 46px;
-  min-height: 0;
-  padding-top: 12px;
-  padding-bottom: 12px;
-  overflow: hidden;
-  resize: none;
-  white-space: pre-wrap;
-}
-
-/* ---------- pairing screen ---------- */
-
-.vb-pair {
-  display: flex;
-  flex-direction: column;
-  height: 100dvh;
-  max-width: 560px;
-  margin: 0 auto;
-  padding: 0 16px;
-}
-
-.vb-pair-header {
-  display: flex;
-  justify-content: flex-end;
-  padding: max(14px, env(safe-area-inset-top)) 0 6px;
-}
-
-.vb-pair main {
-  display: flex;
-  flex: 1;
-  flex-direction: column;
-  justify-content: center;
-  gap: 8px;
-}
-
-.vb-pair code {
-  color: var(--muted);
-  font-size: 12.5px;
-}
-
-/* ---------- settings ---------- */
 
 .vb-setting-row {
   display: flex;
@@ -1168,11 +1082,128 @@ a.vb-setting-row {
   color: var(--muted);
   font-size: 12px;
 }
+
+/* ---------- full-screen editor ---------- */
+
+.vb-edit {
+  display: flex;
+  flex-direction: column;
+  height: 100dvh;
+  max-width: 560px;
+  margin: 0 auto;
+  background: var(--bg);
+}
+
+.vb-edit header {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 10px;
+  min-height: 60px;
+  padding: max(14px, env(safe-area-inset-top)) 12px 12px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg);
+}
+
+.vb-edit header h1 {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  font-size: 17px;
+  font-weight: 650;
+  text-align: center;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.vb-edit-cancel,
+.vb-edit-save {
+  flex: 0 0 auto;
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  color: var(--ink);
+  font-size: 13px;
+}
+
+.vb-edit-save {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--on-accent);
+  font-weight: 600;
+}
+
+.vb-edit-save:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.vb-edit-main {
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+  flex-direction: column;
+  gap: 10px;
+  overflow-y: auto;
+  padding: 12px 14px calc(18px + env(safe-area-inset-bottom));
+}
+
+.vb-edit-field {
+  width: 100%;
+  min-height: 210px;
+  flex: 1 1 auto;
+  padding: 12px 13px;
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
+  border-radius: 14px;
+  background: var(--panel);
+  color: var(--ink);
+  font-size: 14px;
+  line-height: 1.5;
+  resize: none;
+}
+
+.vb-edit-note {
+  margin: 0 2px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/* ---------- pairing screen ---------- */
+
+.vb-pair {
+  display: flex;
+  flex-direction: column;
+  height: 100dvh;
+  max-width: 560px;
+  margin: 0 auto;
+  padding: 0 16px;
+}
+
+.vb-pair-header {
+  display: flex;
+  justify-content: flex-end;
+  padding: max(14px, env(safe-area-inset-top)) 0 6px;
+}
+
+.vb-pair main {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  justify-content: center;
+  gap: 8px;
+}
+
+.vb-pair code {
+  color: var(--muted);
+  font-size: 12.5px;
+}
+
 /* ---------- kit focus ring and the mono chip ---------- */
 
-/* Skeleton paints the switch's focus ring on its root, in a token that does not
-   exist (`--color-surface-950-50`), so it fell back to the ink and drew a loud
-   box around the whole row. The ring stays, on the control, in the accent. */
+/* Skeleton paints the switch's focus ring on its root in a token that does not
+   exist, so it falls back to the ink and draws a loud box around the row. The
+   ring stays, on the control, in the accent. */
 .vb-panel [data-scope='switch'][data-part='root'] {
   outline: none;
 }
@@ -1182,12 +1213,16 @@ a.vb-setting-row {
   outline-offset: 2px;
 }
 
-/* An address or a version is a value, not a code sample: the browser's default
-   `code` box does not belong to this palette. */
 .vb-mono {
-  background: var(--panel-2);
-  border-radius: 8px;
   padding: 2px 8px;
+  border-radius: 8px;
+  background: var(--panel-2);
   color: var(--muted);
   font-size: 12.5px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .swipe-row.leaving .monolog-card {
+    transition: none;
+  }
 }

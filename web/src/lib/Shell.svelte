@@ -1,39 +1,31 @@
 <script lang="ts">
-  import ScrollThumb from './ScrollThumb.svelte';
-
-  // The frame every screen lives in: the header, the recording bar, the one
-  // scrolling container, the notes, the footer and the composer.
+  // The frame every screen lives in: the header, the one scrolling viewport,
+  // the scroll indicator clipped to that viewport, the notes, the install
+  // footer and the monolog composer.
   //
   // The header follows the state, not the screen's props: which controls exist
-  // is a property of where the person is (a monolog open? the archive?), and
-  // putting that decision in one place is what keeps the arrow, the menu and
-  // the archive button from disagreeing with each other.
+  // is a property of where the person is, and putting that decision in one
+  // place keeps the arrow, the menu and the title from disagreeing.
 
   import type { Snippet } from 'svelte';
   import { page } from '../state.svelte';
-  import { formatDuration } from './time';
+  import Composer from './Composer.svelte';
+  import ScrollThumb from './ScrollThumb.svelte';
 
   interface Props {
     title: string;
-    /** Back leaves the monolog by walking the browser's own history. */
-    onback: () => void;
-    /** The composer belongs to the monolog tab; the others have their own. */
-    composerVisible?: boolean;
-    tabs?: Snippet;
     children: Snippet;
-    composer?: Snippet;
   }
+
+  let { title, children }: Props = $props();
 
   let scroller = $state<HTMLElement | null>(null);
 
-  let { title, onback, composerVisible = true, tabs, children, composer }: Props = $props();
-
   const inFeed = $derived(page.screen === 'feed' && page.monolog !== null);
-  const showComposer = $derived(inFeed && !page.archived && composerVisible);
-  const recording = $derived(page.recording);
-  const barVisible = $derived(
-    recording !== null && (page.monolog === null || page.monolog.id !== recording.monologId),
-  );
+  const showBack = $derived(inFeed || page.archived || page.screen === 'settings');
+  const showMenu = $derived(!page.selection && (inFeed || page.screen === 'list'));
+  const showComposer = $derived(inFeed && !page.archived);
+  const selectedCount = $derived(page.selected.length);
 </script>
 
 <div class="vb-shell">
@@ -43,8 +35,8 @@
       id="back"
       type="button"
       aria-label={page.tr('back')}
-      hidden={!inFeed}
-      onclick={onback}>←</button
+      hidden={!showBack}
+      onclick={() => page.back()}>←</button
     >
     <h1 id="title">{title}</h1>
     <span class="vb-grow"></span>
@@ -53,46 +45,37 @@
     >
     <button
       class="icon-button"
-      id="archive"
-      type="button"
-      aria-label={page.tr('archive')}
-      hidden={page.archived || inFeed}
-      onclick={() => page.openArchive()}>⌸</button
-    >
-    <button
-      class="icon-button"
       id="menu"
       type="button"
-      aria-label={page.tr('monolog')}
-      hidden={!inFeed}
-      onclick={() => page.openMenu()}>⋯</button
+      aria-label={page.tr('more')}
+      hidden={!showMenu}
+      onclick={() => page.openHeaderMenu()}>⋯</button
     >
   </header>
 
-  <!-- The recording is not lost when the monolog is left: this bar follows it
-       to every screen and brings the person back. -->
-  <button
-    class="rec-bar"
-    id="rec-bar"
-    type="button"
-    hidden={!barVisible}
-    onclick={() => page.openRecordingMonolog()}
-  >
-    <span class="dot"></span>
-    <span id="rec-bar-text"
-      >{page.tr('recording')}{recording ? ' · ' + formatDuration(page.elapsed) : ''}</span
-    >
-    <span class="open">{page.tr('open')}</span>
-  </button>
+  <div class="vb-viewport">
+    <main id="view" class="vb-main" bind:this={scroller} onscroll={() => page.handleScroll()}>
+      {@render children()}
+    </main>
+    <ScrollThumb target={scroller} />
+  </div>
 
-  {#if tabs}
-    {@render tabs()}
+  {#if page.selection}
+    <div class="vb-select-bar" role="toolbar" aria-label={page.tr('select_several')}>
+      <span class="vb-select-count">{selectedCount} {page.tr('selected')}</span>
+      <button
+        class="vb-select-action"
+        type="button"
+        disabled={selectedCount === 0}
+        onclick={() => void page.archiveSelection()}
+      >
+        {page.tr(page.archived ? 'restore' : 'to_archive')}
+      </button>
+      <button class="vb-select-cancel" type="button" onclick={() => page.cancelSelection()}>
+        {page.tr('cancel')}
+      </button>
+    </div>
   {/if}
-
-  <main id="view" class="vb-main" bind:this={scroller} onscroll={() => page.handleScroll()}>
-    {@render children()}
-  </main>
-  <ScrollThumb target={scroller} />
 
   <!-- Transient messages live in the flow, above the footer: a fixed toast used
        to land on top of the install button on a phone. -->
@@ -113,8 +96,8 @@
   </footer>
 
   <div id="composer" class="vb-composer" hidden={!showComposer}>
-    {#if composer}
-      {@render composer()}
+    {#if showComposer}
+      <Composer />
     {/if}
   </div>
 </div>

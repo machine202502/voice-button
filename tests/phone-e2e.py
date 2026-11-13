@@ -91,6 +91,82 @@ def wait_for(predicate, timeout=30.0, interval=0.25, what="condition"):
     raise TimeoutError(f"timed out waiting for {what}")
 
 
+def sheet_labels(browser):
+    """The words on the open sheet's buttons, without the small detail spans."""
+    return browser.evaluate(
+        "Array.from(document.querySelectorAll('.sheet button'))"
+        ".map((button) => { const first = button.querySelector('span');"
+        " return (first ? first.textContent : button.textContent).trim(); })"
+    )
+
+
+def sheet_click(browser, label):
+    """Press the sheet button that carries `label`; False when there is none."""
+    wanted = json.dumps(label, ensure_ascii=False)
+    return browser.evaluate(
+        "(() => { const wanted = " + wanted + ";"
+        " const button = Array.from(document.querySelectorAll('.sheet button'))"
+        ".find((item) => { const first = item.querySelector('span');"
+        " const text = (first ? first.textContent : item.textContent).trim();"
+        " return text === wanted; });"
+        " if (!button) return false; button.click(); return true; })()"
+    )
+
+
+def sheet_title(browser):
+    return browser.evaluate(
+        "(() => { const heading = document.querySelector('.sheet #sheet-title');"
+        " return heading ? heading.textContent.trim() : ''; })()"
+    )
+
+
+def wait_sheet(browser, title=None, timeout=10):
+    """Wait for the sheet to be there, and for its heading when one is named."""
+    if title is None:
+        return wait_for(
+            lambda: browser.evaluate("!!document.querySelector('.sheet')"),
+            timeout=timeout,
+            what="the sheet",
+        )
+    wanted = json.dumps(title, ensure_ascii=False)
+    return wait_for(
+        lambda: browser.evaluate(
+            "(() => { const heading = document.querySelector('.sheet #sheet-title');"
+            " return !!heading && heading.textContent.trim() === " + wanted + "; })()"
+        ),
+        timeout=timeout,
+        what=f"the sheet «{title}»",
+    )
+
+
+def swipe_card(browser, dx=110):
+    """Pull the only monolog card sideways with the pointer events it listens to.
+
+    The card only archives or unarchives a clear horizontal gesture: more than
+    72 px of travel, and clearly more sideways than up or down. A synthetic
+    touch is enough; `setPointerCapture` on it throws and the card catches that.
+    """
+    step = dx / 6.0
+    return browser.evaluate(
+        "(() => { const card = document.querySelector('.monolog-card');"
+        " if (!card) return 'no card';"
+        " const box = card.getBoundingClientRect();"
+        " const x = box.left + box.width / 2;"
+        " const y = box.top + Math.min(box.height / 2, 30);"
+        " const fire = (type, at, buttons) => card.dispatchEvent(new PointerEvent(type, {"
+        "   bubbles: true, cancelable: true, composed: true, pointerId: 7,"
+        "   pointerType: 'touch', isPrimary: true, button: 0, buttons,"
+        "   clientX: at, clientY: y }));"
+        " fire('pointerdown', x, 1);"
+        " for (let index = 1; index <= 5; index += 1) fire('pointermove', x + "
+        + repr(step)
+        + " * index, 1);"
+        " fire('pointerup', x + " + repr(dx) + ", 0);"
+        " return { from: Math.round(x), to: Math.round(x + " + repr(dx) + "),"
+        " swipe: card.dataset.swipe }; })()"
+    )
+
+
 # ---------------------------------------------------------------- diagnostics
 
 DIAG_PATH = os.path.join(ROOT, "tests", "e2e-diag.log")
@@ -340,7 +416,9 @@ def dump_network(browser, diag, label, bodies=False):
 def snapshot(browser, daemon, diag, label):
     """Write the page's trace, its outbox and the requests made so far."""
     diag.section(f"snapshot · {label}")
-    trace = browser.evaluate("JSON.stringify(window.__trace || [])")
+    trace = browser.evaluate(
+        "JSON.stringify((window.app && window.app.trace) || window.__trace || [])"
+    )
     diag.line("trace: " + str(trace))
     state = outbox_state(browser)
     diag.line("outbox: " + json.dumps(state, ensure_ascii=False))
@@ -481,8 +559,8 @@ class Daemon:
         except urllib.error.HTTPError as error:
             return {"ok": False, "status": error.code, "body": error.read().decode()}
 
-    def messages(self):
-        return self.api("/site/api/monologues/1/messages").get("messages", [])
+    def messages(self, monolog=1):
+        return self.api(f"/site/api/monologues/{monolog}/messages").get("messages", [])
 
     def site_state(self):
         return site_state(self)
@@ -830,9 +908,11 @@ def main():
         else:
             raise TimeoutError("the phone page never loaded")
         browser.evaluate(f"localStorage.setItem('vb_token', {daemon.token!r})")
-        # The header exists on the pairing screen too, so wait for the app itself:
-        # the version, the manifest and the install bar are the app's, not the
-        # pairing screen's.
+        # The page read its storage when it booted and found no token, so it is
+        # on the pairing screen even though the token is there now. A paired
+        # phone reloads; the shell then carries #composer even on the list, where
+        # the composer itself is hidden.
+        browser.call("Page.reload", {"ignoreCache": True})
         wait_for(
             lambda: browser.evaluate("!!document.getElementById('composer')"),
             timeout=20,
@@ -846,6 +926,8 @@ def main():
             "          color: style.color }; })()"
         )
 
+        # A second load proves the token really lives in the page's storage, not
+        # only in this document.
         browser.call("Page.reload", {"ignoreCache": True})
         wait_for(
             lambda: browser.evaluate(
@@ -853,6 +935,13 @@ def main():
             ),
             timeout=20,
             what="the phone page with a token",
+        )
+        # The shell is the app: its boot set the document language and the
+        # manifest href, and #composer exists as soon as it is mounted.
+        wait_for(
+            lambda: browser.evaluate("!!document.getElementById('composer')"),
+            timeout=20,
+            what="the shell with the pairing token",
         )
         check(True, "the phone page opened with the pairing token")
         check(
@@ -1014,19 +1103,24 @@ def main():
             what="the recording state",
         )
         check(True, "the record button shows the recording state")
-        # Leaving the monolog must not hide the recording: the bar follows it
-        # and brings the person back.
+        # Leaving the monolog must not stop the take: the list marks the monolog
+        # it is being recorded into, and tapping that card goes back to it.
         browser.evaluate("document.getElementById('back').click()")
         wait_for(
             lambda: browser.evaluate("document.getElementById('title').textContent === 'Монологи'"),
             timeout=10,
             what="the list while recording",
         )
-        check(
-            browser.evaluate("!document.getElementById('rec-bar').hidden"),
-            "the recording bar is visible on the monolog list",
+        marked = browser.evaluate(
+            "(() => { const card = document.querySelector('.monolog-card.active');"
+            " if (!card) return '';"
+            " return (card.textContent || '').trim(); })()"
         )
-        browser.evaluate("document.getElementById('rec-bar').click()")
+        check(
+            "идёт расшифровка" in marked,
+            f"the list marks the monolog that is being recorded ({marked!r})",
+        )
+        browser.evaluate("document.querySelector('.monolog-card.active').click()")
         wait_for(
             lambda: browser.evaluate(
                 "document.getElementById('title').textContent === 'Проверка'"
@@ -1035,7 +1129,7 @@ def main():
             timeout=10,
             what="the recording monolog again",
         )
-        check(True, "the recording bar returns to the recording monolog")
+        check(True, "the marked monolog returns to the recording")
         snapshot(browser, daemon, diag, "just after the record click")
         time.sleep(3)
         snapshot(browser, daemon, diag, "3 s into the recording")
@@ -1088,16 +1182,16 @@ def main():
         time.sleep(2)
         snapshot(browser, daemon, diag, "2 s after the stop")
 
-        trace = json.loads(browser.evaluate("JSON.stringify(window.__trace || [])"))
+        trace = json.loads(
+            browser.evaluate(
+                "JSON.stringify((window.app && window.app.trace) || window.__trace || [])"
+            )
+        )
         diag.section("full page trace")
         for entry in trace:
             diag.line("  " + str(entry))
-        print("  trace:", trace[:6], "…", [item for item in trace if item.startswith('sync:')][:3])
-        print(
-            f"  trace: {len(trace)} entries,"
-            f" {sum(1 for item in trace if item == 'chunk')} chunk entries,"
-            f" {sum(1 for item in trace if item == 'mic')} mic entries"
-        )
+        print("  trace:", trace[:6], "…", trace[-3:])
+        print(f"  trace: {len(trace)} entries")
         for event in browser.events:
             if event.get("method") in ("Runtime.exceptionThrown", "Log.entryAdded", "Runtime.consoleAPICalled"):
                 diag.line("page: " + json.dumps(event.get("params", {}), ensure_ascii=False)[:800])
@@ -1190,34 +1284,83 @@ def main():
         )
 
         print("editing")
-        # The computer says `done` before the page's next tick redraws the card;
-        # wait for the action the done stage offers instead of racing it.
+        # The message menu lives in a sheet now; editing itself is a full screen.
         wait_for(
-            lambda: browser.evaluate(
-                "Array.from(document.querySelectorAll('button'))"
-                ".some((b) => b.textContent === 'Изменить')"
-            ),
+            lambda: browser.evaluate("!!document.querySelector('.message')"),
             timeout=10,
-            what="the edit action on the done card",
+            what="the message card",
+        )
+        long_text = "Правка текста без потери смысла. " * 14
+        browser.evaluate("document.querySelector('.message').click()")
+        wait_sheet(browser)
+        check(sheet_click(browser, "Изменить текст"), "the message menu offers an edit")
+        wait_for(
+            lambda: browser.evaluate("!!document.querySelector('.vb-edit-field')"),
+            timeout=10,
+            what="the full-screen editor",
         )
         browser.evaluate(
-            "Array.from(document.querySelectorAll('button')).find((b) => b.textContent === 'Изменить').click()"
+            "(() => { const box = document.querySelector('.vb-edit-field');"
+            "box.value = " + json.dumps(long_text, ensure_ascii=False) + ";"
+            "box.dispatchEvent(new Event('input', { bubbles: true })); })()"
         )
-        time.sleep(0.5)
-        browser.evaluate(
-            "const box = document.querySelector('.sheet textarea, .sheet input');"
-            "box.value = 'Отредактировано тестом';"
-            "box.dispatchEvent(new Event('input', { bubbles: true }));"
+        check(
+            browser.evaluate("document.getElementById('edit-save').disabled === false"),
+            "the editor enables Сохранить once the text changes",
         )
-        browser.evaluate(
-            "Array.from(document.querySelectorAll('.sheet button')).find((b) => b.textContent === 'Сохранить').click()"
+        browser.evaluate("document.getElementById('edit-save').click()")
+        wait_for(
+            lambda: browser.evaluate("!document.querySelector('.vb-edit')"),
+            timeout=10,
+            what="the editor to close",
         )
         wait_for(
-            lambda: daemon.messages()[0]["text"] == "Отредактировано тестом",
+            lambda: daemon.messages()[0]["text"] == long_text,
             timeout=15,
             what="the edited text on the computer",
         )
         check(True, "the edit reached the computer")
+
+        print("a long message folds and expands")
+        wait_for(
+            lambda: browser.evaluate("!!document.querySelector('.message .more')"),
+            timeout=10,
+            what="the show-more button",
+        )
+        more = browser.evaluate("document.querySelector('.message .more').textContent.trim()")
+        check(
+            more == "Показать полностью",
+            f"the long message offers «Показать полностью» ({more!r})",
+        )
+        folded = browser.evaluate("document.querySelector('.message .text').textContent")
+        expected = long_text[:240].rstrip() + "…"
+        check(
+            folded.strip() == expected,
+            "the long message is folded to its first lines"
+            f" ({len(folded)} of {len(long_text)} chars)",
+        )
+        browser.evaluate("document.querySelector('.message .more').click()")
+        wait_for(
+            lambda: browser.evaluate(
+                "document.querySelector('.message .more').textContent.trim() === 'Свернуть'"
+            ),
+            timeout=5,
+            what="the expanded message",
+        )
+        full = browser.evaluate("document.querySelector('.message .text').textContent")
+        check(
+            full.strip() == long_text.strip(),
+            f"tapping «Показать полностью» shows the whole text ({len(full)} chars)",
+        )
+        browser.evaluate("document.querySelector('.message .more').click()")
+        wait_for(
+            lambda: browser.evaluate(
+                "document.querySelector('.message .more').textContent.trim() === 'Показать полностью'"
+            ),
+            timeout=5,
+            what="the folded message again",
+        )
+        check(True, "«Свернуть» folds the message again")
 
         print("the network drops in the middle of a take")
         before_drop = len(daemon.messages())
@@ -1310,18 +1453,24 @@ def main():
                 f"the computer transcribed the pieces once it was free ({len(dropped['text'])} chars)",
             )
 
-        print("deleting")
+        print("deleting a message")
+        # The per-message actions are a sheet now: tapping the message opens it,
+        # and the delete asks for a confirmation before it reaches the computer.
         before = len(daemon.messages())
-        browser.evaluate(
-            "Array.from(document.querySelectorAll('button')).filter((b) => b.textContent === 'Удалить')[0].click()"
+        browser.evaluate("document.querySelectorAll('.message')[0].click()")
+        wait_sheet(browser)
+        check(
+            sheet_click(browser, "Удалить сообщение"),
+            "the message menu offers a delete",
         )
-        time.sleep(0.5)
-        browser.evaluate(
-            "const sheet = document.querySelector('.sheet');"
-            "if (sheet) Array.from(sheet.querySelectorAll('button')).find((b) => b.textContent === 'Удалить').click();"
+        wait_sheet(browser, "Удалить сообщение?")
+        check(
+            len(daemon.messages()) == before,
+            "the message is still on the computer until the confirmation",
         )
+        check(sheet_click(browser, "Удалить"), "the confirmation deletes the message")
         wait_for(
-            lambda: all(m.get("deleted") for m in daemon.messages()) or len(daemon.messages()) < before,
+            lambda: len(daemon.messages()) < before,
             timeout=15,
             what="the deletion on the computer",
         )
@@ -1342,22 +1491,10 @@ def main():
             what="the monolog menu button",
         )
         browser.evaluate("document.getElementById('menu').click()")
-        wait_for(
-            lambda: browser.evaluate("!!document.querySelector('.sheet')"),
-            timeout=10,
-            what="the monolog menu",
-        )
-        menu_labels = browser.evaluate(
-            "Array.from(document.querySelectorAll('.sheet button')).map((b) => b.textContent)"
-        )
-        clicked = browser.evaluate(
-            "(() => { const sheet = document.querySelector('.sheet');"
-            "const btn = sheet && Array.from(sheet.querySelectorAll('button'))"
-            ".find((b) => b.textContent === 'Архив');"
-            "if (!btn) return false; btn.click(); return true; })()"
-        )
+        wait_sheet(browser)
+        menu_labels = sheet_labels(browser)
         check(
-            clicked is True,
+            sheet_click(browser, "Архив"),
             f"the phone offers an archive action for the monolog (buttons {menu_labels})",
         )
         wait_for(
@@ -1391,7 +1528,15 @@ def main():
             what="the open list without the archived monolog",
         )
         check(True, "the phone hides the archived monolog from the open list")
-        browser.evaluate("document.getElementById('archive').click()")
+        # The archive is an item of the list menu now: there is no header button
+        # for it any more.
+        browser.evaluate("document.getElementById('menu').click()")
+        wait_sheet(browser)
+        check(
+            any(label.startswith("Архив") for label in sheet_labels(browser)),
+            "the list menu offers the archive",
+        )
+        check(sheet_click(browser, "Архив"), "the list menu opens the archive")
         wait_for(
             lambda: browser.evaluate(
                 "document.getElementById('title').textContent === 'Архив'"
@@ -1408,7 +1553,14 @@ def main():
             "the phone shows the archived monolog in the archive"
             f" ({archived_cards})",
         )
-        # The archive is read-only: no microphone, no rename, only "Из архива".
+        check(
+            browser.evaluate(
+                "document.querySelector('.monolog-card').dataset.swipe === 'unarchive'"
+            ),
+            "a card in the archive swipes out of it, not into it",
+        )
+        # The archive is read-only: no microphone, and the message sheet only
+        # offers a copy and a way back out of the archive.
         browser.evaluate("document.querySelector('.monolog-card').click()")
         wait_for(
             lambda: browser.evaluate("document.getElementById('title').textContent === 'Проверка'"),
@@ -1419,40 +1571,201 @@ def main():
             browser.evaluate("document.getElementById('composer').hidden"),
             "an archived monolog has no microphone",
         )
+        wait_for(
+            lambda: browser.evaluate("!!document.querySelector('.message')"),
+            timeout=10,
+            what="the archived message card",
+        )
         check(
             not browser.evaluate(
                 "Array.from(document.querySelectorAll('.message .actions button'))"
-                ".some((b) => ['Изменить', 'Удалить', 'Повторить'].includes(b.textContent))"
+                ".some((b) => ['Изменить', 'Удалить', 'Повторить'].includes(b.textContent.trim()))"
             ),
-            "an archived monolog has no edit or delete actions",
+            "an archived monolog has no inline edit or delete actions",
+        )
+        browser.evaluate("document.querySelector('.message').click()")
+        wait_sheet(browser)
+        archived_items = sheet_labels(browser)
+        check(
+            "Копировать" in archived_items and "Вернуть из архива" in archived_items,
+            f"the archived message sheet offers a copy and a way back ({archived_items})",
+        )
+        check(
+            not any(
+                label in archived_items
+                for label in ("Изменить текст", "Удалить сообщение", "Повторить распознавание")
+            ),
+            "the archived message sheet has no edit or delete",
+        )
+        browser.evaluate("history.back()")
+        wait_for(
+            lambda: browser.evaluate("document.querySelectorAll('.sheet-backdrop').length === 0"),
+            timeout=10,
+            what="the archived message sheet to close",
         )
         browser.evaluate("document.getElementById('menu').click()")
-        wait_for(
-            lambda: browser.evaluate("!!document.querySelector('.sheet')"),
-            timeout=10,
-            what="the archive menu",
+        wait_sheet(browser)
+        archived_menu = sheet_labels(browser)
+        check(
+            "Вернуть из архива" in archived_menu,
+            f"the archive menu offers to restore the monolog ({archived_menu})",
         )
         check(
             not browser.evaluate("!!document.querySelector('.sheet textarea, .sheet input')"),
             "the archive menu has no name field",
         )
-        check(
-            browser.evaluate(
-                "Array.from(document.querySelectorAll('.sheet button'))"
-                ".some((b) => b.textContent === 'Из архива')"
-            ),
-            "the archive menu offers only Из архива",
-        )
-        browser.evaluate(
-            "Array.from(document.querySelectorAll('.sheet button'))"
-            ".find((b) => b.textContent === 'Отмена').click()"
+        browser.evaluate("history.back()")
+        wait_for(
+            lambda: browser.evaluate("document.querySelectorAll('.sheet-backdrop').length === 0"),
+            timeout=10,
+            what="the archive menu to close",
         )
         browser.evaluate("document.getElementById('back').click()")
         wait_for(
-            lambda: browser.evaluate("document.getElementById('title').textContent === 'Архив'"),
+            lambda: browser.evaluate(
+                "document.getElementById('title').textContent === 'Архив'"
+                " && document.querySelectorAll('.monolog-card').length === 1"
+            ),
             timeout=10,
             what="the archive list again",
         )
+
+        print("swiping a monolog into and out of the archive")
+        # The card listens to pointer events: a clear sideways pull archives it
+        # in the open list, and takes it back out of the archive.
+        gesture = swipe_card(browser, 110)
+        check(
+            isinstance(gesture, dict) and gesture.get("swipe") == "unarchive",
+            f"the archive card was pulled sideways ({gesture})",
+        )
+        wait_for(
+            lambda: not any(
+                item.get("id") == 1 and item.get("archived")
+                for item in daemon_db(daemon).get("monologues", [])
+            ),
+            timeout=15,
+            what="the unarchive on the computer",
+        )
+        check(True, "swiping a card in the archive unarchives it")
+        wait_for(
+            lambda: browser.evaluate(
+                "document.getElementById('title').textContent === 'Архив'"
+                " && document.querySelectorAll('.monolog-card').length === 0"
+            ),
+            timeout=15,
+            what="the archive without the restored monolog",
+        )
+        check(True, "the restored monolog leaves the archive")
+
+        # A fresh load puts the restored monolog back in the open list.
+        browser.navigate(daemon.base + "/")
+        wait_for(
+            lambda: browser.evaluate(
+                "(() => { const title = document.getElementById('title');"
+                " return !!title && title.textContent === 'Монологи'"
+                " && document.querySelectorAll('.monolog-card').length === 1; })()"
+            ),
+            timeout=20,
+            what="the open list with the restored monolog",
+        )
+        check(
+            browser.evaluate(
+                "document.querySelector('.monolog-card').dataset.swipe === 'archive'"
+            ),
+            "a card in the open list swipes into the archive, not out of it",
+        )
+        gesture = swipe_card(browser, -110)
+        check(
+            isinstance(gesture, dict) and gesture.get("swipe") == "archive",
+            f"the list card was pulled sideways ({gesture})",
+        )
+        wait_for(
+            lambda: any(
+                item.get("id") == 1 and item.get("archived")
+                for item in daemon_db(daemon).get("monologues", [])
+            ),
+            timeout=15,
+            what="the archive on the computer after the swipe",
+        )
+        check(True, "swiping a card in the open list archives it")
+        wait_for(
+            lambda: browser.evaluate("document.querySelectorAll('.monolog-card').length === 0"),
+            timeout=15,
+            what="the open list without the swiped monolog",
+        )
+        check(True, "the swiped monolog leaves the open list")
+
+        print("deleting a monolog")
+        # Deleting is in the monolog's own menu, behind a confirmation; the card
+        # itself has no delete button at all.
+        browser.evaluate("document.getElementById('menu').click()")
+        wait_sheet(browser)
+        check(sheet_click(browser, "Архив"), "the list menu opens the archive again")
+        wait_for(
+            lambda: browser.evaluate(
+                "document.getElementById('title').textContent === 'Архив'"
+                " && document.querySelectorAll('.monolog-card').length === 1"
+            ),
+            timeout=10,
+            what="the archive with the swiped monolog",
+        )
+        browser.evaluate("document.querySelector('.monolog-card').click()")
+        wait_for(
+            lambda: browser.evaluate("document.getElementById('title').textContent === 'Проверка'"),
+            timeout=10,
+            what="the archived monolog for deleting",
+        )
+        check(
+            not browser.evaluate(
+                "Array.from(document.querySelectorAll('button'))"
+                ".some((button) => button.textContent.trim() === 'Удалить монолог')"
+            ),
+            "there is no standalone delete button: the menu owns it",
+        )
+        browser.evaluate("document.getElementById('menu').click()")
+        wait_sheet(browser)
+        menu_labels = sheet_labels(browser)
+        check(
+            "Удалить монолог" in menu_labels and "Архив" not in menu_labels,
+            f"the archived monolog's menu offers delete, not archive ({menu_labels})",
+        )
+        check(sheet_click(browser, "Удалить монолог"), "the menu opens the delete confirmation")
+        wait_sheet(browser, "Удалить монолог?")
+        check(
+            any(item.get("id") == 1 for item in daemon_db(daemon).get("monologues", [])),
+            "the monolog still exists until the confirmation",
+        )
+        check(sheet_click(browser, "Удалить"), "the confirmation deletes the monolog")
+        wait_for(
+            lambda: all(
+                item.get("id") != 1 for item in daemon_db(daemon).get("monologues", [])
+            ),
+            timeout=20,
+            what="the monolog to leave the computer",
+        )
+        check(True, "the monolog delete reached the computer")
+        wait_for(
+            lambda: browser.evaluate("document.querySelectorAll('.monolog-card').length === 0"),
+            timeout=15,
+            what="the deleted monolog to leave the archive",
+        )
+        # Gone for good: a reload does not bring it back from the cached page.
+        browser.navigate(daemon.base + "/")
+        wait_for(
+            lambda: browser.evaluate(
+                "(() => { const title = document.getElementById('title');"
+                " return !!title && title.textContent === 'Монологи'"
+                " && document.querySelectorAll('.monolog-card').length === 0; })()"
+            ),
+            timeout=20,
+            what="the open list after the delete",
+        )
+        check(
+            not daemon.api("/site/api/monologues").get("monologs")
+            and not daemon.api("/site/api/monologues?archived=1").get("monologs"),
+            "the deleted monolog is gone from both of the computer's lists",
+        )
+        check(True, "the deleted monolog stays gone after a reload")
 
         print("history is append-only")
         conn = sqlite3.connect(sqlite_path(daemon.root), timeout=5)
@@ -1474,7 +1787,13 @@ def main():
             busy_session is not None,
             f"the computer took the engine before the take (session {busy_session})",
         )
-        daemon.api("/site/api/monologues", "POST", {"name": "Занято"})
+        busy_created = daemon.api("/site/api/monologues", "POST", {"name": "Занято"})
+        check(busy_created.get("ok"), "the second monolog is created")
+        # The delete above removed the first monolog, so the computer may reuse
+        # its number: take the id it really gave instead of guessing one.
+        busy_id = int((busy_created.get("monolog") or {}).get("id") or 0)
+        check(busy_id > 0, f"the second monolog has an id ({busy_id})")
+        busy_messages = "/site/api/monologues/" + str(busy_id) + "/messages"
         browser.navigate(daemon.base + "/")
         wait_for(
             lambda: browser.evaluate(
@@ -1505,7 +1824,7 @@ def main():
         browser.evaluate("document.getElementById('record').click()")
 
         def filled():
-            items = daemon.api("/site/api/monologues/2/messages").get("messages", [])
+            items = daemon.api(busy_messages).get("messages", [])
             if not items:
                 return None
             newest = max(items, key=lambda item: item["id"])
@@ -1532,7 +1851,7 @@ def main():
         check(freed.get("ok"), f"the computer let the engine go ({freed})")
 
         def first_text():
-            items = daemon.api("/site/api/monologues/2/messages").get("messages", [])
+            items = daemon.api(busy_messages).get("messages", [])
             if not items:
                 return None
             newest = max(items, key=lambda item: item["id"])
@@ -1558,12 +1877,88 @@ def main():
         wait_for(
             lambda: any(
                 item["stage"] == "done"
-                for item in daemon.api("/site/api/monologues/2/messages").get("messages", [])
+                for item in daemon.api(busy_messages).get("messages", [])
             ),
             timeout=40,
             what="the take that waited for the engine to finish",
         )
         check(True, "the take that waited for the engine finished")
+
+        print("the scroll indicator stays under the header")
+        # The indicator is only drawn while the view really scrolls, so the list
+        # needs some rows first. They are made through the computer's own route.
+        for index in range(14):
+            daemon.api("/site/api/monologues", "POST", {"name": f"Свиток {index + 1}"})
+        browser.navigate(daemon.base + "/")
+        wait_for(
+            lambda: browser.evaluate(
+                "document.querySelectorAll('.monolog-card').length >= 14"
+            ),
+            timeout=25,
+            what="a list long enough to scroll",
+        )
+
+        def scroll_geometry():
+            """Header bottom and thumb top, in viewport pixels, plus the widths."""
+            return json.loads(
+                browser.evaluate(
+                    "JSON.stringify((() => {"
+                    " const header = document.querySelector('.vb-shell header');"
+                    " const thumb = document.querySelector('.vb-scroll-thumb');"
+                    " const view = document.getElementById('view');"
+                    " const head = header ? header.getBoundingClientRect() : null;"
+                    " const bar = thumb ? thumb.getBoundingClientRect() : null;"
+                    " return { header: head ? head.bottom : null,"
+                    "   thumb: bar ? bar.top : null,"
+                    "   height: view.scrollHeight, room: view.clientHeight,"
+                    "   top: view.scrollTop, width: view.scrollWidth,"
+                    "   inner: view.clientWidth }; })())"
+                )
+            )
+
+        def wake_scroll():
+            # The thumb fades 900 ms after the last scroll; a scroll event makes
+            # it measure and show again, the same way a finger would.
+            browser.evaluate(
+                "document.getElementById('view').dispatchEvent(new Event('scroll'))"
+            )
+            time.sleep(0.15)
+
+        wake_scroll()
+        wait_for(
+            lambda: browser.evaluate("!!document.querySelector('.vb-scroll-thumb')"),
+            timeout=10,
+            what="the scroll indicator",
+        )
+        first = scroll_geometry()
+        check(
+            first["thumb"] is not None and first["header"] is not None,
+            f"the scroll indicator is drawn ({first})",
+        )
+        check(
+            first["thumb"] is not None
+            and first["header"] is not None
+            and first["thumb"] >= first["header"] - 0.5,
+            f"the scroll indicator starts below the header ({first})",
+        )
+        check(
+            first["width"] == first["inner"],
+            f"the list does not scroll sideways ({first['width']} of {first['inner']})",
+        )
+        browser.evaluate("document.getElementById('view').scrollTop = 420")
+        time.sleep(0.4)
+        middle = scroll_geometry()
+        check(
+            middle["thumb"] is not None
+            and middle["header"] is not None
+            and middle["thumb"] >= middle["header"] - 0.5,
+            f"the scroll indicator stays below the header while scrolling ({middle})",
+        )
+        check(
+            middle["width"] == middle["inner"],
+            f"the scrolled list does not scroll sideways"
+            f" ({middle['width']} of {middle['inner']})",
+        )
 
         print("the phone switch applies without a restart")
         toggle = Daemon(port=free_port(), models=False, site=False)
@@ -1742,7 +2137,10 @@ def main():
                 what="the offline scenario page",
             )
             browser.evaluate(f"localStorage.setItem('vb_token', {offline_daemon.token!r})")
-            browser.call("Page.reload", {"ignoreCache": True})
+            # A normal reload, not an ignore-cache one: Chrome's cache-bypassing
+            # reload also bypasses the service worker, and the offline part below
+            # needs the worker to control this page.
+            browser.call("Page.reload")
             wait_for(
                 lambda: browser.evaluate(
                     "!!window.app && !document.getElementById('app').hidden"
@@ -1787,7 +2185,9 @@ def main():
             check(offline_daemon.page_status("/") == 0, "the computer is really off")
             # A reload with no computer must still open the app: the shell and
             # every module come from the service worker, not from the network.
-            browser.call("Page.reload", {"ignoreCache": True})
+            # This must be a normal reload: `ignoreCache` would bypass the very
+            # worker that has the page.
+            browser.call("Page.reload")
             wait_for(
                 lambda: browser.evaluate("document.getElementById('app') && !document.getElementById('app').hidden"),
                 timeout=20,
@@ -1816,27 +2216,32 @@ def main():
             check(
                 not browser.evaluate(
                     "Array.from(document.querySelectorAll('#notes .banner'))"
-                    ".some((note) => note.textContent.includes('не отвечает'))"
+                    ".some((note) => note.textContent.includes('не отвечает')"
+                    " || note.textContent.includes('Нет связи'))"
                 ),
                 "no false warning while the phone is idle and offline",
             )
 
             print("creating a monolog with the computer away")
-            browser.evaluate("document.querySelector('.new-monolog').click()")
+            # The new-monolog row moved into the list menu; it is no longer a
+            # button in the list itself.
+            browser.evaluate("document.getElementById('menu').click()")
+            wait_sheet(browser)
+            check(
+                sheet_click(browser, "＋ Новый монолог"),
+                "the list menu offers a new monolog while the computer is away",
+            )
             wait_for(
                 lambda: browser.evaluate("!!document.querySelector('.sheet textarea, .sheet input')"),
                 timeout=10,
                 what="the new monolog sheet",
             )
             browser.evaluate(
-                "const box = document.querySelector('.sheet textarea, .sheet input');"
+                "(() => { const box = document.querySelector('.sheet textarea, .sheet input');"
                 "box.value = 'Офлайн';"
-                "box.dispatchEvent(new Event('input', { bubbles: true }));"
+                "box.dispatchEvent(new Event('input', { bubbles: true })); })()"
             )
-            browser.evaluate(
-                "Array.from(document.querySelectorAll('.sheet button'))"
-                ".find((b) => b.textContent === 'Создать').click()"
-            )
+            check(sheet_click(browser, "Создать"), "the create sheet makes the monolog")
             shown = wait_for(
                 lambda: browser.evaluate(
                     "(() => { const card = Array.from(document.querySelectorAll('.monolog-card'))"
@@ -1846,7 +2251,18 @@ def main():
                 timeout=20,
                 what="the local monolog card",
             )
-            check("ждёт связи" in shown, f"the local monolog is marked as waiting ({shown})")
+            check("Офлайн" in shown, f"the local monolog is in the list ({shown!r})")
+            # A monolog made with no computer is a local row: it is in the
+            # phone's own storage and shows up at once, with no server id yet.
+            local_rows = browser.evaluate(
+                "window.app.cache.localMonologs()"
+                ".then((rows) => rows.filter((row) => row.name === 'Офлайн').length)",
+                await_promise=True,
+            )
+            check(
+                local_rows == 1,
+                f"the monolog is stored on the phone while the computer is away ({local_rows})",
+            )
             browser.evaluate(
                 "Array.from(document.querySelectorAll('.monolog-card'))"
                 ".find((c) => c.textContent.includes('Офлайн')).click()"
@@ -1959,6 +2375,145 @@ def main():
                 what="the unsent card to go away",
             )
             check(True, "the unsent card is gone after the sync")
+
+            print("editing and deleting with the computer away")
+            # The page promises local first: an edit and a delete made while the
+            # computer cannot be reached stay on the phone and leave for it once
+            # the connection returns. The take that just synced is the row.
+            #
+            # The computer is stopped for real, not emulated: the page's service
+            # worker has a network of its own, and a page-level offline emulation
+            # leaves that one on, so the page would still get fresh answers from
+            # a computer it is supposed to have lost.
+            arrived_id = int(arrived["id"])
+            card = json.dumps(f'.message[data-id="{arrived_id}"]')
+            edited_offline = "Правка без связи"
+            offline_daemon.stop()
+            time.sleep(1)
+            check(
+                offline_daemon.page_status("/") == 0,
+                "the computer is really off for the offline edit",
+            )
+            browser.evaluate(f"document.querySelector({card}).click()")
+            wait_sheet(browser)
+            check(
+                sheet_click(browser, "Изменить текст"),
+                "the message menu offers an edit while the computer is away",
+            )
+            wait_for(
+                lambda: browser.evaluate("!!document.querySelector('.vb-edit-field')"),
+                timeout=10,
+                what="the editor without a connection",
+            )
+            browser.evaluate(
+                "(() => { const box = document.querySelector('.vb-edit-field');"
+                "box.value = " + json.dumps(edited_offline, ensure_ascii=False) + ";"
+                "box.dispatchEvent(new Event('input', { bubbles: true })); })()"
+            )
+            browser.evaluate("document.getElementById('edit-save').click()")
+            wait_for(
+                lambda: browser.evaluate(
+                    "(document.querySelector(" + card + " + ' .text') || {}).textContent"
+                    " === " + json.dumps(edited_offline, ensure_ascii=False)
+                ),
+                timeout=10,
+                what="the offline edit on the phone",
+            )
+            check(
+                browser.evaluate(
+                    "Array.from(document.querySelectorAll('.message .chip'))"
+                    ".some((chip) => chip.textContent.trim() === 'изменено · ждёт связи')"
+                ),
+                "the offline edit is marked as waiting for a connection",
+            )
+            before_edit = next(
+                (
+                    message
+                    for message in daemon_db(offline_daemon).get("messages", [])
+                    if message["id"] == arrived_id
+                ),
+                None,
+            )
+            check(
+                before_edit is not None and before_edit["text"] != edited_offline,
+                "the computer has not seen the offline edit yet",
+            )
+            offline_daemon.start(pair=False)
+            wait_for(
+                lambda: any(
+                    message["id"] == arrived_id and message["text"] == edited_offline
+                    for message in offline_daemon.messages(created["id"])
+                ),
+                timeout=30,
+                what="the offline edit to reach the computer",
+            )
+            check(True, "the offline edit reached the computer when the connection returned")
+            wait_for(
+                lambda: browser.evaluate(
+                    "Array.from(document.querySelectorAll('.message .chip'))"
+                    ".some((chip) => chip.textContent.trim() === 'изменено')"
+                ),
+                timeout=20,
+                what="the phone to show the edit as confirmed",
+            )
+
+            # The same row goes away while the computer is away: the phone hides
+            # it at once, and the delete waits in the change queue.
+            offline_daemon.stop()
+            time.sleep(1)
+            check(
+                offline_daemon.page_status("/") == 0,
+                "the computer is really off for the offline delete",
+            )
+            browser.evaluate(f"document.querySelector({card}).click()")
+            wait_sheet(browser)
+            check(
+                sheet_click(browser, "Удалить сообщение"),
+                "the message menu offers a delete while the computer is away",
+            )
+            wait_sheet(browser, "Удалить сообщение?")
+            before_delete = next(
+                (
+                    message
+                    for message in daemon_db(offline_daemon).get("messages", [])
+                    if message["id"] == arrived_id
+                ),
+                None,
+            )
+            check(
+                before_delete is not None and not before_delete["deleted"],
+                "the message is still on the computer until the confirmation",
+            )
+            check(sheet_click(browser, "Удалить"), "the confirmation deletes the offline message")
+            wait_for(
+                lambda: browser.evaluate(
+                    "document.querySelector(" + card + ") === null"
+                ),
+                timeout=10,
+                what="the deleted message to leave the feed",
+            )
+            after_delete = next(
+                (
+                    message
+                    for message in daemon_db(offline_daemon).get("messages", [])
+                    if message["id"] == arrived_id
+                ),
+                None,
+            )
+            check(
+                after_delete is not None and not after_delete["deleted"],
+                "the offline delete waits on the phone",
+            )
+            offline_daemon.start(pair=False)
+            wait_for(
+                lambda: not any(
+                    message["id"] == arrived_id for message in offline_daemon.messages(created["id"])
+                ),
+                timeout=30,
+                what="the offline delete to reach the computer",
+            )
+            check(True, "the offline delete reached the computer when the connection returned")
+
             browser.evaluate("document.getElementById('back').click()")
             wait_for(
                 lambda: browser.evaluate(

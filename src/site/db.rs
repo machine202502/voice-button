@@ -335,6 +335,57 @@ impl Db {
         }
     }
 
+    /// Remove one monolog and every message it owns, in one transaction.
+    ///
+    /// The message ids are returned so the caller can stop the engine and drop
+    /// the audio files those messages kept; a monolog that does not exist
+    /// answers `None`. Nothing is tombstoned here: the phone asked for the rows
+    /// to be gone, and the revision tells the window to read the list again.
+    pub fn delete_monolog(&mut self, id: u64) -> Option<Vec<u64>> {
+        let mut conn = self.store.conn();
+        let transaction = conn.transaction().ok()?;
+        let exists: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM monologs WHERE id = ?1",
+                [id as i64],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        if exists == 0 {
+            return None;
+        }
+        let mut messages = Vec::new();
+        if let Ok(mut statement) =
+            transaction.prepare("SELECT id FROM site_messages WHERE monolog_id = ?1")
+        {
+            if let Ok(rows) = statement.query_map([id as i64], |row| row.get::<_, i64>(0)) {
+                messages = rows
+                    .filter_map(|row| row.ok())
+                    .map(|value| value as u64)
+                    .collect();
+            }
+        }
+        let _ = transaction.execute(
+            "DELETE FROM site_messages WHERE monolog_id = ?1",
+            [id as i64],
+        );
+        let _ = transaction.execute("DELETE FROM monologs WHERE id = ?1", [id as i64]);
+        // The window keeps one counter for message and monolog writes; the
+        // delete has to move it or the list would keep showing the monolog.
+        let _ = transaction.execute(
+            "INSERT INTO kv(key, value) VALUES ('rev.site', '1')
+             ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1",
+            [],
+        );
+        if transaction.commit().is_err() {
+            return None;
+        }
+        drop(conn);
+        self.data.monologues.retain(|monolog| monolog.id != id);
+        self.dirty_monologs.remove(&id);
+        Some(messages)
+    }
+
     // ---- messages -------------------------------------------------------
 
     pub fn add_message(&mut self, monolog: u64, recorded: &str, now: &str) -> Message {

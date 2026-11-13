@@ -100,6 +100,8 @@ export interface MessageStore {
   find(monolog: number, id: number): Promise<Message | null>;
   /** Remove one message from disk. */
   remove(monolog: number, recorded: string, id: EntityId): Promise<void>;
+  /** Remove every message of one monolog in one transaction. */
+  removeMonolog(monolog: number): Promise<void>;
   /** Is there any message at all on this phone? */
   any(): Promise<boolean>;
 }
@@ -417,6 +419,23 @@ export function messageStore(db: IDBDatabase): MessageStore {
         try {
           const transaction = db.transaction(MESSAGES, 'readwrite');
           transaction.objectStore(MESSAGES).delete(messageKey(monolog, recorded, id));
+          transaction.oncomplete = () => resolve();
+          transaction.onerror = () => reject(transaction.error);
+          transaction.onabort = () => reject(transaction.error ?? new Error('aborted'));
+        } catch (error) {
+          reject(error);
+        }
+      });
+    },
+
+    /** Remove every message of one monolog in one transaction. */
+    async removeMonolog(monolog) {
+      const id = Number(monolog);
+      if (!Number.isFinite(id)) return;
+      return new Promise((resolve, reject) => {
+        try {
+          const transaction = db.transaction(MESSAGES, 'readwrite');
+          transaction.objectStore(MESSAGES).delete(monologRange(id));
           transaction.oncomplete = () => resolve();
           transaction.onerror = () => reject(transaction.error);
           transaction.onabort = () => reject(transaction.error ?? new Error('aborted'));
