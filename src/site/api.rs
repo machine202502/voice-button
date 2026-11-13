@@ -8,7 +8,10 @@
 //! **message** is one spoken take. The stage of a message is the only thing the
 //! phone shows, so the router refuses any request that would skip a stage.
 
+use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use super::db::{Db, Message};
 use super::monolog::Stage;
@@ -61,7 +64,11 @@ fn error(status: u16, message: &str) -> Response {
     json(status, serde_json::json!({ "ok": false, "error": message }))
 }
 
-fn message_json(message: &Message, engine_busy: bool) -> serde_json::Value {
+fn message_json(message: &Message, engine_busy: bool, root: &std::path::Path) -> serde_json::Value {
+    // A retry re-reads the kept audio, so the phone must know whether anything is
+    // left to read: a take that was transcribed long ago, or one whose file never
+    // arrived, cannot be retried and must not offer the button.
+    let audio = super::db::Db::audio_path(root, message.id).is_file();
     // What the person at the computer is doing right now takes the engine away
     // from this message; the phone can only say "the engine is busy" about a
     // message that still waits for it.
@@ -86,6 +93,7 @@ fn message_json(message: &Message, engine_busy: bool) -> serde_json::Value {
         "duration": message.duration,
         "segments_done": message.segments_done,
         "waiting": waiting,
+        "audio": audio,
     })
 }
 
@@ -148,6 +156,94 @@ pub fn handle(request: &Request, ctx: &Ctx) -> Response {
         ("POST", ["site", "api", "messages", id, "retry"]) => retry(ctx, id),
         _ => error(404, "no such route"),
     }
+}
+
+/// The one streaming route. The gate checks the token, then hands the request
+/// back to the socket instead of answering it with a `Response`.
+pub fn is_events_path(request: &Request) -> bool {
+    request.path == "/site/api/events"
+}
+
+/// How often the revision counters are read while a stream is open. Ten tiny
+/// reads a second on the store's own connection: cheap, and the phone reacts
+/// before the eye has moved.
+const WATCH: Duration = Duration::from_millis(100);
+
+/// A comment line this often keeps proxies and the phone from dropping a
+/// stream that has nothing to say.
+const PING: Duration = Duration::from_secs(15);
+
+/// The response head of the stream. There is no `Content-Length`: the body
+/// ends when the connection closes.
+const EVENTS_HEAD: &str = "HTTP/1.1 200 OK\r\n\
+    Content-Type: text/event-stream\r\n\
+    Cache-Control: no-store\r\n\
+    Connection: close\r\n\
+    \r\n";
+
+/// The counters the phone watches: one per table it can see.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Revisions {
+    pub site: u64,
+    pub telegram: u64,
+}
+
+impl Revisions {
+    /// Read both counters under one lock, so an event never mixes two moments.
+    fn read(db: &Mutex<Db>) -> Self {
+        let db = db.lock().unwrap();
+        Self {
+            site: db.store().revision("rev.site"),
+            telegram: db.store().revision("rev.telegram"),
+        }
+    }
+
+    /// One server-sent event, with the blank line that ends it.
+    pub fn event(&self) -> String {
+        format!(
+            "event: rev\ndata: {{\"site\":{},\"telegram\":{}}}\n\n",
+            self.site, self.telegram
+        )
+    }
+}
+
+/// Write `GET /site/api/events` on the connection that owns it: the current
+/// revisions immediately, then one event per change, and a comment line when
+/// the stream has been quiet for [`PING`].
+///
+/// This runs on the connection's own thread and only touches the store for a
+/// few microseconds per tick, so it never holds the daemon up. Every frame is
+/// flushed before the loop sleeps again. A failed write returns an error, which
+/// is how a phone that closed the page ends the writer.
+pub fn stream_events<W: Write>(
+    writer: &mut W,
+    db: &Mutex<Db>,
+    stop: &AtomicBool,
+) -> std::io::Result<()> {
+    writer.write_all(EVENTS_HEAD.as_bytes())?;
+    let mut last = Revisions::read(db);
+    writer.write_all(last.event().as_bytes())?;
+    writer.flush()?;
+    let mut last_ping = Instant::now();
+    while !stop.load(Ordering::SeqCst) {
+        std::thread::sleep(WATCH);
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+        let current = Revisions::read(db);
+        if current != last {
+            // Counters only grow; a change in either is what the phone acts on.
+            writer.write_all(current.event().as_bytes())?;
+            writer.flush()?;
+            last = current;
+        }
+        if last_ping.elapsed() >= PING {
+            writer.write_all(b": ping\n\n")?;
+            writer.flush()?;
+            last_ping = Instant::now();
+        }
+    }
+    Ok(())
 }
 
 fn me(ctx: &Ctx) -> Response {
@@ -315,6 +411,7 @@ fn list_messages(ctx: &Ctx, id: &str, request: &Request) -> Response {
     };
     let before = cursor("before");
     let after = cursor("after");
+    let root = db.root().to_path_buf();
     let list: Vec<serde_json::Value> = db
         .message_page(
             id,
@@ -323,7 +420,7 @@ fn list_messages(ctx: &Ctx, id: &str, request: &Request) -> Response {
             limit,
         )
         .iter()
-        .map(|message| message_json(message, busy))
+        .map(|message| message_json(message, busy, &root))
         .collect();
     json(
         200,
@@ -355,7 +452,11 @@ fn create_message(ctx: &Ctx, request: &Request) -> Response {
     let message = db.add_message(monolog, &recorded, ctx.now);
     let _ = db.save();
     let busy = ctx.engine.busy();
-    json(200, serde_json::json!({ "ok": true, "message": message_json(&message, busy) }))
+    let root = db.root().to_path_buf();
+    json(
+        200,
+        serde_json::json!({ "ok": true, "message": message_json(&message, busy, &root) }),
+    )
 }
 
 fn show_message(ctx: &Ctx, id: &str) -> Response {
@@ -366,7 +467,11 @@ fn show_message(ctx: &Ctx, id: &str) -> Response {
     match db.message(id) {
         Some(message) => {
             let busy = ctx.engine.busy();
-            json(200, serde_json::json!({ "ok": true, "message": message_json(&message, busy) }))
+            let root = db.root().to_path_buf();
+            json(
+                200,
+                serde_json::json!({ "ok": true, "message": message_json(&message, busy, &root) }),
+            )
         }
         None => error(404, "no such message"),
     }
@@ -873,7 +978,10 @@ mod tests {
                 headers,
                 body: Vec::new(),
             };
-            crate::site::gate::answer(&request, &gate).status
+            match crate::site::gate::answer(&request, &gate) {
+                crate::site::gate::Answer::Response(response) => response.status,
+                crate::site::gate::Answer::Events => panic!("a delete is not a stream"),
+            }
         };
         assert_eq!(ask_gate(None), 401, "no token, no delete");
         assert_eq!(ask_gate(Some("wrong")), 401, "a wrong token is not a token");
@@ -915,5 +1023,104 @@ mod tests {
         let me = ask(&db, &engine, "GET", "/site/api/me", b"");
         assert_eq!(me["paired"], false);
         assert_eq!(me["monologs"], 1);
+    }
+
+    #[test]
+    fn the_revision_event_has_the_agreed_wire_shape() {
+        let event = Revisions {
+            site: 12,
+            telegram: 7,
+        }
+        .event();
+        assert_eq!(event, "event: rev\ndata: {\"site\":12,\"telegram\":7}\n\n");
+    }
+
+    /// Count the revision frames a test writer has received.
+    fn event_frames(out: &Mutex<Vec<u8>>) -> usize {
+        out.lock()
+            .unwrap()
+            .windows(b"event: rev".len())
+            .filter(|window| *window == b"event: rev")
+            .count()
+    }
+
+    /// Records what the stream writes and ends it after the event that follows
+    /// the initial one, the way a phone that closed the page ends it.
+    struct RecordingSink<'a> {
+        out: &'a Mutex<Vec<u8>>,
+        stop: &'a AtomicBool,
+        events: usize,
+    }
+
+    impl Write for RecordingSink<'_> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.out.lock().unwrap().extend_from_slice(bytes);
+            if bytes.starts_with(b"event: rev") {
+                self.events += 1;
+                if self.events == 2 {
+                    self.stop.store(true, Ordering::SeqCst);
+                }
+            }
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_event_stream_reports_a_change_written_through_the_router() {
+        let (db, engine) = setup();
+        let stop = AtomicBool::new(false);
+        let out = Mutex::new(Vec::new());
+        let mut started = false;
+        let mut created = false;
+        std::thread::scope(|scope| {
+            let stream = scope.spawn(|| {
+                let mut sink = RecordingSink {
+                    out: &out,
+                    stop: &stop,
+                    events: 0,
+                };
+                stream_events(&mut sink, &db, &stop).expect("the sink accepts writes");
+            });
+            // Wait for the initial event before changing anything, so the
+            // change is unquestionably after the stream started.
+            for _ in 0..400 {
+                if event_frames(&out) >= 1 {
+                    started = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            if started {
+                let answer =
+                    ask(&db, &engine, "POST", "/site/api/messages", br#"{"monolog":1}"#);
+                created = answer["ok"] == true;
+            }
+            if !created {
+                stop.store(true, Ordering::SeqCst);
+            }
+            stream.join().expect("the writer thread ends");
+        });
+        assert!(started, "the stream sends the current revisions at once");
+        assert!(created, "the change went through the real handler");
+
+        let text = String::from_utf8(out.into_inner().unwrap()).unwrap();
+        let revisions: Vec<serde_json::Value> = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .map(|line| serde_json::from_str(line).expect("an event carries JSON"))
+            .collect();
+        assert_eq!(revisions.len(), 2, "the start and the one change: {text}");
+        assert!(
+            revisions[1]["site"].as_u64() > revisions[0]["site"].as_u64(),
+            "the new site revision is in the second event: {text}"
+        );
+        assert_eq!(
+            revisions[0]["telegram"], revisions[1]["telegram"],
+            "nothing changed telegram"
+        );
     }
 }

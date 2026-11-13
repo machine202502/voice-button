@@ -55,7 +55,10 @@
     return { label: 'in_progress', tone: 'amber' };
   });
 
-  const inlineRetry = $derived(!page.archived && info.actions.includes('retry'));
+  // Inline too: no retry when the computer has no audio left to re-read.
+  const inlineRetry = $derived(
+    !page.archived && info.actions.includes('retry') && message.audio !== false,
+  );
   const inlineDelete = $derived(inlineRetry);
 
   function open(): void {

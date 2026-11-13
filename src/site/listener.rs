@@ -8,10 +8,12 @@
 //! its own test here.
 
 use std::io::{Read, Write};
+use std::sync::atomic::AtomicBool;
 
-use crate::http::{self, Response};
+use crate::http;
 
-use super::gate::{self, Gate};
+use super::api;
+use super::gate::{self, Answer, Gate};
 
 /// How many requests one connection may carry before it is closed anyway.
 const MAX_REQUESTS: usize = 64;
@@ -30,13 +32,27 @@ pub fn serve_connection<S: Read + Write>(stream: &mut S, gate: &Gate) -> usize {
             .header("connection")
             .map(|value| value.eq_ignore_ascii_case("close"))
             .unwrap_or(false);
-        let response: Response = gate::answer(&request, gate);
-        if http::write_response_keep_alive(reader.get_mut(), &response, !wants_close).is_err() {
-            break;
-        }
-        let _ = reader.get_mut().flush();
+        let keep_open = match gate::answer(&request, gate) {
+            Answer::Response(response) => {
+                if http::write_response_keep_alive(reader.get_mut(), &response, !wants_close)
+                    .is_err()
+                {
+                    break;
+                }
+                let _ = reader.get_mut().flush();
+                !wants_close
+            }
+            Answer::Events => {
+                // The stream owns this connection until the phone goes away.
+                // There is no request after it: the write that fails is the
+                // disconnect, and the thread ends with it.
+                let stop = AtomicBool::new(false);
+                let _ = api::stream_events(reader.get_mut(), gate.db, &stop);
+                false
+            }
+        };
         answered += 1;
-        if wants_close {
+        if !keep_open {
             break;
         }
     }
@@ -153,6 +169,73 @@ mod tests {
         assert_eq!(answered, 1);
         let text = response_text(&pipe.output);
         assert!(text.contains("Connection: close"), "{text}");
+    }
+
+    /// A pipe whose write side ends as soon as a revision event is written,
+    /// the way a phone that closed the page does.
+    struct ClosingPipe {
+        input: Vec<u8>,
+        position: usize,
+        output: Vec<u8>,
+    }
+
+    impl Read for ClosingPipe {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let left = self.input.len() - self.position;
+            if left == 0 {
+                return Ok(0);
+            }
+            let take = left.min(buffer.len());
+            buffer[..take].copy_from_slice(&self.input[self.position..self.position + take]);
+            self.position += take;
+            Ok(take)
+        }
+    }
+
+    impl Write for ClosingPipe {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            if buffer.starts_with(b"event: rev") {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "the phone is gone",
+                ));
+            }
+            self.output.extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_events_route_takes_over_the_connection() {
+        let (db, dir) = gate_with_db();
+        let request = "GET /site/api/events HTTP/1.1\r\nAuthorization: Bearer secret\r\n\r\n";
+        let mut pipe = ClosingPipe {
+            input: request.as_bytes().to_vec(),
+            position: 0,
+            output: Vec::new(),
+        };
+        let gate = Gate {
+            db: &db,
+            engine: &Silent,
+            static_dir: &dir,
+            ca: &dir,
+            now: "2026-11-12T15:00:00+05:00",
+        };
+        assert_eq!(serve_connection(&mut pipe, &gate), 1, "one request, one answer");
+        let text = response_text(&pipe.output);
+        assert!(text.starts_with("HTTP/1.1 200 OK\r\n"), "{text}");
+        assert!(
+            text.contains("Content-Type: text/event-stream\r\n"),
+            "the answer is a stream: {text}"
+        );
+        assert!(text.contains("Connection: close\r\n"), "{text}");
+        assert!(
+            !text.contains("Content-Length"),
+            "a stream has no known length: {text}"
+        );
     }
 
     #[test]

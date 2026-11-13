@@ -30,40 +30,54 @@ pub struct Gate<'a> {
     pub now: &'a str,
 }
 
-pub fn answer(request: &Request, gate: &Gate) -> Response {
+/// What the gate answers with: a whole response, or a route the caller has to
+/// keep open and write itself.
+pub enum Answer {
+    Response(Response),
+    /// `GET /site/api/events`: the token was accepted, the stream has not
+    /// started yet. The socket owner writes it.
+    Events,
+}
+
+pub fn answer(request: &Request, gate: &Gate) -> Answer {
     let path = request.path.as_str();
 
     // The liveness probe is open: it names nothing and is used to decide whether
     // the local address is reachable from the phone.
     if path == "/site/api/ping" {
         let version = api::API_VERSION;
-        return Response::json(200, serde_json::json!({ "ok": true, "api": version }))
-            .with_header("Access-Control-Allow-Origin", "*");
+        return Answer::Response(
+            Response::json(200, serde_json::json!({ "ok": true, "api": version }))
+                .with_header("Access-Control-Allow-Origin", "*"),
+        );
     }
 
     if path == "/pair" {
-        return pairing_page(request, gate);
+        return Answer::Response(pairing_page(request, gate));
     }
 
     // The certificate is public on purpose: a public key is not a secret, and
     // the phone needs it before it can trust this address.
     if path == "/ca.crt" {
-        return match std::fs::read(gate.ca) {
+        return Answer::Response(match std::fs::read(gate.ca) {
             Ok(bytes) => Response::new(200, "application/x-x509-ca-cert", bytes).with_header(
                 "Content-Disposition",
                 "attachment; filename=\"voice-button-ca.crt\"",
             ),
             Err(_) => Response::new(404, "text/plain; charset=utf-8", "no authority yet"),
-        };
+        });
     }
 
     if path == "/install" {
-        return static_file("install.html", gate.static_dir);
+        return Answer::Response(static_file("install.html", gate.static_dir));
     }
 
     if path.starts_with("/site/api/") {
         if !authorised(request, gate) {
-            return Response::json(401, serde_json::json!({ "ok": false, "error": "pairing required" }));
+            return Answer::Response(Response::json(
+                401,
+                serde_json::json!({ "ok": false, "error": "pairing required" }),
+            ));
         }
         // The first request that proves the token pairs the phone. Doing it on
         // the pairing page would burn the link before the browser follows it.
@@ -74,29 +88,53 @@ pub fn answer(request: &Request, gate: &Gate) -> Response {
                 let _ = db.save();
             }
         }
+        if api::is_events_path(request) {
+            // The stream is GET-only: anything else gets an ordinary answer
+            // and the connection closes instead of being held open.
+            if request.method != "GET" {
+                return Answer::Response(Response::json(
+                    405,
+                    serde_json::json!({ "ok": false, "error": "the event stream is GET only" }),
+                ));
+            }
+            return Answer::Events;
+        }
         let ctx = Ctx {
             db: gate.db,
             engine: gate.engine,
             now: gate.now,
         };
-        return api::handle(request, &ctx);
+        return Answer::Response(api::handle(request, &ctx));
     }
 
-    static_file(path, gate.static_dir)
+    Answer::Response(static_file(path, gate.static_dir))
 }
 
 /// A token is the only key. An unused pairing link dies with its five minutes;
 /// a phone that already paired keeps its token.
+///
+/// The header is the normal way. The event stream also accepts the token in
+/// `?t=`: `EventSource` cannot send headers, and a client that opens the stream
+/// that way must still be refused before any event is written.
 fn authorised(request: &Request, gate: &Gate) -> bool {
-    let Some(header) = request.header("authorization") else {
-        return false;
+    let token = match request.header("authorization") {
+        Some(header) => match header.strip_prefix("Bearer ") {
+            Some(token) => token.trim().to_string(),
+            None => return false,
+        },
+        None if api::is_events_path(request) => {
+            match http::query_param(&request.query, "t") {
+                Some(token) => token,
+                None => return false,
+            }
+        }
+        None => return false,
     };
-    let Some(token) = header.strip_prefix("Bearer ") else {
+    if token.is_empty() {
         return false;
-    };
-    let token = token.trim();
+    }
     let db = gate.db.lock().unwrap();
-    if !db.token_matches(token) {
+    if !db.token_matches(&token) {
         return false;
     }
     db.data().client.paired || db.pairing_alive(gate.now)
@@ -349,8 +387,32 @@ mod tests {
                     .headers
                     .push(("Authorization".to_string(), format!("Bearer {token}")));
             }
-            let response = answer(&request, &self.gate());
-            (response.status, String::from_utf8_lossy(&response.body).to_string())
+            match answer(&request, &self.gate()) {
+                Answer::Response(response) => {
+                    (response.status, String::from_utf8_lossy(&response.body).to_string())
+                }
+                Answer::Events => panic!("this request opens the event stream"),
+            }
+        }
+
+        /// Whether this request is allowed to open the event stream.
+        fn events(&self, method: &str, query: &str, token: Option<&str>) -> Option<u16> {
+            let mut request = Request {
+                method: method.to_string(),
+                path: "/site/api/events".to_string(),
+                query: query.to_string(),
+                headers: Vec::new(),
+                body: Vec::new(),
+            };
+            if let Some(token) = token {
+                request
+                    .headers
+                    .push(("Authorization".to_string(), format!("Bearer {token}")));
+            }
+            match answer(&request, &self.gate()) {
+                Answer::Events => None,
+                Answer::Response(response) => Some(response.status),
+            }
         }
     }
 
@@ -384,6 +446,37 @@ mod tests {
             case.ask("GET", "/site/api/monologues", "", Some("secret")).0,
             200,
             "the right token opens it"
+        );
+    }
+
+    #[test]
+    fn the_event_stream_is_refused_before_it_starts_without_the_token() {
+        let case = Case::new("events");
+        assert_eq!(case.events("GET", "", None), Some(401), "no token, no stream");
+        assert_eq!(
+            case.events("GET", "t=wrong", None),
+            Some(401),
+            "a wrong query token is refused"
+        );
+        assert_eq!(
+            case.events("GET", "", Some("wrong")),
+            Some(401),
+            "a wrong header token is refused"
+        );
+        assert_eq!(
+            case.events("GET", "", Some("secret")),
+            None,
+            "the header opens the stream"
+        );
+        assert_eq!(
+            case.events("GET", "t=secret", None),
+            None,
+            "so does the query, for clients that cannot send headers"
+        );
+        assert_eq!(
+            case.events("HEAD", "", Some("secret")),
+            Some(405),
+            "only GET keeps the connection open"
         );
     }
 

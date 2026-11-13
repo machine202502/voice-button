@@ -95,13 +95,20 @@
       if (messageInfo.stage === 'done') {
         rows.push({ label: page.tr('edit_text'), action: () => page.openEdit(row) });
       }
-      rows.push({
-        label: page.tr('retry_recognition'),
-        action: () => {
-          page.dismissSheet();
-          void page.retryMessage(row);
-        },
-      });
+      // Retrying only means something for a take the computer could not
+      // transcribe: the server refuses it for anything else, and offering it on a
+      // finished message is a button that can only answer with an error.
+      // A retry re-reads the kept audio: a take whose file the computer no longer
+      // has cannot be retried, and a button that can only fail is not offered.
+      if (messageInfo.stage === 'failed' && row.audio !== false) {
+        rows.push({
+          label: page.tr('retry_recognition'),
+          action: () => {
+            page.dismissSheet();
+            void page.retryMessage(row);
+          },
+        });
+      }
       rows.push({
         label: page.tr('delete_message'),
         style: 'danger',

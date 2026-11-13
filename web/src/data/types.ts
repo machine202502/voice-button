@@ -31,6 +31,11 @@ export interface Message extends MessageInput {
   id: number;
   monolog: number;
   recorded: string;
+  /**
+   * False when the computer kept no audio for this take, so "retry recognition"
+   * cannot work. Absent means "unknown" and the button is offered.
+   */
+  audio?: boolean;
 }
 
 /** Where a feed page starts or ends: the same `recorded|id` cursor the API uses. */

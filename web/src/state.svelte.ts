@@ -41,6 +41,8 @@ import { applyTheme, readTheme } from './lib/theme';
 import type { ThemeMode } from './lib/theme';
 import { version as pageVersion } from './lib/version';
 import { NoiseCleaner } from './lib/noise';
+import { createEventStream } from './lib/events';
+import type { EventStream } from './lib/events';
 import { readToken } from './lib/token';
 
 /** How many rows one screen keeps in memory. Older pages are dropped. */
@@ -55,6 +57,8 @@ const CHUNK_SAMPLES = Math.round(RECORD_RATE * 0.5);
 /** How often the level for the rings is measured; 30 Hz is smooth to the eye. */
 const METER_MS = 33;
 const METER_SECONDS = METER_MS / 1000;
+/** A phone in a pocket keeps its event stream only this long after going dark. */
+const HIDDEN_STREAM_MS = 60_000;
 
 /** A monolog as the page refers to it while one is open. */
 export interface MonologRef {
@@ -280,15 +284,22 @@ class Page {
   private loop: number | null = null;
   /** The open monolog's own refresh, so a queued take stops saying "not sent". */
   private feedLoop: number | null = null;
+  /** The push channel. While it is live nothing is polled. */
+  private events: EventStream | null = null;
+  private streamLive = false;
+  /** Closes the stream once the page has been hidden long enough. */
+  private hiddenTimer: number | null = null;
   private started = false;
   private noteId = 0;
+  /** A tick is running; a request that arrives meanwhile runs right after it. */
+  private kicking = false;
+  private kickAgain = false;
   /** Bumped by every open, so a slow cache read cannot open an older monolog. */
   private openSerial = 0;
   /** Takes the computer accepted; a snapshot read before that must not undo it. */
   private acceptedLocals = new Set<string>();
-  private lastToastText = '';
-  private lastToastAt = 0;
-  private offlineNotedAt = 0;
+  /** Conditions a note has already reported: quiet until the condition is over. */
+  private noted = new Set<string>();
   private installPrompt: InstallPrompt | null = null;
   private traces: string[] = [];
 
@@ -411,6 +422,7 @@ class Page {
     window.app = this.handle();
     this.startLoop();
     this.startFeedLoop();
+    this.startEvents();
     void this.kick();
     void this.refreshMe();
   }
@@ -422,6 +434,7 @@ class Page {
       try {
         const answer = await call(method, path, body);
         this.reachable = true;
+        this.connectionRestored();
         return answer;
       } catch (error) {
         if (error instanceof PairingError) {
@@ -433,6 +446,7 @@ class Page {
         } else {
           // The computer answered and said no: it is reachable.
           this.reachable = true;
+          this.connectionRestored();
         }
         throw error;
       }
@@ -475,6 +489,9 @@ class Page {
       get trace(): readonly string[] {
         return page.traces;
       },
+      get streamLive(): boolean {
+        return page.streamLive;
+      },
     };
   }
 
@@ -491,14 +508,23 @@ class Page {
       this.installPrompt = null;
       this.canInstall = false;
     });
-    window.addEventListener('offline', () => this.toast(this.tr('offline')));
+    window.addEventListener('offline', () => this.toast(this.tr('offline'), 'offline'));
     window.addEventListener('online', () => {
       this.reachable = true;
+      this.connectionRestored();
       void this.kick();
     });
     document.addEventListener('visibilitychange', () => {
-      // A phone whose screen went dark comes back here: send what waited.
-      if (!document.hidden) void this.kick();
+      if (document.hidden) {
+        // A screen that went dark is not going to use the stream right now:
+        // give it a while, then let the phone sleep without a socket.
+        this.sleepEvents();
+        return;
+      }
+      // A phone whose screen went dark comes back here: reopen the stream and
+      // send what waited.
+      this.wakeEvents();
+      void this.kick();
     });
     window.addEventListener('popstate', () => this.onPopState());
   }
@@ -1708,28 +1734,96 @@ class Page {
 
   // ------------------------------------------------------------ the sync loop
 
-  /** Ask the loop to run now. Never awaited by a click handler. */
+  /**
+   * Ask the loop to run now. Never awaited by a click handler.
+   *
+   * `sync.tick` ignores a second call while it is running. With a push channel
+   * an event can land in exactly that window, and losing it would leave the
+   * page stale until the next event. A request made during a tick is therefore
+   * remembered and runs once more when the tick ends.
+   */
   async kick(): Promise<void> {
     if (!this.own) return;
-    let result: TickResult;
-    try {
-      result = await this.sync.tick();
-    } catch (error) {
-      this.log('tick failed: ' + this.reason(error));
+    if (this.kicking) {
+      this.kickAgain = true;
       return;
     }
-    if (result.refused && result.refused.length > 0) this.reportRefusals(result.refused);
-    if (result.failed && !this.reachable) void this.offlineNoteIfWork();
+    this.kicking = true;
+    try {
+      let result: TickResult;
+      try {
+        result = await this.sync.tick();
+      } catch (error) {
+        this.log('tick failed: ' + this.reason(error));
+        return;
+      }
+      if (result.refused && result.refused.length > 0) this.reportRefusals(result.refused);
+      if (result.failed && !this.reachable) void this.offlineNoteIfWork();
+    } finally {
+      this.kicking = false;
+      if (this.kickAgain) {
+        this.kickAgain = false;
+        void this.kick();
+      }
+    }
+  }
+
+  /**
+   * The push channel: one long-lived response from the computer. A `rev` event
+   * is the signal this page exists for, so a change calls `kick` at once
+   * instead of waiting for a tick. The token rides in the header.
+   */
+  private startEvents(): void {
+    if (this.events) return;
+    this.events = createEventStream({
+      url: '/site/api/events',
+      token: () => readToken(),
+      onRev: () => void this.kick(),
+      onLive: (live) => {
+        this.streamLive = live;
+        if (!live) return;
+        // The computer is answering again: clear the lost-connection notes and
+        // send whatever waited while the stream was down.
+        this.reachable = true;
+        this.connectionRestored();
+        void this.kick();
+      },
+      onUnauthorized: () => this.showPairing(),
+    });
+    this.events.start();
+  }
+
+  /** The page is visible again: reopen a stream that was closed while hidden. */
+  private wakeEvents(): void {
+    if (this.hiddenTimer !== null) {
+      window.clearTimeout(this.hiddenTimer);
+      this.hiddenTimer = null;
+    }
+    this.events?.start();
+  }
+
+  /** The page went dark: close the socket after a while, not at once. */
+  private sleepEvents(): void {
+    if (this.hiddenTimer !== null) return;
+    this.hiddenTimer = window.setTimeout(() => {
+      this.hiddenTimer = null;
+      if (!document.hidden) return;
+      this.events?.close();
+    }, HIDDEN_STREAM_MS);
   }
 
   /**
    * The one repeating timer. It goes through `kick` rather than `sync.start`,
    * so an interval tick reports a refusal and says the computer is away exactly
    * like a tick after an action does.
+   *
+   * Ten seconds, and silent while the event stream is up: this is the fallback
+   * for a lost stream, not the normal way the page learns about changes.
    */
-  private startLoop(intervalMs = 1500): void {
+  private startLoop(intervalMs = 10_000): void {
     if (this.loop !== null) return;
     this.loop = window.setInterval(() => {
+      if (this.streamLive) return;
       void this.kick();
     }, intervalMs);
   }
@@ -1743,7 +1837,9 @@ class Page {
     const feed = this.feed;
     const monolog = this.monolog;
     if (!this.own || !feed || !monolog || this.screen !== 'feed') return;
-    if (document.hidden || !this.reachable) return;
+    // The stream pushes every change; polling the open page is only the
+    // fallback while it is down.
+    if (document.hidden || !this.reachable || this.streamLive) return;
     try {
       const page = await this.sync.latest(monolog.id);
       if (this.feed !== feed || this.monolog?.id !== monolog.id) return;
@@ -1835,15 +1931,20 @@ class Page {
   }
 
   /**
-   * One transient note. An identical note that just left is not repeated, and
-   * at most two are on screen: the oldest leaves rather than stacking.
+   * One transient note. At most two are on screen: the oldest leaves rather
+   * than stacking.
+   *
+   * `condition` names a state that lasts longer than the banner (a lost
+   * connection, say). The note is shown once per episode: it is not repeated
+   * while the condition stays true, and closing the banner does not bring it
+   * back either. When the condition ends, `connectionRestored` or the caller
+   * forgets it, and a new episode may speak again. A note without a condition
+   * is a one-off event and is shown whenever it happens.
    */
-  toast(text: string): void {
-    const now = Date.now();
+  toast(text: string, condition?: string): void {
+    if (condition !== undefined && this.noted.has(condition)) return;
     if (this.notes.some((note) => note.text === text)) return;
-    if (text === this.lastToastText && now - this.lastToastAt < 4000) return;
-    this.lastToastText = text;
-    this.lastToastAt = now;
+    if (condition !== undefined) this.noted.add(condition);
     const id = ++this.noteId;
     this.notes = [...this.notes, { id, text }].slice(-2);
     window.setTimeout(() => {
@@ -1851,12 +1952,20 @@ class Page {
     }, 3200);
   }
 
+  /** The reader tapped (or pressed the × on) a note: it goes away for good. */
+  dismissNote(id: number): void {
+    this.notes = this.notes.filter((note) => note.id !== id);
+  }
+
+  /** The computer answers again: the next loss is a new condition. */
+  private connectionRestored(): void {
+    this.noted.delete('offline');
+    this.noted.delete('offline_recording');
+  }
+
   /** The same failure repeats every tick; one note says it better than ten. */
   offlineNote(): void {
-    const now = Date.now();
-    if (now - this.offlineNotedAt < 5000) return;
-    this.offlineNotedAt = now;
-    this.toast(this.tr('offline_recording'));
+    this.toast(this.tr('offline_recording'), 'offline_recording');
   }
 
   /** Why a request failed, in the person's language where a key exists. */
@@ -1905,6 +2014,8 @@ declare global {
       readonly archived: boolean;
       readonly screen: Screen;
       readonly trace: readonly string[];
+      /** The push channel is open; browser tests use it instead of guessing. */
+      readonly streamLive: boolean;
     };
   }
 }

@@ -42,15 +42,28 @@
   let canvas = $state<HTMLCanvasElement | null>(null);
   let frame = 0;
   let shown = 0;
+  /** 0..1: the halo fades in when a take starts and out when it ends. */
+  let presence = 0;
+
+  /** How far a ring can reach beyond the button: the spread plus the wobble. */
+  const furthest = (): number => halo + (1.4 + 18 * AMPLITUDE) + 8;
+  /** Half the canvas, in CSS pixels. */
+  const half = (): number => size / 2 + furthest();
 
   const SPINS = [0.22, -0.15, 0.31, -0.11, 0.18, -0.24, 0.13];
   const POINTS = 64;
 
-  function draw(context: CanvasRenderingContext2D, time: number, value: number): void {
-    const side = size + halo * 2;
+  function draw(
+    context: CanvasRenderingContext2D,
+    time: number,
+    value: number,
+    opacity: number,
+  ): void {
+    const side = half() * 2;
     const centre = side / 2;
     const radius = size / 2;
     context.clearRect(0, 0, side, side);
+    if (opacity <= 0.001) return;
 
     const open = IDLE + (1 - IDLE) * Math.pow(Math.min(1, Math.max(0, value)), 0.85);
     const reach = halo * SPREAD;
@@ -59,7 +72,7 @@
     const stepFull = Math.max(1.2, (reach - 2) / Math.max(1, rings));
 
     const glow = context.createRadialGradient(centre, centre, radius, centre, centre, radius + reach * open);
-    glow.addColorStop(0, `rgba(199,243,107,${(0.05 + value * 0.14) * open})`);
+    glow.addColorStop(0, `rgba(199,243,107,${(0.05 + value * 0.14) * open * opacity})`);
     glow.addColorStop(1, 'rgba(199,243,107,0)');
     context.fillStyle = glow;
     context.beginPath();
@@ -70,8 +83,10 @@
       const spin = (SPINS[ring % SPINS.length] ?? 0.2) * SPEED;
       const phase = ring * 1.7;
       const step = 1.2 + (stepFull - 1.2) * open;
-      const base = radius + (ring + 1) * step * SPREAD;
-      const amplitude = (1.4 + value * 18 * AMPLITUDE) * (1 - ring * 0.1) * SPREAD;
+      // The whole halo grows out of the button edge and shrinks back into it, so
+      // starting and stopping a take is a breath, not a switch.
+      const base = radius + (ring + 1) * step * SPREAD * opacity;
+      const amplitude = (1.4 + value * 18 * AMPLITUDE) * (1 - ring * 0.1) * SPREAD * opacity;
       const points: number[] = [];
       for (let index = 0; index <= POINTS; index += 1) {
         const angle = (index / POINTS) * Math.PI * 2 + spin * when + phase * 0.15;
@@ -101,7 +116,7 @@
 
     const trail = 0.055 * SMEAR;
     for (let ring = 0; ring < rings; ring += 1) {
-      const alpha = (0.5 - ring * 0.06) * (0.55 + value * 0.45) * (0.62 + 0.38 * open);
+      const alpha = (0.5 - ring * 0.06) * (0.55 + value * 0.45) * (0.62 + 0.38 * open) * opacity;
       if (SMEAR > 0) {
         for (let ghost = 2; ghost >= 1; ghost -= 1) {
           stroke(edge(ring, time - trail * ghost), 3.2, (alpha * 0.1) / ghost);
@@ -119,7 +134,7 @@
   $effect(() => {
     const element = canvas;
     const running = active;
-    const side = size + halo * 2;
+    const side = half() * 2;
     const ratio = Math.min(window.devicePixelRatio || 1, 2);
     if (!element) return;
     element.width = side * ratio;
@@ -130,7 +145,8 @@
     if (!context) return;
     context.scale(ratio, ratio);
 
-    if (!running) {
+    // Nothing to animate and nothing left of a previous take: stay quiet.
+    if (!running && presence <= 0.001) {
       shown = 0;
       context.clearRect(0, 0, side, side);
       return;
@@ -140,12 +156,21 @@
     const tick = (now: number): void => {
       const delta = Math.min((now - last) / 1000, 0.05);
       last = now;
-      // The visible size chases the measured loudness: a hard cut on a syllable
-      // would look like a glitch, not like breathing.
+      // The halo breathes in over about 0.4 s and back out the same way; the
+      // loudness chases the voice underneath it. 6 per second reaches 90 % in
+      // 0.38 s, which reads as a breath rather than a switch.
+      presence += ((running ? 1 : 0) - presence) * Math.min(1, delta * 6);
+      if (!running && presence < 0.004) {
+        presence = 0;
+        shown = 0;
+        context.clearRect(0, 0, side, side);
+        frame = 0;
+        return;
+      }
       const target = Math.min(1, Math.max(0, level));
       const rate = target > shown ? 18 : 5;
       shown += (target - shown) * Math.min(1, delta * rate);
-      draw(context, now / 1000, shown);
+      draw(context, now / 1000, shown, presence);
       frame = requestAnimationFrame(tick);
     };
     frame = requestAnimationFrame(tick);
@@ -158,6 +183,6 @@
   class:live={active}
   bind:this={canvas}
   aria-hidden="true"
-  style:--rings-side="{size + halo * 2}px"
+  style:--rings-side="{half() * 2}px"
   data-reduced={reduced ? 'yes' : 'no'}
 ></canvas>

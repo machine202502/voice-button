@@ -459,7 +459,24 @@ impl Db {
         if current == stage {
             return true;
         }
-        if !current.can_move_to(stage) {
+        // A take the engine is waiting for or working on may always be closed: a
+        // queued message whose audio never arrived is silence, and one interrupted
+        // mid-transcription may end. Without this, a take left open by a restart
+        // could never leave "queued", which is exactly how a message used to hang.
+        // A draft is not covered: nothing was ever sent for it.
+        let closing = matches!(current, Stage::Queued | Stage::Transcribing) && stage.is_final();
+        // A take whose audio never arrived (the phone started it and vanished) is
+        // silence, whatever stage it was left in. Only silence: a draft cannot
+        // become text out of nowhere.
+        let abandoned = stage == Stage::Silent
+            && matches!(
+                current,
+                Stage::Draft | Stage::Uploading | Stage::Queued | Stage::Transcribing
+            );
+        // A restart can leave a take mid-transcription; it goes back to the queue
+        // instead of staying "transcribing" for ever.
+        let requeueing = current == Stage::Transcribing && stage == Stage::Queued;
+        if !current.can_move_to(stage) && !closing && !requeueing && !abandoned {
             crate::log::log(&format!(
                 "site: message {id} cannot go from {current:?} to {stage:?}"
             ));
@@ -1057,6 +1074,37 @@ mod tests {
         assert_eq!(db.message(message.id).unwrap().stage, Stage::Cancelled);
         assert!(db.data().monologues.len() == 1, "the monolog is still stored");
         assert!(db.message(message.id).is_some(), "and so is the deleted take");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_take_left_open_by_a_restart_can_always_be_closed() {
+        // The stuck-status bug: a message left in `queued` by a restart has no
+        // audio, and settling it as silence was refused because the stage machine
+        // did not allow `queued -> silent`. It then stayed "waiting" for ever.
+        let root = root_for("recovery-stages");
+        let mut db = Db::open(&root).unwrap();
+        let monolog = db.create_monolog("Работа", "2026-11-12T10:00:00+05:00");
+        let queued = db.add_message(monolog.id, "2026-11-12T15:00:00+05:00", "2026-11-12T15:00:01+05:00");
+        assert!(db.set_stage(queued.id, Stage::Uploading));
+        assert!(db.set_stage(queued.id, Stage::Queued));
+        assert!(
+            db.set_stage(queued.id, Stage::Silent),
+            "a queued take with no audio settles as silence"
+        );
+
+        let busy = db.add_message(monolog.id, "2026-11-12T15:05:00+05:00", "2026-11-12T15:05:01+05:00");
+        assert!(db.set_stage(busy.id, Stage::Uploading));
+        assert!(db.set_stage(busy.id, Stage::Queued));
+        assert!(db.set_stage(busy.id, Stage::Transcribing));
+        assert!(
+            db.set_stage(busy.id, Stage::Queued),
+            "a take interrupted mid-transcription goes back to the queue"
+        );
+        // A finished message still may not be reopened.
+        assert!(db.set_stage(busy.id, Stage::Transcribing));
+        assert!(db.set_stage(busy.id, Stage::Done));
+        assert!(!db.set_stage(busy.id, Stage::Transcribing), "done stays done");
         let _ = std::fs::remove_dir_all(root);
     }
 

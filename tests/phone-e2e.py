@@ -168,7 +168,7 @@ def swipe_card(browser, dx=110):
 
 
 def view_geometry(browser):
-    """The viewport's own numbers: a plate or a note must not change them."""
+    """The viewport's own numbers: a bar or a note must not change them."""
     return json.loads(
         browser.evaluate(
             "JSON.stringify((() => { const view = document.getElementById('view');"
@@ -176,6 +176,43 @@ def view_geometry(browser):
             " scrollTop: view.scrollTop }; })())"
         )
     )
+
+
+def pointer_click(browser, selector):
+    """Click an element with a real mouse, so pointer-events and hit testing count."""
+    target = json.dumps(selector)
+    box = browser.evaluate(
+        "(() => { const node = document.querySelector(" + target + ");"
+        " if (!node) return null; const rect = node.getBoundingClientRect();"
+        " return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 }; })()"
+    )
+    if not box:
+        return False
+    browser.call(
+        "Input.dispatchMouseEvent",
+        {"type": "mouseMoved", "x": box["x"], "y": box["y"]},
+    )
+    browser.call(
+        "Input.dispatchMouseEvent",
+        {
+            "type": "mousePressed",
+            "x": box["x"],
+            "y": box["y"],
+            "button": "left",
+            "clickCount": 1,
+        },
+    )
+    browser.call(
+        "Input.dispatchMouseEvent",
+        {
+            "type": "mouseReleased",
+            "x": box["x"],
+            "y": box["y"],
+            "button": "left",
+            "clickCount": 1,
+        },
+    )
+    return True
 
 
 # ---------------------------------------------------------------- diagnostics
@@ -1021,9 +1058,9 @@ def main():
         check(sheet == 200, f"the page stylesheet is served ({sheet})")
 
         print("a note is an overlay that never moves the view")
-        # The old note was a row in the layout; it now floats above the dock.
-        # It must show at most one copy of the same words, fade on its own, and
-        # leave the scrolling viewport exactly as it was.
+        # The note is a dismissible overlay above the dock. It speaks once per
+        # condition, leaves the scrolling viewport exactly as it was, and a tap
+        # on the banner removes it until the condition ends and comes back.
         wait_for(
             lambda: browser.evaluate("!!document.getElementById('install')"),
             timeout=20,
@@ -1037,8 +1074,7 @@ def main():
             timeout=10,
             what="the note about the lost connection",
         )
-        # The same words again, while the first note is still up: not a second
-        # copy, and definitely not a layout row.
+        # The link is still down: the same condition must not add a second note.
         browser.evaluate("window.dispatchEvent(new Event('offline'))")
         time.sleep(0.6)
         notes = json.loads(
@@ -1053,6 +1089,11 @@ def main():
                 "     left: Math.round(box.left), right: Math.round(box.right) }; };"
                 " return { count: notes.querySelectorAll('.banner').length,"
                 "   position: style.position, pointer: style.pointerEvents,"
+                "   tag: banner ? banner.tagName : '',"
+                "   classes: banner ? banner.className : '',"
+                "   text: banner && banner.querySelector('.banner-text')"
+                "     ? banner.querySelector('.banner-text').textContent : '',"
+                "   close: !!(banner && banner.querySelector('.banner-close')),"
                 "   banner: inside(banner), footer: inside(footer),"
                 "   width: document.documentElement.scrollWidth, page: innerWidth }; })())"
             )
@@ -1060,7 +1101,7 @@ def main():
         after_note = view_geometry(browser)
         check(
             notes["count"] == 1,
-            f"a repeated note inside four seconds is shown once ({notes['count']} banners)",
+            f"the lost link has one note, not a pile ({notes['count']} banners)",
         )
         check(
             before_note == after_note,
@@ -1072,6 +1113,13 @@ def main():
             f"the note is an overlay, not a row ({notes['position']}, pointer {notes['pointer']})",
         )
         check(
+            notes["tag"] == "BUTTON"
+            and "banner" in notes["classes"].split()
+            and notes["text"]
+            and notes["close"],
+            f"the note is a dismissible banner button ({notes})",
+        )
+        check(
             notes["banner"] is not None
             and notes["footer"] is not None
             and notes["banner"]["bottom"] <= notes["footer"]["top"],
@@ -1081,6 +1129,54 @@ def main():
             notes["width"] <= notes["page"],
             f"the note does not push the page sideways ({notes['width']} of {notes['page']})",
         )
+        # A real pointer tap, not element.click(): the overlay's hit testing is
+        # part of what makes the note dismissible.
+        check(pointer_click(browser, "#notes .banner"), "the note banner is tappable")
+        wait_for(
+            lambda: browser.evaluate("document.querySelectorAll('#notes .banner').length === 0"),
+            timeout=5,
+            what="the tapped note to go away",
+        )
+        check(True, "tapping the note removes it")
+        # Dismissed, but the link is still down: the same condition stays quiet.
+        browser.evaluate("window.dispatchEvent(new Event('offline'))")
+        time.sleep(0.6)
+        check(
+            browser.evaluate("document.querySelectorAll('#notes .banner').length === 0"),
+            "the note does not come back while the link stays down",
+        )
+        # A new loss after a recovery is a new condition and speaks again.
+        browser.evaluate("window.dispatchEvent(new Event('online'))")
+        time.sleep(0.2)
+        browser.evaluate("window.dispatchEvent(new Event('offline'))")
+        wait_for(
+            lambda: browser.evaluate("document.querySelectorAll('#notes .banner').length > 0"),
+            timeout=5,
+            what="the note after a new loss",
+        )
+        check(True, "a new loss after a recovery shows the note again")
+        # The note also leaves when it is swiped away, the way a phone dismisses a
+        # banner: the finger drags it sideways, past the threshold it goes.
+        swiped = browser.evaluate(
+            "(() => { const banner = document.querySelector('#notes .banner');"
+            " if (!banner) return 'no banner';"
+            " const box = banner.getBoundingClientRect();"
+            " const start = { clientX: box.left + box.width / 2, clientY: box.top + box.height / 2 };"
+            " const fire = (type, x) => banner.dispatchEvent(new PointerEvent(type, {"
+            "   bubbles: true, cancelable: true, pointerId: 7, pointerType: 'touch',"
+            "   clientX: start.clientX + x, clientY: start.clientY }));"
+            " fire('pointerdown', 0);"
+            " for (const step of [12, 30, 55, 80, 110]) fire('pointermove', step);"
+            " fire('pointerup', 130);"
+            " return 'swiped'; })()"
+        )
+        check(swiped == "swiped", f"the note accepts a sideways gesture ({swiped})")
+        wait_for(
+            lambda: browser.evaluate("document.querySelectorAll('#notes .banner').length === 0"),
+            timeout=5,
+            what="the swiped note to go away",
+        )
+        check(True, "swiping the note away removes it")
         wait_for(
             lambda: browser.evaluate("document.querySelectorAll('#notes .banner').length === 0"),
             timeout=6,
@@ -1152,9 +1248,11 @@ def main():
         check(True, "the record button shows the recording state")
         snapshot(browser, daemon, diag, "just after the record click")
 
-        print("the recording plate on the list")
+        print("the composer bar on the list")
         # Leaving the monolog must not stop the take: the list marks the monolog
-        # and the plate keeps the running take in sight outside its monolog.
+        # and the same composer bar, with the monolog's name, keeps the running
+        # take in sight and stoppable outside it.
+        feed_geometry = view_geometry(browser)
         browser.evaluate("document.getElementById('back').click()")
         wait_for(
             lambda: browser.evaluate("document.getElementById('title').textContent === 'Монологи'"),
@@ -1170,70 +1268,99 @@ def main():
             "идёт расшифровка" in marked,
             f"the list marks the monolog that is being recorded ({marked!r})",
         )
-        plate = json.loads(
+        bar = json.loads(
             browser.evaluate(
-                "JSON.stringify((() => { const plate = document.getElementById('rec-plate');"
-                " if (!plate) return null;"
-                " return { monolog: plate.dataset.monolog,"
-                "   name: (plate.querySelector('.vb-plate-name') || {}).textContent || '',"
-                "   timer: (plate.querySelector('#rec-plate-timer') || {}).textContent || '',"
-                "   stop: !!document.getElementById('rec-plate-stop'),"
-                "   composerHidden: document.getElementById('composer').hidden,"
-                "   position: getComputedStyle(plate).position }; })())"
+                "JSON.stringify((() => { const composer = document.getElementById('composer');"
+                " const record = document.getElementById('record');"
+                " const view = document.getElementById('view');"
+                " const name = document.getElementById('rec-name');"
+                " const viewBox = view.getBoundingClientRect();"
+                " const barBox = composer.getBoundingClientRect();"
+                " return { hidden: composer.hidden,"
+                "   record: !!record,"
+                "   recordClass: record ? record.className : '',"
+                "   title: (document.getElementById('rec-title') || {}).textContent || '',"
+                "   timer: (document.getElementById('timer') || {}).textContent || '',"
+                "   name: name ? name.textContent : null,"
+                "   viewBottom: Math.round(viewBox.bottom),"
+                "   barTop: Math.round(barBox.top),"
+                "   position: getComputedStyle(composer).position,"
+                "   geom: { clientHeight: view.clientHeight, scrollTop: view.scrollTop } }; })())"
             )
         )
         check(
-            plate is not None and plate["monolog"] == "1",
-            f"the plate names the monolog it records into ({plate})",
+            bar["hidden"] is False and bar["record"],
+            f"the composer bar is on the list while recording ({bar})",
         )
         check(
-            plate is not None and "Проверка" in plate["name"],
-            f"the plate shows that monolog's name ({plate})",
+            "recording" in bar["recordClass"].split(),
+            f"the list's record button shows the take is live ({bar['recordClass']!r})",
+        )
+        # The name sits on the state line after a dot: "Идёт запись · Проверка".
+        check(
+            bar["title"].startswith("Идёт запись"),
+            f"the list bar names the state ({bar['title']!r})",
         )
         check(
-            plate is not None and plate["stop"],
-            "the plate offers a Stop button",
+            "Проверка" in (bar["name"] or ""),
+            f"the list bar names the monolog being recorded ({bar['name']!r})",
         )
         check(
-            plate is not None and plate["composerHidden"],
-            "the composer is hidden on the list while the plate is up",
+            "·" in bar["title"] and bar["title"].strip().endswith("Проверка"),
+            f"the monolog name follows the state on the same line ({bar['title']!r})",
         )
-        check(
-            plate is not None and plate["position"] == "absolute",
-            f"the plate is an overlay, not a list row ({plate})",
-        )
-        first_timer = plate["timer"] if plate else ""
+        first_timer = bar["timer"]
         check(
             len(first_timer) == 5
             and first_timer[2] == ":"
             and first_timer.replace(":", "").isdigit(),
-            f"the plate has a running timer ({first_timer!r})",
+            f"the list bar has a running timer ({first_timer!r})",
+        )
+        # Outside a monolog the bar floats above the dock on purpose: leaving a
+        # monolog in the middle of a take must not move the list by the height of
+        # the bar. So the bar overlaps the view instead of taking a row from it,
+        # and the list keeps the height it had before the take started.
+        check(
+            bar.get("position") == "absolute" and bar["viewBottom"] > bar["barTop"],
+            f"outside a monolog the bar floats over the list instead of taking its height ({bar})",
+        )
+        check(
+            bar["geom"]["clientHeight"] > feed_geometry["clientHeight"]
+            and bar["geom"]["scrollTop"] == 0,
+            "the list keeps its full height while the floating bar is up"
+            f" ({feed_geometry} then {bar['geom']})",
         )
         wait_for(
             lambda: (
                 lambda value: value != first_timer and len(value) == 5
             )(
                 browser.evaluate(
-                    "(document.getElementById('rec-plate-timer') || {}).textContent || ''"
+                    "(document.getElementById('timer') || {}).textContent || ''"
                 )
             ),
             timeout=4,
-            what="the plate timer to run",
+            what="the composer timer to run",
         )
-        check(True, "the plate timer runs")
-        with_plate = view_geometry(browser)
-        # The plate itself is the tap target; its Stop button is the one part
-        # that must not open the monolog.
-        browser.evaluate("document.getElementById('rec-plate').click()")
+        check(True, "the composer timer runs on the list")
+        stayed = view_geometry(browser)
+        check(
+            stayed["clientHeight"] == bar["geom"]["clientHeight"]
+            and stayed["scrollTop"] == bar["geom"]["scrollTop"],
+            f"the live bar does not move the view ({bar['geom']} then {stayed})",
+        )
+        # Tapping the marked card returns to the recording monolog; there is no
+        # separate plate to tap any more.
+        browser.evaluate("document.querySelector('.monolog-card.active').click()")
         wait_for(
             lambda: browser.evaluate(
                 "document.getElementById('title').textContent === 'Проверка'"
+                " && !document.getElementById('composer').hidden"
                 " && document.getElementById('record').classList.contains('recording')"
             ),
             timeout=10,
             what="the recording monolog again",
         )
-        check(True, "tapping the plate opens the recording monolog")
+        check(True, "tapping the marked card opens the recording monolog")
         snapshot(browser, daemon, diag, "3 s into the recording")
 
         print("text while the recording is still running")
@@ -1278,8 +1405,8 @@ def main():
                 f"the phone shows the text while the recording is still open ({shown[:40]!r})",
             )
         time.sleep(1)
-        # The plate is the only control outside the monolog: its Stop ends the
-        # take from the list, and its overlay leaves the viewport alone.
+        # The same composer bar on the list stops the take: there is no separate
+        # plate any more, and the bar is the only control outside the monolog.
         browser.evaluate("document.getElementById('back').click()")
         wait_for(
             lambda: browser.evaluate("document.getElementById('title').textContent === 'Монологи'"),
@@ -1287,26 +1414,19 @@ def main():
             what="the list to stop the take",
         )
         timer_now = browser.evaluate(
-            "(document.getElementById('rec-plate-timer') || {}).textContent || ''"
+            "(document.getElementById('timer') || {}).textContent || ''"
         )
         check(
             timer_now != first_timer,
-            f"the plate timer kept running after the tap ({first_timer} then {timer_now})",
+            f"the composer timer kept running on the list ({first_timer} then {timer_now})",
         )
-        browser.evaluate("document.getElementById('rec-plate-stop').click()")
+        browser.evaluate("document.getElementById('record').click()")
         wait_for(
-            lambda: browser.evaluate("!document.getElementById('rec-plate')"),
+            lambda: browser.evaluate("document.getElementById('composer').hidden"),
             timeout=10,
-            what="the plate to leave after Stop",
+            what="the composer bar to leave after Stop",
         )
-        check(True, "the plate's Stop ends the take")
-        after_stop = view_geometry(browser)
-        check(
-            after_stop["clientHeight"] == with_plate["clientHeight"]
-            and after_stop["scrollTop"] == with_plate["scrollTop"],
-            "the plate does not change the view's clientHeight or scrollTop"
-            f" ({with_plate} then {after_stop})",
-        )
+        check(True, "the record button on the list stops the take")
         # Back into the monolog to watch the text that arrives after the stop.
         browser.evaluate("document.querySelectorAll('.monolog-card')[0].click()")
         wait_for(
@@ -1321,7 +1441,7 @@ def main():
             not browser.evaluate(
                 "document.getElementById('record').classList.contains('recording')"
             ),
-            "the record button leaves the recording state after the plate's Stop",
+            "the record button leaves the recording state after the list Stop",
         )
         time.sleep(0.2)
         snapshot(browser, daemon, diag, "just after the stop click")
@@ -1439,6 +1559,12 @@ def main():
         long_text = "Правка текста без потери смысла. " * 14
         browser.evaluate("document.querySelector('.message').click()")
         wait_sheet(browser)
+        done_items = sheet_labels(browser)
+        check(
+            "Изменить текст" in done_items
+            and "Повторить распознавание" not in done_items,
+            f"a done message offers edit but no recognition retry ({done_items})",
+        )
         check(sheet_click(browser, "Изменить текст"), "the message menu offers an edit")
         wait_for(
             lambda: browser.evaluate("!!document.querySelector('.vb-edit-field')"),
@@ -1507,6 +1633,50 @@ def main():
             what="the folded message again",
         )
         check(True, "«Свернуть» folds the message again")
+
+        print("only a failed take can be retried")
+        # A finished message has no retry (checked in its menu above); a take the
+        # computer could not transcribe still does. A draft finished with no audio
+        # becomes exactly that failed take.
+        failed_draft = daemon.api("/site/api/messages", "POST", {"monolog": 1})
+        failed_id = int((failed_draft.get("message") or {}).get("id") or 0)
+        failed_finish = daemon.api(
+            f"/site/api/messages/{failed_id}/finish", "POST"
+        )
+        check(
+            failed_finish.get("stage") == "failed",
+            f"the computer made a failed take to inspect ({failed_finish})",
+        )
+        failed_card = json.dumps(f'.message[data-id="{failed_id}"]')
+        wait_for(
+            lambda: browser.evaluate(
+                "(document.querySelector(" + failed_card + ") || {}).textContent || ''"
+            ).find("ошибка распознавания") >= 0,
+            timeout=20,
+            what="the failed message on the phone",
+        )
+        browser.evaluate(f"document.querySelector({failed_card}).click()")
+        wait_sheet(browser)
+        failed_items = sheet_labels(browser)
+        # This failed message was created without any audio (a draft that was
+        # finished at once), so the computer has nothing to re-read: a retry could
+        # only fail, and the button is deliberately absent. A failed message that
+        # still has its audio keeps the button — that case is covered by the Rust
+        # test `only_a_failed_take_can_be_retried`.
+        check(
+            "Повторить распознавание" not in failed_items,
+            f"a failed message with no audio offers no retry ({failed_items})",
+        )
+        check(
+            "Удалить сообщение" in failed_items,
+            f"a failed message can still be deleted ({failed_items})",
+        )
+        browser.evaluate("history.back()")
+        wait_for(
+            lambda: browser.evaluate("document.querySelectorAll('.sheet-backdrop').length === 0"),
+            timeout=10,
+            what="the failed message sheet to close",
+        )
 
         print("the network drops in the middle of a take")
         before_drop = len(daemon.messages())

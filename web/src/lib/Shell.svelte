@@ -10,7 +10,7 @@
   import type { Snippet } from 'svelte';
   import { page } from '../state.svelte';
   import Composer from './Composer.svelte';
-  import RecordingPlate from './RecordingPlate.svelte';
+  import NoteBanner from './NoteBanner.svelte';
   import ScrollThumb from './ScrollThumb.svelte';
 
   interface Props {
@@ -25,7 +25,10 @@
   const inFeed = $derived(page.screen === 'feed' && page.monolog !== null);
   const showBack = $derived(inFeed || page.archived || page.screen === 'settings');
   const showMenu = $derived(!page.selection && (inFeed || page.screen === 'list'));
-  const showComposer = $derived(inFeed && !page.archived);
+  // The composer bar is the one and only recording panel: inside a monolog it
+  // records, and on the list or in the archive it shows the same bar while a take
+  // is running, with the monolog's name, so the person can always see and stop it.
+  const showComposer = $derived((inFeed && !page.archived) || page.recording !== null);
   const selectedCount = $derived(page.selected.length);
 </script>
 
@@ -79,19 +82,14 @@
       </div>
     {/if}
 
-    {#if page.recording}
-      <RecordingPlate />
-    {/if}
-
     <!-- Transient messages are an overlay above the composer area, never a row
          in the layout: a note must not push the content or move the reader. -->
     <div
       id="notes"
       class="notes"
-      class:with-plate={page.recording !== null}
       role="status"
       aria-live="polite"
-      >{#each page.notes as note (note.id)}<p class="banner">{note.text}</p>{/each}{#if page.updateReady}<p class="banner"><button
+      >{#each page.notes as note (note.id)}<NoteBanner text={note.text} id={note.id} onDismiss={(id) => page.dismissNote(id)} />{/each}{#if page.updateReady}<p class="banner"><button
             class="action"
             id="update-app"
             type="button"
@@ -111,7 +109,12 @@
       >
     </footer>
 
-    <div id="composer" class="vb-composer" hidden={!showComposer}>
+    <div
+      id="composer"
+      class="vb-composer"
+      class:detached={page.recording !== null && !inFeed}
+      hidden={!showComposer}
+    >
       {#if showComposer}
         <Composer />
       {/if}

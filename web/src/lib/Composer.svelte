@@ -13,7 +13,13 @@
 
   const recording = $derived(page.recording !== null);
   const offline = $derived(recording && !page.reachable);
-  const disabled = $derived(page.monolog === null || page.archived);
+  // On the list and in the archive the same bar is shown while a take runs, so it
+  // has to say which monolog is being recorded; inside that monolog the title
+  // already does.
+  const elsewhere = $derived(
+    recording && (page.monolog === null || page.monolog.id !== page.recording?.monologId),
+  );
+  const disabled = $derived(!recording && (page.monolog === null || page.archived));
 
   const title = $derived(
     recording
@@ -48,7 +54,11 @@
   </button>
 </div>
 <div class="vb-composer-hint" id="rec-hint">
-  <b id="rec-title">{title}</b>
+  <b id="rec-title"
+    >{title}{#if elsewhere}<span class="vb-composer-name" id="rec-name"
+        ><span class="vb-composer-dot">·</span>{page.recording?.name}</span
+      >{/if}</b
+  >
   <span id="rec-sub">{hint}</span>
 </div>
 <span class="vb-composer-timer" id="timer">{recording ? formatDuration(page.elapsed) : ''}</span>

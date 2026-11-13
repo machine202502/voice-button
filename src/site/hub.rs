@@ -366,6 +366,12 @@ impl DbSink<'_> {
             if stage == target {
                 break;
             }
+            // The destination first: a queued or transcribing take may now be closed
+            // directly, and walking through the intermediate stages would stop at
+            // the first legal step and never arrive.
+            if db.set_stage(id, target) {
+                break;
+            }
             let Some(step) = [
                 Stage::Uploading,
                 Stage::Queued,
