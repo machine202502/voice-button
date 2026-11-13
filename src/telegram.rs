@@ -13,7 +13,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::asr::AsrClient;
 use crate::config::AppDirs;
 use crate::state::{Shared, Status};
 
@@ -570,7 +569,7 @@ fn settings(dirs: &AppDirs, shared: &Arc<Shared>) -> (bool, String, String, Stri
 
 /// Start the polling and worker threads. They live as long as the daemon and
 /// wait quietly while the setting is off or no token is stored.
-pub fn spawn(dirs: AppDirs, shared: Arc<Shared>, asr: Arc<Mutex<AsrClient>>) {
+pub fn spawn(dirs: AppDirs, shared: Arc<Shared>, asr: Arc<crate::asr_engine::Engine>) {
     let state = Arc::new(Mutex::new(load_state(&dirs)));
 
     let poll_dirs = dirs.clone();
@@ -823,7 +822,7 @@ fn process_job(
     client: &dyn Api,
     dirs: &AppDirs,
     shared: &Arc<Shared>,
-    asr: &Arc<Mutex<AsrClient>>,
+    asr: &Arc<crate::asr_engine::Engine>,
     state: &Arc<Mutex<TelegramState>>,
     job: &Job,
 ) -> Result<String> {
@@ -882,9 +881,12 @@ fn process_job(
             save_state(dirs, &state);
         }
         let reply = asr
-            .lock()
-            .unwrap()
-            .decode("", chunk, crate::telegram_media::TARGET_RATE)
+            .decode(
+                crate::asr_engine::Priority::Telegram,
+                "",
+                chunk,
+                crate::telegram_media::TARGET_RATE,
+            )
             .context("the recognizer did not answer")?;
         if reply.ok && !reply.text.trim().is_empty() {
             if !text.is_empty() {

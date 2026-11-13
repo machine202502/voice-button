@@ -159,7 +159,7 @@ fn the_eight_minute_recording_is_transcribed_whole() {
     let dir = temp_dir("whole");
     write_recording(&dir, &samples);
 
-    let client = std::sync::Arc::new(std::sync::Mutex::new(voice_button::asr::AsrClient::new(exe)));
+    let client = std::sync::Arc::new(voice_button::asr_engine::Engine::new(exe));
     let began = Instant::now();
     let (text, audio_seconds, failed) =
         voice_button::session::recover(&client, &dir, &model_id(), 25.0, 1.0).expect("recovery");
@@ -222,7 +222,7 @@ fn a_live_session_writes_the_audio_and_reports_the_text() {
         clipboard: true,
         buffer: buffer.clone(),
     };
-    let client = Arc::new(Mutex::new(voice_button::asr::AsrClient::new(exe)));
+    let client = Arc::new(voice_button::asr_engine::Engine::new(exe));
     let handle = session::start(shared, dirs, events, client, start).expect("start the session");
     // Twelve seconds of the recording, in the 100 ms chunks the recorder hands
     // over.
@@ -291,7 +291,7 @@ fn the_api_server_transcribes_the_recording_over_http() {
     let shared = Arc::new(Shared::new(cfg, History::from_entries(Vec::new())));
     voice_button::daemon::install(voice_button::daemon::Runtime {
         buffer: Arc::new(Mutex::new(Vec::new())),
-        asr: Arc::new(Mutex::new(voice_button::asr::AsrClient::new(exe))),
+        asr: Arc::new(voice_button::asr_engine::Engine::new(exe)),
         session: Mutex::new(None),
         file: Mutex::new(None),
     });
@@ -506,7 +506,7 @@ fn an_imported_file_is_transcribed_without_copying_it() {
     cfg.onnx_model = "gigaam-v3-rnnt-punct".to_string();
     let shared = Arc::new(Shared::new(cfg, History::from_entries(Vec::new())));
     let (events, received) = mpsc::channel();
-    let client = Arc::new(Mutex::new(voice_button::asr::AsrClient::new(exe)));
+    let client = Arc::new(voice_button::asr_engine::Engine::new(exe));
     let path = asset("dictation-8min.mp3");
     let handle = voice_button::session::start_file(shared, dirs.clone(), events, client, path.clone())
         .expect("start the file transcription");

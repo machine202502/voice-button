@@ -3,7 +3,7 @@
 use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
-use voice_button::asr::AsrClient;
+use voice_button::asr_engine::Engine;
 use voice_button::daemon::{self, Runtime};
 use voice_button::recorder::Recorder;
 use voice_button::session::{self, SessionStart};
@@ -619,7 +619,7 @@ fn apply_phone(
     enabled: bool,
     port: u16,
     shared: &Arc<Shared>,
-    asr: &Arc<Mutex<AsrClient>>,
+    asr: &Arc<Engine>,
     phone: &mut Option<voice_button::site::runtime::PhoneRuntime>,
     paired: &mut Option<bool>,
 ) {
@@ -749,7 +749,7 @@ fn start_recovery(
     shared: Arc<Shared>,
     dirs: config::AppDirs,
     events: mpsc::Sender<AppEvent>,
-    asr: Arc<Mutex<AsrClient>>,
+    asr: Arc<Engine>,
     tray_cmds: mpsc::Sender<tray::TrayCommand>,
     crashed: bool,
 ) {
@@ -953,9 +953,9 @@ fn run_daemon() {
     // The recognizer runs in `voice-button.exe --asr-worker`, started lazily on
     // the first segment: a crash inside ONNX Runtime then costs one process,
     // never the recording.
-    let asr = Arc::new(Mutex::new(AsrClient::new(
+    let asr = Arc::new(Engine::new(
         std::env::current_exe().unwrap_or_else(|_| "voice-button.exe".into()),
-    )));
+    ));
     // The Telegram bot waits for its switch and token, then polls in its own
     // threads; it is lower priority than the phone and the microphone.
     voice_button::telegram::spawn(dirs.clone(), shared.clone(), asr.clone());
@@ -1797,9 +1797,9 @@ mod tests {
     fn init_runtime() {
         voice_button::daemon::install(voice_button::daemon::Runtime {
             buffer: Arc::new(Mutex::new(Vec::new())),
-            asr: Arc::new(Mutex::new(voice_button::asr::AsrClient::new(
+            asr: Arc::new(voice_button::asr_engine::Engine::new(
                 std::path::PathBuf::from("voice-button.exe"),
-            ))),
+            )),
             session: Mutex::new(None),
             file: Mutex::new(None),
         });

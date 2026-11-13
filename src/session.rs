@@ -7,7 +7,7 @@
 //! segment is never longer than `MAX_SEGMENT`, and a failing engine costs the
 //! session nothing but that segment.
 
-use crate::asr::AsrClient;
+use crate::asr_engine::{Engine, Priority};
 use crate::audio::{read_wav, Resampler, WavWriter};
 use crate::config::AppDirs;
 use crate::history::EntryState;
@@ -152,7 +152,7 @@ pub fn start(
     shared: Arc<Shared>,
     dirs: AppDirs,
     events: mpsc::Sender<AppEvent>,
-    asr: Arc<Mutex<AsrClient>>,
+    asr: Arc<Engine>,
     start: SessionStart,
 ) -> Result<SessionHandle> {
     let dir = recordings_dir(&dirs.root).join(format!(
@@ -179,7 +179,7 @@ fn run(
     shared: Arc<Shared>,
     dirs: AppDirs,
     events: mpsc::Sender<AppEvent>,
-    asr: Arc<Mutex<AsrClient>>,
+    asr: Arc<Engine>,
     start: SessionStart,
     dir: PathBuf,
     control: mpsc::Receiver<Control>,
@@ -400,8 +400,15 @@ fn run(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn priority(kind: InteractorKind) -> Priority {
+    match kind {
+        InteractorKind::User => Priority::User,
+        InteractorKind::Server => Priority::Api,
+    }
+}
+
 fn decode_segment(
-    asr: &Arc<Mutex<AsrClient>>,
+    asr: &Arc<Engine>,
     model_id: &str,
     start: &SessionStart,
     shared: &Arc<Shared>,
@@ -415,10 +422,12 @@ fn decode_segment(
         return;
     }
     let began = std::time::Instant::now();
-    let mut result = asr
-        .lock()
-        .unwrap()
-        .decode(model_id, &segment.samples, SAMPLE_RATE);
+    let mut result = asr.decode(
+        priority(start.interactor.kind),
+        model_id,
+        &segment.samples,
+        SAMPLE_RATE,
+    );
     if result.is_err() {
         // The worker is restarted by the client; one retry covers a crash.
         log::log(&format!(
@@ -427,10 +436,12 @@ fn decode_segment(
             segment.index,
             result.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default()
         ));
-        result = asr
-            .lock()
-            .unwrap()
-            .decode(model_id, &segment.samples, SAMPLE_RATE);
+        result = asr.decode(
+            priority(start.interactor.kind),
+            model_id,
+            &segment.samples,
+            SAMPLE_RATE,
+        );
     }
     match result {
         Ok(reply) => {
@@ -493,7 +504,7 @@ pub fn start_file(
     shared: Arc<Shared>,
     dirs: AppDirs,
     events: mpsc::Sender<AppEvent>,
-    asr: Arc<Mutex<AsrClient>>,
+    asr: Arc<Engine>,
     path: PathBuf,
 ) -> Result<FileHandle> {
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -509,7 +520,7 @@ fn run_file(
     shared: Arc<Shared>,
     dirs: AppDirs,
     events: mpsc::Sender<AppEvent>,
-    asr: Arc<Mutex<AsrClient>>,
+    asr: Arc<Engine>,
     path: PathBuf,
     cancelled: Arc<AtomicBool>,
 ) {
@@ -643,7 +654,7 @@ fn run_file(
 
 /// Decode one segment of an imported file (two attempts, like a recording).
 fn decode_file_segment(
-    asr: &Arc<Mutex<AsrClient>>,
+    asr: &Arc<Engine>,
     segment: &Segment,
     stitcher: &mut Stitcher,
 ) -> bool {
@@ -652,15 +663,9 @@ fn decode_file_segment(
     }
     // An empty model id means "the model selected in Settings", which also
     // covers custom model folders.
-    let mut result = asr
-        .lock()
-        .unwrap()
-        .decode("", &segment.samples, SAMPLE_RATE);
+    let mut result = asr.decode(Priority::File, "", &segment.samples, SAMPLE_RATE);
     if result.is_err() {
-        result = asr
-            .lock()
-            .unwrap()
-            .decode("", &segment.samples, SAMPLE_RATE);
+        result = asr.decode(Priority::File, "", &segment.samples, SAMPLE_RATE);
     }
     match result {
         Ok(reply) => {
@@ -687,7 +692,7 @@ fn decode_file_segment(
 /// the start: the file is the source of truth, so recovery never depends on how
 /// far the interrupted run got.
 pub fn recover(
-    asr: &Arc<Mutex<AsrClient>>,
+    asr: &Arc<Engine>,
     dir: &Path,
     model: &str,
     limit: f32,
@@ -714,15 +719,9 @@ pub fn recover(
         out
     };
     let decode = |segment: &Segment, stitcher: &mut Stitcher, failed: &mut usize| {
-        let mut result = asr
-            .lock()
-            .unwrap()
-            .decode(model, &segment.samples, SAMPLE_RATE);
+        let mut result = asr.decode(Priority::User, model, &segment.samples, SAMPLE_RATE);
         if result.is_err() {
-            result = asr
-                .lock()
-                .unwrap()
-                .decode(model, &segment.samples, SAMPLE_RATE);
+            result = asr.decode(Priority::User, model, &segment.samples, SAMPLE_RATE);
         }
         match result {
             Ok(reply) => {

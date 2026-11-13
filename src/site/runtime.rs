@@ -182,7 +182,7 @@ impl PhoneRuntime {
         root: &Path,
         port: u16,
         shared: Arc<Shared>,
-        asr: Arc<Mutex<crate::asr::AsrClient>>,
+        asr: Arc<crate::asr_engine::Engine>,
         static_dir: Option<PathBuf>,
     ) -> Result<Self> {
         let db = Arc::new(Mutex::new(Db::open(root)?));
@@ -301,10 +301,10 @@ mod tests {
         shared_with(Status::NoModel)
     }
 
-    fn worker() -> Arc<Mutex<crate::asr::AsrClient>> {
-        Arc::new(Mutex::new(crate::asr::AsrClient::new(
+    fn worker() -> Arc<crate::asr_engine::Engine> {
+        Arc::new(crate::asr_engine::Engine::new(
             std::env::temp_dir().join("vb-no-such-worker.exe"),
-        )))
+        ))
     }
 
     #[test]

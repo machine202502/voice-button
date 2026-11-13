@@ -18,12 +18,12 @@ use super::queue::{Decoder, Outcome};
 use crate::state::{Shared, Status};
 
 pub struct AsrDecoder {
-    client: Arc<std::sync::Mutex<crate::asr::AsrClient>>,
+    client: Arc<crate::asr_engine::Engine>,
     failures_before_reset: usize,
 }
 
 impl AsrDecoder {
-    pub fn new(client: Arc<std::sync::Mutex<crate::asr::AsrClient>>) -> Self {
+    pub fn new(client: Arc<crate::asr_engine::Engine>) -> Self {
         Self {
             client,
             failures_before_reset: 0,
@@ -35,9 +35,12 @@ impl Decoder for AsrDecoder {
     fn decode(&mut self, samples: &[f32]) -> Result<Outcome, String> {
         let reply = self
             .client
-            .lock()
-            .map_err(|_| "the recognizer is poisoned".to_string())?
-            .decode("", samples, crate::session::SAMPLE_RATE)
+            .decode(
+                crate::asr_engine::Priority::Phone,
+                "",
+                samples,
+                crate::session::SAMPLE_RATE,
+            )
             .map_err(|error| format!("{error:#}"))?;
         self.failures_before_reset = 0;
         if reply.text.trim().is_empty() {
@@ -109,9 +112,9 @@ mod tests {
     fn a_failed_decode_is_an_error_not_an_empty_answer() {
         // A client that was never started cannot decode: the queue must see an
         // error, so the message ends up failed instead of silently empty.
-        let client = Arc::new(std::sync::Mutex::new(crate::asr::AsrClient::new(
+        let client = Arc::new(crate::asr_engine::Engine::new(
             std::env::temp_dir().join("vb-no-such-worker.exe"),
-        )));
+        ));
         let mut decoder = AsrDecoder::new(client);
         let result = decoder.decode(&vec![0.0; 1600]);
         assert!(result.is_err(), "a broken worker must not look like silence");

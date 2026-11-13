@@ -4,7 +4,7 @@
 //! needs the tray, so it lives in the library: the end-to-end API test drives
 //! exactly the same code the daemon runs, over a real HTTP socket.
 
-use crate::asr::AsrClient;
+use crate::asr_engine::Engine;
 use crate::config;
 use crate::ipc;
 use crate::log;
@@ -22,7 +22,7 @@ use std::sync::{mpsc, Arc, Mutex, OnceLock};
 pub struct Runtime {
     /// Audio captured by the microphone; the session drains it every 60 ms.
     pub buffer: Arc<Mutex<Vec<f32>>>,
-    pub asr: Arc<Mutex<AsrClient>>,
+    pub asr: Arc<Engine>,
     /// The session that is currently open, if any.
     pub session: Mutex<Option<SessionHandle>>,
     /// The imported file that is being transcribed, for cancellation.
