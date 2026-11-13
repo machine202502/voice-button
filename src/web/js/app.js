@@ -572,11 +572,30 @@ function mountScreen() {
   view.scrollTop = 0;
 }
 
+/// The window of rows that a given scroll offset covers. Cheap enough to run on
+/// every scroll event, which is the point: see `onViewScroll`.
+function windowAt(state, scrollTop, viewport) {
+  return visibleRows(state, layoutRows(state), scrollTop, viewport);
+}
+
+function sameWindow(left, right) {
+  return left.start === right.start && left.end === right.end;
+}
+
 function onViewScroll() {
   const state = activeState();
   if (!state || state.painting) return;
   if (state.kind === 'feed') onFeedScroll(state);
   else onListScroll(state);
+  // Repainting the whole list on every scroll event made the page flicker while
+  // a flick was decelerating: the window was torn down and rebuilt many times a
+  // second, and the scroll offset was restored after each rebuild. A paint is
+  // only needed when the set of visible rows actually changes; scrolling inside
+  // the same window needs none.
+  const view = el('view');
+  const viewport = view.clientHeight || 600;
+  const next = windowAt(state, Math.max(0, view.scrollTop - padTop()), viewport);
+  if (sameWindow(next, state.window)) return;
   schedulePaint(state);
 }
 

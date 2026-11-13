@@ -3093,7 +3093,7 @@ fn weekday_name(day: chrono::Weekday) -> &'static str {
 /// Height of one collapsed history row. A day header lives inside this slot,
 /// so every row has the same height and the scrollbar can map a position to a
 /// row without measuring the whole table.
-const HISTORY_ROW_HEIGHT: f32 = 34.0;
+const HISTORY_ROW_HEIGHT: f32 = 22.0;
 
 fn history_entry_for(
     history: &state::History,
