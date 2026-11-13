@@ -1704,24 +1704,10 @@ fn telegram_body(
     // last at the bottom. The date under a card is the date of the *original* file,
     // which can be years old for a forwarded note, so it is metadata only and never
     // reorders anything.
-    if chat.total() == 0 {
-        ui.horizontal(|ui| {
-            ui.add(
-                egui::TextEdit::singleline(search)
-                    .hint_text(tr("Search"))
-                    .desired_width(220.0),
-            );
-        });
-        ui.label(
-            RichText::new(if search.trim().is_empty() {
-                tr("Nothing from Telegram yet.")
-            } else {
-                tr("No matching messages.")
-            })
-            .weak(),
-        );
-        return;
-    }
+    // The filter row is always here, even when the list is empty: otherwise the
+    // screen hid the only control that could explain the emptiness, and a person
+    // whose messages are a week old saw "nothing from Telegram yet" with no way
+    // to reach them.
     ui.horizontal(|ui| {
         ui.add(
             egui::TextEdit::singleline(search)
@@ -1739,6 +1725,28 @@ fn telegram_body(
                 .weak(),
         );
     });
+    if chat.total() == 0 {
+        let searching = !search.trim().is_empty();
+        ui.label(
+            RichText::new(if searching {
+                tr("No matching messages.")
+            } else if *range == crate::telegram::ChatRange::Today {
+                tr("Nothing today")
+            } else if *range == crate::telegram::ChatRange::Week {
+                tr("Nothing this week")
+            } else {
+                tr("Nothing from Telegram yet.")
+            })
+            .weak(),
+        );
+        if !searching && *range != crate::telegram::ChatRange::All
+            && ui.button(tr("Show everything")).clicked()
+        {
+            *range = crate::telegram::ChatRange::All;
+        }
+        ui.separator();
+        return;
+    }
     ui.separator();
     // Proper lazy list: each row is drawn at its natural height and measured, so a
     // three-line message and a thirty-line one both fit, and nothing has to be

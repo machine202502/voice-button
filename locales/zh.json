@@ -303,6 +303,9 @@
     "Show more": "展开全文",
     "Show less": "收起",
     "Week": "本周",
-    "All time": "全部时间"
+    "All time": "全部时间",
+    "Nothing today": "今天没有消息。",
+    "Nothing this week": "本周没有消息。",
+    "Show everything": "显示全部时间"
   }
 }

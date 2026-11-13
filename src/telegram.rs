@@ -2132,6 +2132,34 @@ mod tests {
     }
 
     #[test]
+    fn old_messages_without_a_processing_stamp_fall_back_to_their_date() {
+        // Rows written before `added_at` existed have an empty stamp; the filter
+        // must still find them, or the log looks empty to anyone with history.
+        let dirs = dirs("legacy-range");
+        let nine_days_ago = (chrono::Utc::now() - chrono::Duration::days(9))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        {
+            let store = open_store(&dirs.root).expect("store");
+            let conn = store.conn();
+            for index in 0..3 {
+                conn.execute(
+                    "INSERT INTO telegram_chat(chat_id, message_id, at, sender, kind, file_name,
+                        seconds, text, error, added_at)
+                     VALUES (1, ?1, ?2, 'User', 'voice', 'old.ogg', 1.0, ?3, NULL, '')",
+                    rusqlite::params![index as i64 + 1, nine_days_ago, format!("old {index}")],
+                )
+                .expect("insert");
+            }
+        }
+        assert_eq!(chat_count(&dirs, ChatRange::Today), 0, "nothing was handled today");
+        assert_eq!(chat_count(&dirs, ChatRange::Week), 0);
+        assert_eq!(chat_count(&dirs, ChatRange::All), 3, "everything is still there");
+        assert_eq!(chat_page(&dirs, ChatRange::All, 10, 0).len(), 3);
+        let _ = std::fs::remove_dir_all(&dirs.root);
+    }
+
+    #[test]
     fn the_chat_keeps_the_order_the_bot_worked_through_it() {
         // The date on a message is the date of the original file and can be
         // anything: a forwarded note is old while it is processed today. The log

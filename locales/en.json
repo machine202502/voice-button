@@ -303,6 +303,9 @@
     "Show more": "Show more",
     "Show less": "Show less",
     "Week": "Week",
-    "All time": "All time"
+    "All time": "All time",
+    "Nothing today": "Nothing today.",
+    "Nothing this week": "Nothing this week.",
+    "Show everything": "Show everything"
   }
 }
