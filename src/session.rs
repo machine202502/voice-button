@@ -226,6 +226,17 @@ pub fn start(
     })
 }
 
+/// Name the history and the recovered state record for a session: the model the
+/// session asked for, or the one selected in Settings — the same rule the
+/// worker applies to an empty id. A local dictation asks for nothing, so
+/// without this fallback its entries said "unknown model".
+pub fn recorded_model(model: Option<&ModelChoice>, cfg: &crate::config::Config) -> String {
+    match model {
+        Some(model) => model.id.clone(),
+        None => transcribe::selected_id(cfg),
+    }
+}
+
 fn run(
     shared: Arc<Shared>,
     dirs: AppDirs,
@@ -240,11 +251,9 @@ fn run(
         .as_ref()
         .map(|model| model.api_id())
         .unwrap_or_default();
-    let model_label = start
-        .model
-        .as_ref()
-        .map(|model| model.id.clone())
-        .unwrap_or_default();
+    // The model that really decodes this recording, so the history and the
+    // state left for the recovery both name it.
+    let model_label = recorded_model(start.model.as_ref(), &shared.lock().config);
     let mut persisted = PersistedState {
         id: start.id,
         started: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
@@ -911,7 +920,7 @@ pub fn keep_for_recovery(dir: &Path) {
 
 #[cfg(test)]
 mod tests {
-    use super::{mark_failed, pending, recordings_dir, write_state, PersistedState};
+    use super::{mark_failed, pending, recorded_model, recordings_dir, write_state, PersistedState};
 
     #[test]
     fn a_failed_recording_is_not_retried_at_the_next_start() {
@@ -937,5 +946,28 @@ mod tests {
             "a failed recording must not be picked up again"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_local_dictation_records_the_model_selected_in_settings() {
+        use crate::config::{Backend, Config};
+        use crate::state::ModelChoice;
+
+        let mut cfg = Config::default();
+        cfg.backend = Backend::Onnx;
+        cfg.onnx_model = "gigaam-v3-rnnt-punct".to_string();
+        // The window, the hotkey and the tray start a recording without a model
+        // of their own: the history must still name the one that runs.
+        assert_eq!(recorded_model(None, &cfg), "gigaam-v3-rnnt-punct");
+
+        let asked = ModelChoice {
+            backend: Backend::Whisper,
+            id: "large-v3".to_string(),
+        };
+        assert_eq!(
+            recorded_model(Some(&asked), &cfg),
+            "large-v3",
+            "a session that names its model keeps it"
+        );
     }
 }

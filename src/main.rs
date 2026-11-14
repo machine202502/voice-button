@@ -795,13 +795,25 @@ fn start_recovery(
             let cfg = config::load_config(&dirs.root);
             let sensitivity = cfg.vad_sensitivity;
             for dir in pending {
+                // The state file keeps the plain catalogue id, while the worker
+                // takes either an `Engine/id` or an empty id that resolves
+                // through the settings. Either way the entry names the model
+                // that really decodes the recording.
                 let state = session::read_state(&dir).unwrap_or_default();
-                let model = state.model.clone();
-                let limit = match voice_button::state::ModelChoice::parse(&model) {
-                    Some(choice) => voice_button::transcribe::segment_limit(&choice),
-                    None => voice_button::transcribe::limit_for_config(&cfg),
+                let choice = voice_button::state::ModelChoice::parse(&state.model);
+                let model = choice
+                    .as_ref()
+                    .map(|choice| choice.id.clone())
+                    .unwrap_or_else(|| voice_button::transcribe::selected_id(&cfg));
+                let limit = choice
+                    .as_ref()
+                    .map(voice_button::transcribe::segment_limit)
+                    .unwrap_or_else(|| voice_button::transcribe::limit_for_config(&cfg));
+                let worker_model = match choice {
+                    Some(_) => state.model.clone(),
+                    None => String::new(),
                 };
-                match session::recover(&asr, &dir, &model, limit, sensitivity) {
+                match session::recover(&asr, &dir, &worker_model, limit, sensitivity) {
                     Ok((text, seconds, failed)) => {
                         if text.trim().is_empty() {
                             log::log(&format!(
@@ -821,11 +833,7 @@ fn start_recovery(
                         let entry = state::HistoryEntry {
                             at: now_stamp(),
                             text: text.clone(),
-                            model: if model.is_empty() {
-                                "unknown model".to_string()
-                            } else {
-                                model
-                            },
+                            model,
                             parts: Vec::new(),
                             source: match state.interactor {
                                 InteractorKind::Server => state::Source::Server,
