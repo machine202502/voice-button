@@ -69,6 +69,10 @@ jobs:
         run: cargo test --release --lib --bins
       - name: Install Inno Setup
         run: choco install innosetup --yes --no-progress
+      # scripts/web.ps1 builds the phone page and needs pnpm; the Windows runner
+      # ships Node and npm, not pnpm, and the release used to die there.
+      - name: Install pnpm
+        run: npm install --global pnpm
       - name: Package and publish
         shell: pwsh
         run: ./scripts/publish.ps1 -Tag "v${{ needs.version.outputs.version }}"
