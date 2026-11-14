@@ -24,13 +24,26 @@ jobs:
         run: |
           set -euo pipefail
           version=$(awk -F'"' '/^version[[:space:]]*=/{print $2; exit}' Cargo.toml)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          # An existing release is never rebuilt.
+          if gh release view "v$version" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # A manual run publishes the version that is in the tree. Without this,
+          # a version whose bump already landed but never turned into a release
+          # (v0.6.0 sat in Cargo.toml with a local build only) could not be
+          # published at all: the automatic gate only fires on a version change.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           if git rev-parse --verify HEAD^ >/dev/null 2>&1; then
             previous=$(git show HEAD^:Cargo.toml | awk -F'"' '/^version[[:space:]]*=/{print $2; exit}')
           else
             previous=""
           fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          if [ "$version" = "$previous" ] || gh release view "v$version" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          if [ "$version" = "$previous" ]; then
             echo "publish=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
