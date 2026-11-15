@@ -39,6 +39,7 @@ import { language, setLanguage, t } from './i18n';
 import { messageId, shortTime, textOf } from './lib/format';
 import { applyTheme, readTheme } from './lib/theme';
 import type { ThemeMode } from './lib/theme';
+import { playEndCue, playStartCue, readSounds, saveSounds } from './lib/sound';
 import { version as pageVersion } from './lib/version';
 import { NoiseCleaner } from './lib/noise';
 import { createEventStream } from './lib/events';
@@ -237,6 +238,8 @@ class Page {
   version = $state('');
   langCode = $state(language());
   theme = $state<ThemeMode>('dark');
+  /** The start and end cues, as the Settings switch left them. */
+  sounds = $state(readSounds());
 
   screen = $state<Screen>('list');
   archived = $state(false);
@@ -1591,6 +1594,10 @@ class Page {
       return;
     }
 
+    // The microphone answered, so the take really starts here: the cue is about
+    // the recording, not about the tap.
+    playStartCue();
+
     const context = new AudioContext();
     await context.resume();
     let wakeLock: WakeLockLike | null = null;
@@ -1696,6 +1703,9 @@ class Page {
     this.recording = null;
     this.elapsed = 0;
     if (!audio) return;
+    // The take is over the moment the person stops it; the cleanup below can
+    // take a few hundred milliseconds and must not delay the cue.
+    playEndCue();
     try {
       audio.processor.disconnect();
       audio.source.disconnect();
@@ -1906,6 +1916,12 @@ class Page {
   setTheme(mode: ThemeMode): void {
     this.theme = mode;
     applyTheme(mode);
+  }
+
+  /** The start and end cues on or off; the phone remembers the choice. */
+  setSounds(value: boolean): void {
+    this.sounds = value;
+    saveSounds(value);
   }
 
   async refreshMe(): Promise<void> {

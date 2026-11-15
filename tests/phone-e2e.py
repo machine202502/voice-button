@@ -1019,6 +1019,79 @@ def main():
             f"the computer serves the same version the page runs ({served})",
         )
 
+        print("the take cues")
+        # The two cues are part of the page, not a download: the worker keeps them
+        # for the next visit even with no network at all.
+        cached = browser.evaluate(
+            "fetch('sw.js', { cache: 'no-store' }).then((r) => r.text())",
+            await_promise=True,
+        )
+        check(
+            ".wav" in cached and cached.count(".wav") >= 2,
+            "the start and end cues are in the page's own cache list",
+        )
+        browser.evaluate("document.getElementById('menu').click()")
+        check(sheet_click(browser, "Настройки"), "the list menu opens the settings")
+        wait_for(
+            lambda: browser.evaluate(
+                "(document.getElementById('title') || {}).textContent === 'Настройки'"
+            ),
+            timeout=10,
+            what="the settings screen",
+        )
+        def cue_row():
+            return json.loads(
+                browser.evaluate(
+                    "JSON.stringify((() => {"
+                    " const rows = Array.from(document.querySelectorAll('.vb-switch-row'));"
+                    " const row = rows.find((node) => (node.textContent || '').includes('Звуки'));"
+                    " if (!row) return null;"
+                    " const input = row.querySelector('input');"
+                    " return { checked: !!(input && input.checked),"
+                    "          stored: localStorage.getItem('vb_sounds'),"
+                    "          text: (row.textContent || '').trim() }; })())"
+                )
+            )
+
+        def click_cue_row():
+            browser.evaluate(
+                "(() => { const rows = Array.from(document.querySelectorAll('.vb-switch-row'));"
+                " const row = rows.find((node) => (node.textContent || '').includes('Звуки'));"
+                " const input = row.querySelector('input');"
+                " if (input) input.click(); })()"
+            )
+
+        before = cue_row()
+        check(
+            before is not None and before["checked"],
+            f"settings offer the take cues, on by default ({before})",
+        )
+        click_cue_row()
+        wait_for(
+            lambda: cue_row()["stored"] == "off",
+            timeout=10,
+            what="the cue switch to turn off",
+        )
+        after = cue_row()
+        check(
+            after is not None and not after["checked"] and "Выкл" in after["text"],
+            f"the switch shows the cues are off ({after})",
+        )
+        click_cue_row()
+        wait_for(
+            lambda: cue_row()["stored"] == "on",
+            timeout=10,
+            what="the cue switch to turn back on",
+        )
+        browser.evaluate("document.getElementById('back').click()")
+        wait_for(
+            lambda: browser.evaluate(
+                "(document.getElementById('title') || {}).textContent === 'Монологи'"
+            ),
+            timeout=10,
+            what="the list after the settings",
+        )
+
         manifest = browser.evaluate(
             "(() => ({ href: document.getElementById('manifest').href,"
             " lang: document.documentElement.lang }))()"
@@ -1227,6 +1300,9 @@ def main():
             timeout=10,
             what="the monolog list",
         )
+        # The list without a take: the bar is hidden, so this is the height the
+        # view has to give up when the bar appears.
+        list_geometry = view_geometry(browser)
         browser.evaluate("document.querySelectorAll('.monolog-card')[0].click()")
         wait_for(
             lambda: browser.evaluate("!document.getElementById('composer').hidden"),
@@ -1247,12 +1323,34 @@ def main():
         )
         check(True, "the record button shows the recording state")
         snapshot(browser, daemon, diag, "just after the record click")
+        # The plate is the button: a tap on the hint text, not on the circle,
+        # starts and stops the take, and the circle is only a part of the bar.
+        target = browser.evaluate(
+            "(() => { const plate = document.getElementById('record');"
+            " const hint = document.getElementById('rec-hint');"
+            " const circle = document.querySelector('.vb-record-button');"
+            " const hintBox = hint.getBoundingClientRect();"
+            " const plateBox = plate.getBoundingClientRect();"
+            " const circleBox = circle.getBoundingClientRect();"
+            " const hit = document.elementFromPoint("
+            "   hintBox.left + hintBox.width / 2, hintBox.top + hintBox.height / 2);"
+            " return { inPlate: plate.contains(hit),"
+            "          wider: plateBox.left < circleBox.left && plateBox.right > circleBox.right,"
+            "          taller: plateBox.height > circleBox.height + 10 }; })()"
+        )
+        check(
+            target["inPlate"],
+            f"a tap on the state text lands on the recording plate ({target})",
+        )
+        check(
+            target["wider"] and target["taller"],
+            f"the whole bar is the target, not only the circle ({target})",
+        )
 
         print("the composer bar on the list")
         # Leaving the monolog must not stop the take: the list marks the monolog
         # and the same composer bar, with the monolog's name, keeps the running
         # take in sight and stoppable outside it.
-        feed_geometry = view_geometry(browser)
         browser.evaluate("document.getElementById('back').click()")
         wait_for(
             lambda: browser.evaluate("document.getElementById('title').textContent === 'Монологи'"),
@@ -1316,19 +1414,18 @@ def main():
             and first_timer.replace(":", "").isdigit(),
             f"the list bar has a running timer ({first_timer!r})",
         )
-        # Outside a monolog the bar floats above the dock on purpose: leaving a
-        # monolog in the middle of a take must not move the list by the height of
-        # the bar. So the bar overlaps the view instead of taking a row from it,
-        # and the list keeps the height it had before the take started.
+        # The bar is a row of the dock, on the list too: leaving a monolog in the
+        # middle of a take gives the bar its height, so the list shrinks by that
+        # much and no row is left underneath the bar.
         check(
-            bar.get("position") == "absolute" and bar["viewBottom"] > bar["barTop"],
-            f"outside a monolog the bar floats over the list instead of taking its height ({bar})",
+            bar.get("position") == "static" and bar["viewBottom"] <= bar["barTop"],
+            f"the bar takes its own row and the list ends above it ({bar})",
         )
         check(
-            bar["geom"]["clientHeight"] > feed_geometry["clientHeight"]
+            bar["geom"]["clientHeight"] < list_geometry["clientHeight"]
             and bar["geom"]["scrollTop"] == 0,
-            "the list keeps its full height while the floating bar is up"
-            f" ({feed_geometry} then {bar['geom']})",
+            "the list gives the bar its height instead of hiding rows under it"
+            f" ({list_geometry} then {bar['geom']})",
         )
         wait_for(
             lambda: (
@@ -1708,7 +1805,7 @@ def main():
             "the microphone keeps showing a live take while the computer is unreachable",
         )
         background = browser.evaluate(
-            "getComputedStyle(document.getElementById('record')).backgroundColor"
+            "getComputedStyle(document.querySelector('.vb-record-button')).backgroundColor"
         )
         check(
             background == "rgb(199, 243, 107)",
@@ -2677,7 +2774,7 @@ def main():
             )
             check(
                 browser.evaluate(
-                    "getComputedStyle(document.getElementById('record')).backgroundColor"
+                    "getComputedStyle(document.querySelector('.vb-record-button')).backgroundColor"
                 )
                 == "rgb(199, 243, 107)",
                 "the record button stays lime with the computer away",

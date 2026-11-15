@@ -636,35 +636,43 @@ textarea:focus-visible,
 
 /*
  * The composer, the install footer and the selection bar live in one dock. The
- * recording plate and the notes are absolutely positioned above it, so neither
- * takes part in the layout: appearing or leaving cannot move the viewport or
- * the reader's scroll position.
+ * notes are absolutely positioned above it, so they take no part in the layout:
+ * appearing or leaving cannot move the viewport or the reader's scroll position.
+ *
+ * The composer itself is a row of the dock, also while the person is on the
+ * list: it was an overlay once, and the last rows of a long list slid under it.
  */
 .vb-composer {
   display: flex;
   flex: 0 0 auto;
+  min-height: 0;
+}
+
+/*
+ * The plate is one button, and it fills the row: the whole bar starts and stops
+ * the take, so a tap anywhere on it works, not only on the circle. Nothing inside
+ * is interactive on its own, so there is no second target to miss.
+ */
+.vb-recording-plate {
+  display: flex;
+  flex: 1 1 auto;
   align-items: center;
   gap: 12px;
+  width: 100%;
   min-height: 82px;
   padding: 10px 14px calc(16px + env(safe-area-inset-bottom));
   border-top: 1px solid var(--line);
   background: var(--composer);
+  color: var(--ink);
+  border-radius: 0;
+  text-align: left;
   /* The halo is allowed to leave the bar: clipping it here cut the rings into a
      square. Nothing else inside the bar is wider than it, so nothing spills. */
   overflow: visible;
 }
 
-/* The recording panel is the normal composer bar. Inside a monolog it is a row of
-   the dock; on the list and in the archive it floats above the dock instead, so
-   leaving a monolog mid-take does not move the list by the height of the bar. */
-.vb-composer.detached {
-  position: absolute;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  z-index: 6;
-  background: var(--composer);
-  border-top: 1px solid var(--line);
+.vb-recording-plate:disabled {
+  cursor: default;
 }
 
 .vb-dock {

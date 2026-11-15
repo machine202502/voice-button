@@ -1,5 +1,11 @@
 <script lang="ts">
-  // The round button that records, and the two lines that say what it will do.
+  // The recording plate: the button that records, and the two lines that say
+  // what it will do.
+  //
+  // The whole bar is the button, not just the circle: on a phone the person taps
+  // the plate where the state is written, not a 54 px target. The circle, the
+  // rings and the texts are one element's content; nothing inside is interactive
+  // on its own, so a tap anywhere starts or stops the take.
   //
   // Its colour is a promise about the microphone, not about the network: the
   // button and the rings are lime whenever a take is running, online or not.
@@ -37,28 +43,30 @@
   );
 </script>
 
-<div class="vb-record-wrap">
-  <RecordRings active={recording} level={page.level} size={56} halo={12} rings={3} />
-  <button
-    class="vb-record-button"
-    class:recording
-    class:offline
-    id="record"
-    type="button"
-    aria-label={page.tr('record')}
-    aria-pressed={recording}
-    {disabled}
-    onclick={() => void page.toggleRecording()}
-  >
-    <MicIcon size={24} />
-  </button>
-</div>
-<div class="vb-composer-hint" id="rec-hint">
-  <b id="rec-title"
-    >{title}{#if elsewhere}<span class="vb-composer-name" id="rec-name"
-        ><span class="vb-composer-dot">·</span>{page.recording?.name}</span
-      >{/if}</b
-  >
-  <span id="rec-sub">{hint}</span>
-</div>
-<span class="vb-composer-timer" id="timer">{recording ? formatDuration(page.elapsed) : ''}</span>
+<button
+  class="vb-recording-plate"
+  class:recording
+  class:offline
+  id="record"
+  type="button"
+  aria-label={`${title}. ${hint}`}
+  aria-pressed={recording}
+  {disabled}
+  onclick={() => void page.toggleRecording()}
+>
+  <span class="vb-record-wrap">
+    <RecordRings active={recording} level={page.level} size={56} halo={12} rings={3} />
+    <span class="vb-record-button" class:recording class:offline aria-hidden="true">
+      <MicIcon size={24} />
+    </span>
+  </span>
+  <span class="vb-composer-hint" id="rec-hint">
+    <b id="rec-title"
+      >{title}{#if elsewhere}<span class="vb-composer-name" id="rec-name"
+          ><span class="vb-composer-dot">·</span>{page.recording?.name}</span
+        >{/if}</b
+    >
+    <span id="rec-sub">{hint}</span>
+  </span>
+  <span class="vb-composer-timer" id="timer">{recording ? formatDuration(page.elapsed) : ''}</span>
+</button>

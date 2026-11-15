@@ -816,10 +816,20 @@ pub struct MessageRow {
     pub text: String,
 }
 
-/// The date condition for a monolog list: a monolog belongs to the day it was
-/// started, which is what its card shows.
+/// The date condition for a monolog list: a monolog belongs to every day it
+/// holds a message for, and to the day it was started — an empty monolog has
+/// nothing else to be dated by, and the day its card shows is that day.
+///
+/// Narrowing by the creation date alone hid a monolog that was started last
+/// week and is still being dictated into today: "Today" listed nothing while
+/// the messages were right there.
 fn monolog_clause() -> String {
-    DateFilter::clause("m.created", "m.created")
+    let created = DateFilter::clause("m.created", "m.created");
+    let messages = DateFilter::clause("s.recorded", "s.received");
+    format!(
+        "({created} OR EXISTS (SELECT 1 FROM site_messages s \
+         WHERE s.monolog_id = m.id AND s.deleted = 0 AND {messages}))"
+    )
 }
 
 pub fn monolog_count(store: &Store, archived: bool, needle: &str, range: DateFilter) -> usize {
@@ -1173,7 +1183,8 @@ mod tests {
     #[test]
     fn the_monolog_list_can_be_narrowed_to_a_day() {
         // The list offers today / yesterday / this week / all time, the same
-        // choices as the Telegram log. A monolog belongs to the day it was started.
+        // choices as the Telegram log. A monolog belongs to the days it holds
+        // messages for, and to the day it was started.
         let root = root_for("monolog-days");
         let mut db = Db::open(&root).unwrap();
         let today = chrono::Local::now();
@@ -1191,18 +1202,41 @@ mod tests {
         };
         db.create_monolog("Сегодня", &stamp(0));
         db.create_monolog("Вчера", &stamp(1));
-        db.create_monolog("Старый", &stamp(30));
+        let old = db.create_monolog("Старый", &stamp(30));
+        // The old monolog is still being dictated into: today's message puts it
+        // in today's window, because that is the day of the words.
+        let message = db.add_message(old.id, &stamp(0), &stamp(0));
+        db.set_progress(message.id, "сегодня", 1);
         db.save().unwrap();
 
         let store = Store::open(&root).unwrap();
         assert_eq!(monolog_count(&store, false, "", DateFilter::everything()), 3);
-        assert_eq!(monolog_count(&store, false, "", DateFilter::today()), 1);
-        assert_eq!(monolog_count(&store, false, "", DateFilter::yesterday()), 1);
-        assert_eq!(monolog_count(&store, false, "", DateFilter::week()), 2);
+        assert_eq!(
+            monolog_count(&store, false, "", DateFilter::today()),
+            2,
+            "the monolog started today, and the old one with a message today"
+        );
+        assert_eq!(
+            monolog_count(&store, false, "", DateFilter::yesterday()),
+            1,
+            "an empty monolog still belongs to the day it was started"
+        );
+        assert_eq!(
+            monolog_count(&store, false, "", DateFilter::week()),
+            3,
+            "the week holds all three days the messages fall on"
+        );
 
         let today_rows = monolog_page(&store, false, "", DateFilter::today(), 0, 10);
-        assert_eq!(today_rows.len(), 1);
-        assert_eq!(today_rows[0].name, "Сегодня");
+        assert_eq!(today_rows.len(), 2);
+        assert!(
+            today_rows.iter().any(|row| row.name == "Сегодня"),
+            "an empty monolog created today is listed"
+        );
+        assert!(
+            today_rows.iter().any(|row| row.name == "Старый"),
+            "a monolog with a message today is listed"
+        );
         let yesterday_rows = monolog_page(&store, false, "", DateFilter::yesterday(), 0, 10);
         assert_eq!(yesterday_rows.len(), 1, "yesterday is its own window");
         assert_eq!(yesterday_rows[0].name, "Вчера");

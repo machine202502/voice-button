@@ -1,6 +1,7 @@
 import { mount } from 'svelte';
 import App from './App.svelte';
 import { loadLanguage } from './i18n';
+import { unlockSounds } from './lib/sound';
 import { applyTheme, readTheme } from './lib/theme';
 import { takeTokenFromHash } from './lib/token';
 import { startUpdates } from './lib/updates';
@@ -37,6 +38,10 @@ if (!target) {
 }
 
 mount(App, { target });
+
+// The take cues may only sound once a gesture has asked for audio: the first
+// touch on the page unlocks them for the rest of the visit.
+document.addEventListener('pointerdown', () => unlockSounds(), { once: true });
 
 // A new build reaches the phone on its own: the worker is re-checked while the
 // page is open, and the page reloads when it takes over — unless a recording is

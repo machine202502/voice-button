@@ -28,6 +28,8 @@
   // The composer bar is the one and only recording panel: inside a monolog it
   // records, and on the list or in the archive it shows the same bar while a take
   // is running, with the monolog's name, so the person can always see and stop it.
+  // It is a row of the dock, never an overlay: whatever the bar says, the list
+  // above it keeps its own height and nothing scrolls underneath.
   const showComposer = $derived((inFeed && !page.archived) || page.recording !== null);
   const selectedCount = $derived(page.selected.length);
 </script>
@@ -111,12 +113,9 @@
       >
     </footer>
 
-    <div
-      id="composer"
-      class="vb-composer"
-      class:detached={page.recording !== null && !inFeed}
-      hidden={!showComposer}
-    >
+    <!-- The plate is a row of the dock, on the list and in the archive too: it
+         takes its own height there, so no row of the list can slide under it. -->
+    <div id="composer" class="vb-composer" hidden={!showComposer}>
       {#if showComposer}
         <Composer />
       {/if}

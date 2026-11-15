@@ -53,6 +53,24 @@
   </section>
 
   <section class="vb-panel">
+    <Switch
+      checked={page.sounds}
+      onCheckedChange={(details) => page.setSounds(details.checked)}
+      class="vb-switch-row"
+    >
+      <span class="vb-switch-copy">
+        <Switch.Label>{page.tr('sounds')}</Switch.Label>
+        <span class="vb-switch-desc">{page.tr('sounds_hint')}</span>
+      </span>
+      <span class="vb-setting-state">{page.tr(page.sounds ? 'on' : 'off')}</span>
+      <Switch.Control class="vb-switch-control">
+        <Switch.Thumb class="vb-switch-thumb" />
+      </Switch.Control>
+      <Switch.HiddenInput />
+    </Switch>
+  </section>
+
+  <section class="vb-panel">
     <select
       class="vb-select"
       aria-label={currentName}
