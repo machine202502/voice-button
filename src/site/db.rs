@@ -932,6 +932,74 @@ pub fn message_count(store: &Store, monolog: u64) -> usize {
         .unwrap_or(0)
 }
 
+/// How many messages of one monolog fall into the chosen days.
+pub fn message_count_range(store: &Store, monolog: u64, range: DateFilter) -> usize {
+    let clause = DateFilter::clause("recorded", "recorded");
+    let sql = crate::sql::render("site_db/message_count_range", &[("range", &clause)]);
+    store
+        .conn()
+        .query_row(
+            &sql,
+            params![range.since(), range.until(), monolog as i64],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|count| count as usize)
+        .unwrap_or(0)
+}
+
+/// One page of a monolog's messages inside the chosen days, oldest first.
+pub fn message_page_range(
+    store: &Store,
+    monolog: u64,
+    range: DateFilter,
+    offset: usize,
+    limit: usize,
+) -> Vec<MessageRow> {
+    let clause = DateFilter::clause("recorded", "recorded");
+    let sql = crate::sql::render("site_db/message_rows_range", &[("range", &clause)]);
+    let conn = store.conn();
+    let mut statement = match conn.prepare(&sql) {
+        Ok(statement) => statement,
+        Err(_) => return Vec::new(),
+    };
+    statement
+        .query_map(
+            params![
+                range.since(),
+                range.until(),
+                monolog as i64,
+                limit as i64,
+                offset as i64
+            ],
+            |row| {
+                Ok(MessageRow {
+                    id: row.get::<_, i64>(0)? as u64,
+                    recorded: row.get(1)?,
+                    stage: Stage::from_storage(&row.get::<_, String>(2)?),
+                    text: row.get(3)?,
+                })
+            },
+        )
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default()
+}
+
+/// Ids of the messages in the chosen days, for "Select all".
+pub fn message_ids_range(store: &Store, monolog: u64, range: DateFilter) -> Vec<u64> {
+    let clause = DateFilter::clause("recorded", "recorded");
+    let sql = crate::sql::render("site_db/message_ids_range", &[("range", &clause)]);
+    let conn = store.conn();
+    let Ok(mut statement) = conn.prepare(&sql) else {
+        return Vec::new();
+    };
+    statement
+        .query_map(params![range.since(), range.until(), monolog as i64], |row| {
+            row.get::<_, i64>(0)
+        })
+        .map(|rows| rows.flatten().map(|id| id as u64).collect())
+        .unwrap_or_default()
+}
+
 pub fn message_page(store: &Store, monolog: u64, offset: usize, limit: usize) -> Vec<MessageRow> {
     let conn = store.conn();
     let mut statement = match conn.prepare(crate::sql::query("site_db/message_rows")) {
@@ -1246,6 +1314,72 @@ mod tests {
             1
         );
         assert_eq!(monolog_count(&store, false, "вчера", DateFilter::today()), 0);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn the_open_monolog_follows_the_chosen_day() {
+        // The filter above the list narrows the messages of the open monolog too:
+        // "Today" inside a monolog must not show Friday.
+        let root = root_for("message-days");
+        let mut db = Db::open(&root).unwrap();
+        let today = chrono::Local::now();
+        let stamp = |days: u64| {
+            let naive = (today.date_naive() - chrono::Days::new(days))
+                .and_hms_opt(12, 0, 0)
+                .unwrap();
+            let moment = chrono::TimeZone::from_local_datetime(&chrono::Local, &naive)
+                .earliest()
+                .unwrap();
+            moment
+                .with_timezone(&chrono::Utc)
+                .format("%Y-%m-%dT%H:%M:%S+00:00")
+                .to_string()
+        };
+        let monolog = db.create_monolog("Работа", &stamp(30));
+        db.add_message(monolog.id, &stamp(4), &stamp(4));
+        let fresh = db.add_message(monolog.id, &stamp(0), &stamp(0));
+        db.set_progress(fresh.id, "сегодня", 1);
+        db.save().unwrap();
+
+        let store = Store::open(&root).unwrap();
+        assert_eq!(message_count(&store, monolog.id), 2);
+        assert_eq!(message_count_range(&store, monolog.id, DateFilter::today()), 1);
+        let page = message_page_range(&store, monolog.id, DateFilter::today(), 0, 10);
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].id, fresh.id);
+        assert_eq!(
+            message_ids_range(&store, monolog.id, DateFilter::everything()).len(),
+            2
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn the_list_follows_the_newest_message() {
+        // A monolog somebody just dictated into belongs at the top, even when
+        // another one was created later and has been quiet since.
+        let root = root_for("monolog-order");
+        let mut db = Db::open(&root).unwrap();
+        db.create_monolog("Тихий", "2026-11-14T09:00:00+05:00");
+        let busy = db.create_monolog("Рабочий", "2026-11-11T09:00:00+05:00");
+        db.add_message(busy.id, "2026-11-15T11:00:00+05:00", "2026-11-15T11:00:01+05:00");
+        // The list is read from SQL, and `Db` writes there on save.
+        db.save().unwrap();
+        let (phone, _) = db.monologs_page(false, 0, 10);
+        assert_eq!(phone.len(), 2);
+        assert_eq!(
+            phone[0].name, "Рабочий",
+            "the phone list puts the monolog with the newest message first"
+        );
+        drop(db);
+        let store = Store::open(&root).unwrap();
+        let window = monolog_page(&store, false, "", DateFilter::everything(), 0, 10);
+        assert_eq!(window.len(), 2);
+        assert_eq!(
+            window[0].name, "Рабочий",
+            "the window list uses the same order"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

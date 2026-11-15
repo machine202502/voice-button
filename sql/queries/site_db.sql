@@ -95,6 +95,22 @@ SELECT id, stage FROM site_messages ORDER BY id;
 -- name: message_count
 SELECT COUNT(*) FROM site_messages WHERE monolog_id = ?1 AND deleted = 0;
 
+-- name: message_count_range
+-- ?1 and ?2 are the date bounds, ?3 the monolog: the open list narrows with the
+-- same day filter as the monologs above it.
+SELECT COUNT(*) FROM site_messages
+WHERE monolog_id = ?3 AND deleted = 0 AND {{range}};
+
+-- name: message_rows_range
+SELECT id, recorded, stage, text FROM site_messages
+WHERE monolog_id = ?3 AND deleted = 0 AND {{range}}
+ORDER BY recorded, id LIMIT ?4 OFFSET ?5;
+
+-- name: message_ids_range
+SELECT id FROM site_messages
+WHERE monolog_id = ?3 AND deleted = 0 AND {{range}}
+ORDER BY recorded, id;
+
 -- name: message_page_before
 SELECT id, monolog_id, recorded, received, stage, text, original, edited,
     deleted, duration, segments_done, history_at, closed
@@ -127,7 +143,9 @@ SELECT m.id, m.name, m.archived, m.created,
     (SELECT COUNT(*) FROM site_messages s
      WHERE s.monolog_id = m.id AND s.deleted = 0)
 FROM monologs m WHERE m.archived = ?1
-ORDER BY m.created DESC, m.id DESC LIMIT ?2 OFFSET ?3;
+ORDER BY COALESCE((SELECT datetime(MAX(datetime(s.recorded))) FROM site_messages s
+    WHERE s.monolog_id = m.id AND s.deleted = 0), datetime(m.created)) DESC,
+  m.id DESC LIMIT ?2 OFFSET ?3;
 
 -- name: message_last_text
 SELECT id, monolog_id, recorded, received, stage, text, original, edited,
@@ -160,7 +178,9 @@ SELECT m.id, m.name, m.archived, m.created,
     COALESCE((SELECT recorded FROM site_messages s WHERE s.monolog_id = m.id AND s.deleted = 0
         ORDER BY s.recorded DESC, s.id DESC LIMIT 1), '')
 FROM monologs m WHERE {{range}} AND m.archived = ?3
-ORDER BY m.created DESC, m.id DESC LIMIT ?4 OFFSET ?5;
+ORDER BY COALESCE((SELECT datetime(MAX(datetime(s.recorded))) FROM site_messages s
+    WHERE s.monolog_id = m.id AND s.deleted = 0), datetime(m.created)) DESC,
+  m.id DESC LIMIT ?4 OFFSET ?5;
 
 -- name: monolog_page_search
 SELECT m.id, m.name, m.archived, m.created,
@@ -173,7 +193,9 @@ FROM monologs m WHERE {{range}} AND m.archived = ?3
   AND (vb_lower(m.name) LIKE ?4 ESCAPE '\' OR vb_lower(COALESCE((
       SELECT text FROM site_messages s WHERE s.monolog_id = m.id AND s.deleted = 0
       ORDER BY s.recorded DESC, s.id DESC LIMIT 1), '')) LIKE ?4 ESCAPE '\')
-ORDER BY m.created DESC, m.id DESC LIMIT ?5 OFFSET ?6;
+ORDER BY COALESCE((SELECT datetime(MAX(datetime(s.recorded))) FROM site_messages s
+    WHERE s.monolog_id = m.id AND s.deleted = 0), datetime(m.created)) DESC,
+  m.id DESC LIMIT ?5 OFFSET ?6;
 
 -- name: message_rows
 SELECT id, recorded, stage, text FROM site_messages

@@ -555,7 +555,7 @@ struct PhoneState {
     /// One page window over the open monolog's messages, keyed by
     /// (revision, monolog id).
     messages: Paged<MessageRow>,
-    message_key: Option<(u64, u64)>,
+    message_key: Option<(u64, u64, crate::dates::DateFilter)>,
     /// Measured heights: a message is as tall as its text, a monolog as tall as
     /// its preview. Both lists are lazy with per-row heights.
     monolog_heights: crate::lazy_list::LazyList,
@@ -2605,19 +2605,31 @@ fn phone_messages(
     monolog: &MonologRow,
     phone: &mut PhoneState,
 ) {
-    let total = crate::site::db::message_count(store, monolog.id);
+    // The filter above the list is a filter of the monolog's own messages too:
+    // choosing "Today" must not show Friday inside the monolog that stays open.
+    let range = phone.monolog_range;
+    let total = crate::site::db::message_count_range(store, monolog.id, range);
     if total == 0 {
-        ui.label(RichText::new(tr("No messages from the phone yet.")).weak());
+        let text = if range.preset == crate::dates::Preset::Today {
+            tr("Nothing today")
+        } else if range.preset == crate::dates::Preset::Yesterday {
+            tr("Nothing yesterday")
+        } else if range.preset == crate::dates::Preset::Week {
+            tr("Nothing this week")
+        } else {
+            tr("No messages from the phone yet.")
+        };
+        ui.label(RichText::new(text).weak());
         return;
     }
-    let key = (store.revision("rev.site"), monolog.id);
+    let key = (store.revision("rev.site"), monolog.id, range);
     if phone.message_key.as_ref() != Some(&key) {
         phone.messages.reset(total);
         phone.message_key = Some(key);
     }
     ui.horizontal_wrapped(|ui| {
         if ui.small_button(tr("Select all")).clicked() {
-            for id in crate::site::db::message_ids(store, monolog.id) {
+            for id in crate::site::db::message_ids_range(store, monolog.id, range) {
                 phone.selected.insert(id);
             }
         }
@@ -2667,7 +2679,7 @@ fn phone_messages(
                 return;
             }
             phone.messages.ensure(first..last, |offset, limit| {
-                crate::site::db::message_page(store, monolog.id, offset, limit)
+                crate::site::db::message_page_range(store, monolog.id, range, offset, limit)
             });
             for index in first..last {
                 let Some(message) = phone.messages.get(index) else {

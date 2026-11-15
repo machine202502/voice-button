@@ -266,12 +266,22 @@ textarea:focus-visible,
   width: 3px;
   border-radius: 999px;
   background: color-mix(in srgb, var(--accent) 38%, transparent);
-  pointer-events: auto;
+  /* The bar is a hint, not furniture: it fades in while the page moves and
+     fades out again when it stops, so the green line never sits on the text.
+     An invisible thumb takes no pointer events either. */
+  opacity: 0;
+  pointer-events: none;
   touch-action: none;
   cursor: grab;
   transition:
+    opacity 220ms ease,
     background 140ms ease,
     width 140ms ease;
+}
+
+.vb-scroll-thumb.active {
+  opacity: 1;
+  pointer-events: auto;
 }
 
 .vb-scroll-thumb:hover,

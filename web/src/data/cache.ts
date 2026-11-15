@@ -101,6 +101,22 @@ export function bootOutcome({ hasToken = false }: BootState = {}): 'app' | 'pair
 }
 
 /** One page of the monolog list. */
+/**
+ * When a monolog last heard from somebody: its newest message, or its start when
+ * it has none. The phone orders the list by this, the same rule the computer
+ * uses in SQL, so a monolog just dictated into comes first.
+ */
+export function monologActivity(monolog: Monolog): number {
+  const stamp = Date.parse(String(monolog.lastAt || monolog.created || ''));
+  return Number.isFinite(stamp) ? stamp : 0;
+}
+
+/** Newest activity first; the id keeps two monologs with one stamp steady. */
+export function compareMonologs(left: Monolog, right: Monolog): number {
+  const difference = monologActivity(right) - monologActivity(left);
+  return difference !== 0 ? difference : Number(right.id) - Number(left.id);
+}
+
 export interface MonologPage {
   monologs: Monolog[];
   total: number;
@@ -281,7 +297,7 @@ export function createCache({
       const local = (await this.localMonologs()).filter(
         (monolog) => Boolean(monolog.archived) === Boolean(archived),
       );
-      const merged = mergeMonologs(await serverRecords(archived), local);
+      const merged = mergeMonologs(await serverRecords(archived), local).sort(compareMonologs);
       return {
         monologs: merged.slice(start, start + size),
         total: merged.length,

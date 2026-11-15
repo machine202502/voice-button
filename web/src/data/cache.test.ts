@@ -214,6 +214,26 @@ describe('the monolog list', () => {
     expect(ordered.map((monolog) => monolog.id)).toEqual([-1, 2, 1]);
   });
 
+  it('puts the monolog with the newest message first', async () => {
+    // The list follows the last message, not the day the monolog was made: a
+    // monolog just dictated into is the one you look for.
+    const monologs = bag<Monolog>();
+    const cache = cacheWith(monologs);
+    await monologs.put(1, {
+      id: 1,
+      name: 'Тихий',
+      created: '2026-11-14T09:00:00+05:00',
+    });
+    await monologs.put(2, {
+      id: 2,
+      name: 'Рабочий',
+      created: '2026-11-11T09:00:00+05:00',
+      lastAt: '2026-11-15T11:00:00+05:00',
+    });
+    const page = await cache.monologPage(false, 0, 10);
+    expect(page.monologs.map((monolog) => monolog.id)).toEqual([2, 1]);
+  });
+
   it('allocates a local monolog and goes down', async () => {
     const monologs = bag<Monolog>();
     const cache = cacheWith(monologs);

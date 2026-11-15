@@ -18,7 +18,10 @@
 
   let thumbTop = $state(0);
   let thumbHeight = $state(0);
-  let visible = $state(false);
+  // `scrollable` keeps the track mounted; `awake` is the fade: the thumb is
+  // opaque while the page moves and fades out once it stops.
+  let scrollable = $state(false);
+  let awake = $state(false);
   let dragging = $state(false);
   let hideTimer: number | undefined;
 
@@ -31,20 +34,22 @@
     const travel = Math.max(0, room - thumbHeight);
     const progress = scrollHeight > clientHeight ? scrollTop / (scrollHeight - clientHeight) : 0;
     thumbTop = TOP_INSET + Math.round(travel * Math.min(1, Math.max(0, progress)));
-    visible = scrollHeight > clientHeight + 2;
+    scrollable = scrollHeight > clientHeight + 2;
   }
 
   function scheduleHide(): void {
     if (dragging) return;
     window.clearTimeout(hideTimer);
     hideTimer = window.setTimeout(() => {
-      if (!dragging) visible = false;
+      if (!dragging) awake = false;
     }, FADE_AFTER_MS);
   }
 
   function wake(): void {
     measure();
-    if (visible) scheduleHide();
+    if (!scrollable) return;
+    awake = true;
+    scheduleHide();
   }
 
   $effect(() => {
@@ -52,7 +57,10 @@
     if (!element) return;
     window.clearTimeout(hideTimer);
     measure();
-    if (visible) scheduleHide();
+    if (scrollable) {
+      awake = true;
+      scheduleHide();
+    }
 
     const onScroll = (): void => wake();
     const observer = new ResizeObserver(() => wake());
@@ -80,7 +88,7 @@
     event.preventDefault();
     event.stopPropagation();
     dragging = true;
-    visible = true;
+    awake = true;
     const startY = event.clientY;
     const startTop = target.scrollTop;
     const travel = Math.max(
@@ -109,10 +117,11 @@
   }
 </script>
 
-{#if visible}
+{#if scrollable}
   <div class="vb-scroll-track" role="presentation">
     <div
       class="vb-scroll-thumb"
+      class:active={awake}
       class:dragging
       aria-hidden="true"
       onpointerdown={startDrag}

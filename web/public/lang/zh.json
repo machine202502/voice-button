@@ -101,10 +101,6 @@
   "card_working": "电脑正在处理这个独白",
   "card_unsent": "这里有一条消息尚未发送到电脑",
   "theme": "主题",
-  "sounds": "声音",
-  "sounds_hint": "录音开始和结束时的一声提示",
-  "on": "开",
-  "off": "关",
   "dark": "深色",
   "light": "浅色",
   "more": "更多",
@@ -112,5 +108,6 @@
   "select_several": "选择多个",
   "selected": "已选择",
   "rename": "重命名",
-  "message": "消息"
+  "message": "消息",
+  "mic_lost": "麦克风被占用 — 录音已结束，文字已保存。"
 }

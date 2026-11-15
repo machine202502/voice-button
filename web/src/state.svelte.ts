@@ -39,7 +39,6 @@ import { language, setLanguage, t } from './i18n';
 import { messageId, shortTime, textOf } from './lib/format';
 import { applyTheme, readTheme } from './lib/theme';
 import type { ThemeMode } from './lib/theme';
-import { playEndCue, playStartCue, readSounds, saveSounds } from './lib/sound';
 import { version as pageVersion } from './lib/version';
 import { NoiseCleaner } from './lib/noise';
 import { createEventStream } from './lib/events';
@@ -238,8 +237,6 @@ class Page {
   version = $state('');
   langCode = $state(language());
   theme = $state<ThemeMode>('dark');
-  /** The start and end cues, as the Settings switch left them. */
-  sounds = $state(readSounds());
 
   screen = $state<Screen>('list');
   archived = $state(false);
@@ -260,6 +257,10 @@ class Page {
   private pendingEdits = $state<number[]>([]);
 
   recording = $state<RecordingView | null>(null);
+  /** A take is waiting for the microphone; the plate must not start a second. */
+  private starting = false;
+  /** A stop asked for while `starting`: the take ends as soon as it begins. */
+  private stopRequested = false;
   elapsed = $state(0);
 
   /** The computer answered the last request; the microphone colour follows it. */
@@ -422,6 +423,13 @@ class Page {
       .map((mutation) => Number(mutation.target.message))
       .filter((id) => Number.isFinite(id));
     await this.refreshArchiveCount();
+    // A take the previous visit left open (the page was closed or killed while
+    // recording) would otherwise keep its message "in progress" on the computer
+    // forever, and the monolog would stay marked as busy. Closing it here sends
+    // the audio that was already stored and lets the computer finish it.
+    for (const take of await this.outbox.list()) {
+      if (!take.closed) await this.outbox.put({ ...take, closed: true });
+    }
     window.app = this.handle();
     this.startLoop();
     this.startFeedLoop();
@@ -519,6 +527,11 @@ class Page {
     });
     document.addEventListener('visibilitychange', () => {
       if (document.hidden) {
+        // A take does not survive the app going away: the phone may suspend the
+        // capture at any moment and the recording would keep "running" with
+        // nothing arriving. Ending it here closes the take, sends its tail and
+        // releases the microphone, so the text is finished instead of hanging.
+        if (this.recording) void this.stopRecording();
         // A screen that went dark is not going to use the stream right now:
         // give it a while, then let the phone sleep without a socket.
         this.sleepEvents();
@@ -528,6 +541,10 @@ class Page {
       // send what waited.
       this.wakeEvents();
       void this.kick();
+      // The take was closed when the app went away, and the computer finished it
+      // in the meantime. The open monolog asks for its newest page now instead of
+      // waiting for the next poll or a trip back to the list.
+      if (this.feed && this.monolog) void this.refreshFeed();
     });
     window.addEventListener('popstate', () => this.onPopState());
   }
@@ -1282,16 +1299,14 @@ class Page {
   /**
    * The takes of one monolog that are still only on the phone. A take the
    * computer has accepted is not among them, even when a snapshot of the outbox
-   * was read just before that answer arrived.
+   * was read just before that answer arrived. The take being recorded is among
+   * them on purpose: the message appears under the reader the moment the plate
+   * is tapped, instead of only after the computer has answered.
    */
   private waitingTakes(takes: readonly Take[], monologId: number): Take[] {
-    // The take being recorded right now is shown by the composer and the plate,
-    // not as a second "not sent" card that would appear under the reader.
-    const active = this.recording?.take.localId ?? '';
     return takes.filter(
       (take) =>
         Number(take.monolog) === monologId &&
-        take.localId !== active &&
         !take.remote &&
         !this.acceptedLocals.has(take.localId),
     );
@@ -1568,6 +1583,14 @@ class Page {
 
   /** The round button: start when idle, stop when a take is running. */
   async toggleRecording(): Promise<void> {
+    // The microphone grant is asynchronous, and `recording` only turns on after
+    // it: a second tap in that window used to start a second take, whose audio
+    // kept running with no card and no way to stop it. Now the second tap means
+    // "stop", and the pending start is cancelled the moment it lands.
+    if (this.starting) {
+      this.stopRequested = true;
+      return;
+    }
     if (this.recording) await this.stopRecording();
     else await this.startRecording();
   }
@@ -1579,25 +1602,28 @@ class Page {
    */
   async startRecording(): Promise<void> {
     const monolog = this.monolog;
-    if (this.recording || !monolog || this.archived) return;
-    const take = this.outbox.newTake(monolog.id);
-    await this.outbox.put(take);
-
-    let stream: MediaStream;
+    if (this.recording || this.starting || !monolog || this.archived) return;
+    // A graph left behind by a take that was never shown (an interrupted start):
+    // close it instead of opening a second microphone next to it.
+    if (this.audio) await this.stopRecording();
+    this.starting = true;
     try {
-      stream = await navigator.mediaDevices.getUserMedia({
-        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
-      });
-    } catch {
-      await this.outbox.remove(take.localId);
-      this.toast(this.tr('mic_denied'));
-      return;
-    }
+      const take = this.outbox.newTake(monolog.id);
+      await this.outbox.put(take);
 
-    // The microphone answered, so the take really starts here: the cue is about
-    // the recording, not about the tap.
-    playStartCue();
+      let stream: MediaStream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
+        });
+      } catch {
+        await this.outbox.remove(take.localId);
+        this.toast(this.tr('mic_denied'));
+        return;
+      }
 
+    // One context per take: it is built after the microphone is granted and
+    // closed when the take ends, so nothing outlives the recording.
     const context = new AudioContext();
     await context.resume();
     let wakeLock: WakeLockLike | null = null;
@@ -1691,7 +1717,38 @@ class Page {
       started: Date.now(),
     };
     this.elapsed = 0;
+    // The phone can take the microphone back at any time: another app starts a
+    // call, a system dialog grabs it, or the page is put away. Chrome then ends
+    // or mutes the track while the take would keep "recording" into nothing.
+    // Closing the take here keeps its audio and finishes the message.
+    const track = stream.getAudioTracks()[0];
+    let muteTimer = 0;
+    const lost = (): void => {
+      if (this.audio?.take.localId !== take.localId) return;
+      window.clearTimeout(muteTimer);
+      this.toast(this.tr('mic_lost'));
+      void this.stopRecording();
+    };
+    track?.addEventListener('ended', lost);
+    // A mute is often momentary — another app beeps, a call rings — so only a
+    // mute that lasts means the microphone was really taken away.
+    track?.addEventListener('mute', () => {
+      window.clearTimeout(muteTimer);
+      muteTimer = window.setTimeout(lost, 1500);
+    });
+    track?.addEventListener('unmute', () => window.clearTimeout(muteTimer));
+    // The reader sees the message at once: the take is already in the outbox, so
+    // its card belongs in the open monolog without waiting for the computer.
+    void this.refreshFeed();
     void this.kick();
+    // A stop asked for while the microphone was still being granted.
+    if (this.stopRequested) {
+      this.stopRequested = false;
+      void this.stopRecording();
+    }
+    } finally {
+      this.starting = false;
+    }
   }
 
   async stopRecording(): Promise<void> {
@@ -1703,16 +1760,13 @@ class Page {
     this.recording = null;
     this.elapsed = 0;
     if (!audio) return;
-    // The take is over the moment the person stops it; the cleanup below can
-    // take a few hundred milliseconds and must not delay the cue.
-    playEndCue();
     try {
       audio.processor.disconnect();
       audio.source.disconnect();
       for (const track of audio.stream.getTracks()) track.stop();
       await audio.context.close();
     } catch {
-      // Closing a closed context is not an error worth reporting.
+      // Already disconnected; the take is over either way.
     }
     if (audio.wakeLock) {
       try {
@@ -1916,12 +1970,6 @@ class Page {
   setTheme(mode: ThemeMode): void {
     this.theme = mode;
     applyTheme(mode);
-  }
-
-  /** The start and end cues on or off; the phone remembers the choice. */
-  setSounds(value: boolean): void {
-    this.sounds = value;
-    saveSounds(value);
   }
 
   async refreshMe(): Promise<void> {
