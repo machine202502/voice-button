@@ -149,7 +149,14 @@ mod tests {
 
     /// Every placeholder a statement is allowed to use. A typo in `sql/` is
     /// caught here instead of panicking on a user's machine.
-    const KNOWN_PLACEHOLDERS: &[&str] = &["filter", "key_column", "marks", "range", "table"];
+    const KNOWN_PLACEHOLDERS: &[&str] = &[
+        "filter",
+        "key_column",
+        "marks",
+        "message_range",
+        "range",
+        "table",
+    ];
 
     fn panic_message(run: impl FnOnce() + std::panic::UnwindSafe) -> String {
         let error = std::panic::catch_unwind(run).expect_err("the call must panic");

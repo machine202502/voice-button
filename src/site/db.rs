@@ -823,6 +823,12 @@ pub struct MessageRow {
 /// Narrowing by the creation date alone hid a monolog that was started last
 /// week and is still being dictated into today: "Today" listed nothing while
 /// the messages were right there.
+/// The date condition for the count on a list row: the card says how many
+/// messages fall into the chosen days, not how many the monolog holds overall.
+fn message_clause() -> String {
+    DateFilter::clause("s.recorded", "s.received")
+}
+
 fn monolog_clause() -> String {
     let created = DateFilter::clause("m.created", "m.created");
     let messages = DateFilter::clause("s.recorded", "s.received");
@@ -873,10 +879,17 @@ pub fn monolog_page(
     let needle = needle.trim().to_lowercase();
     let conn = store.conn();
     let clause = monolog_clause();
+    let counted = message_clause();
     let sql = if needle.is_empty() {
-        crate::sql::render("site_db/monolog_page", &[("range", &clause)])
+        crate::sql::render(
+            "site_db/monolog_page",
+            &[("range", &clause), ("message_range", &counted)],
+        )
     } else {
-        crate::sql::render("site_db/monolog_page_search", &[("range", &clause)])
+        crate::sql::render(
+            "site_db/monolog_page_search",
+            &[("range", &clause), ("message_range", &counted)],
+        )
     };
     let mut statement = match conn.prepare(&sql) {
         Ok(statement) => statement,
@@ -1314,6 +1327,44 @@ mod tests {
             1
         );
         assert_eq!(monolog_count(&store, false, "вчера", DateFilter::today()), 0);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn the_list_counts_only_the_chosen_days() {
+        // The card says how many messages fall into the chosen days: with
+        // "Today" a monolog of five messages that has one today says one.
+        let root = root_for("count-days");
+        let mut db = Db::open(&root).unwrap();
+        let today = chrono::Local::now();
+        let stamp = |days: u64| {
+            let naive = (today.date_naive() - chrono::Days::new(days))
+                .and_hms_opt(12, 0, 0)
+                .unwrap();
+            let moment = chrono::TimeZone::from_local_datetime(&chrono::Local, &naive)
+                .earliest()
+                .unwrap();
+            moment
+                .with_timezone(&chrono::Utc)
+                .format("%Y-%m-%dT%H:%M:%S+00:00")
+                .to_string()
+        };
+        let monolog = db.create_monolog("Работа", &stamp(30));
+        for days in [5_u64, 4, 3, 2, 1] {
+            db.add_message(monolog.id, &stamp(days), &stamp(days));
+        }
+        db.add_message(monolog.id, &stamp(0), &stamp(0));
+        db.save().unwrap();
+
+        let store = Store::open(&root).unwrap();
+        let all = monolog_page(&store, false, "", DateFilter::everything(), 0, 10);
+        assert_eq!(all.len(), 1, "the store has the monolog");
+        assert_eq!(all[0].count, 6, "everything counts all six");
+        let today_rows = monolog_page(&store, false, "", DateFilter::today(), 0, 10);
+        assert_eq!(today_rows.len(), 1);
+        assert_eq!(today_rows[0].count, 1, "today counts the message of today");
+        let yesterday = monolog_page(&store, false, "", DateFilter::yesterday(), 0, 10);
+        assert_eq!(yesterday[0].count, 1, "yesterday counts its own message");
         let _ = std::fs::remove_dir_all(root);
     }
 

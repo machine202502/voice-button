@@ -172,7 +172,8 @@ SELECT COUNT(*) FROM monologs m WHERE {{range}} AND m.archived = ?3
 
 -- name: monolog_page
 SELECT m.id, m.name, m.archived, m.created,
-    (SELECT COUNT(*) FROM site_messages s WHERE s.monolog_id = m.id AND s.deleted = 0),
+    (SELECT COUNT(*) FROM site_messages s WHERE s.monolog_id = m.id AND s.deleted = 0
+        AND {{message_range}}),
     COALESCE((SELECT text FROM site_messages s WHERE s.monolog_id = m.id AND s.deleted = 0
         ORDER BY s.recorded DESC, s.id DESC LIMIT 1), ''),
     COALESCE((SELECT recorded FROM site_messages s WHERE s.monolog_id = m.id AND s.deleted = 0
@@ -184,7 +185,8 @@ ORDER BY COALESCE((SELECT datetime(MAX(datetime(s.recorded))) FROM site_messages
 
 -- name: monolog_page_search
 SELECT m.id, m.name, m.archived, m.created,
-    (SELECT COUNT(*) FROM site_messages s WHERE s.monolog_id = m.id AND s.deleted = 0),
+    (SELECT COUNT(*) FROM site_messages s WHERE s.monolog_id = m.id AND s.deleted = 0
+        AND {{message_range}}),
     COALESCE((SELECT text FROM site_messages s WHERE s.monolog_id = m.id AND s.deleted = 0
         ORDER BY s.recorded DESC, s.id DESC LIMIT 1), ''),
     COALESCE((SELECT recorded FROM site_messages s WHERE s.monolog_id = m.id AND s.deleted = 0
