@@ -1,8 +1,10 @@
 """The Telegram bot against a fake Bot API: no real token, no real Telegram.
 
 The daemon is the real one, the recognizer is the real one; only the Bot API is
-a local HTTP server. This checks the path a real voice message takes: /start,
-media, 👀, transcription, reply in the thread, ✅, history and the desktop chat.
+a local HTTP server. This checks the path a real voice message takes from a new
+account: /start becomes a request, the window allows it, media is transcribed,
+👀 and ✅ mark the message, the reply lands in the thread, the history and the
+desktop chat; then access is taken back and the account is ignored.
 
     python tests/telegram-test.py
 """
@@ -127,6 +129,19 @@ class FakeBot(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
 
+def start_update(update_id, user, first_name="Guest", username="guest"):
+    return {
+        "update_id": update_id,
+        "message": {
+            "message_id": update_id,
+            "chat": {"id": user, "type": "private"},
+            "from": {"id": user, "is_bot": False, "first_name": first_name, "username": username},
+            "date": int(time.time()),
+            "text": "/start",
+        },
+    }
+
+
 def voice_update(update_id, owner, media):
     return {
         "update_id": update_id,
@@ -175,9 +190,17 @@ def read_state(root, attempts=40):
                     "text, error FROM telegram_chat ORDER BY id"
                 )
             ]
+            accounts = [
+                {key: row[key] for key in row.keys()}
+                for row in conn.execute(
+                    "SELECT user_id, status, name, username, added_at, last_seen_at "
+                    "FROM telegram_account ORDER BY user_id"
+                )
+            ]
             conn.close()
             return {
-                "owner": int(kv["telegram.owner"]) if kv.get("telegram.owner") else None,
+                "offset": int(kv["telegram.offset"]) if kv.get("telegram.offset") else 0,
+                "accounts": accounts,
                 "current": current,
                 "queue": queue,
                 "chat": chat,
@@ -186,6 +209,24 @@ def read_state(root, attempts=40):
             last = error
             time.sleep(0.1)
     raise last
+
+
+def account_of(state, user):
+    return next(
+        (item for item in state.get("accounts", []) if item["user_id"] == user), None
+    )
+
+
+def write_access(root, action, user=0):
+    """A decision from the window, exactly as ipc::request_telegram_access writes it."""
+    conn = sqlite3.connect(os.path.join(root, "voice-button.sqlite3"), timeout=5)
+    conn.execute(
+        "INSERT INTO kv(key, value) VALUES('request.telegram_access', ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        ("action\t%s\nuser\t%d" % (action, user),),
+    )
+    conn.commit()
+    conn.close()
 
 
 def read_history(root, attempts=40):
@@ -249,6 +290,37 @@ def main():
                     "text": "/start",
                 },
             },
+        ]
+        e2e.wait_for(
+            lambda: account_of(read_state(root), owner) is not None,
+            timeout=30,
+            what="the /start request to be recorded",
+        )
+        check(
+            account_of(read_state(root), owner)["status"] == "pending",
+            "a new account waits for the window",
+        )
+        check(not server.sent, "a new account gets no answer")
+        check(not read_state(root)["queue"], "and cannot queue anything")
+
+        write_access(root, "allow", owner)
+        e2e.wait_for(
+            lambda: (account_of(read_state(root), owner) or {}).get("status") == "allowed",
+            timeout=30,
+            what="the window's decision to reach the bot",
+        )
+        check(True, "the window opens the bot to the account")
+        e2e.wait_for(
+            lambda: any(
+                item.get("chat_id") == owner and item.get("reply_to_message_id") is None
+                for item in server.sent
+            ),
+            timeout=30,
+            what="the access notice",
+        )
+        check(True, "the account is told that access is open")
+
+        server.updates = [
             {
                 "update_id": 2,
                 "message": {
@@ -292,13 +364,16 @@ def main():
         check(
             any(
                 reaction.get("message_id") == 12
-                and any(item.get("emoji") == "✅" for item in reaction.get("reaction", []))
+                and any(item.get("emoji") == "👍" for item in reaction.get("reaction", []))
                 for reaction in server.reactions
             ),
-            "the bot finishes with ✅",
+            "the bot finishes with 👍",
         )
         state = read_state(root)
-        check(state.get("owner") == owner, "the owner was stored")
+        check(
+            account_of(state, owner)["status"] == "allowed",
+            "the account stays allowed",
+        )
         check(
             any(entry.get("message_id") == 12 and entry.get("text") for entry in state.get("chat", [])),
             "the desktop chat got the entry",
@@ -343,6 +418,95 @@ def main():
                 for word in ("Queue", "Очередь", "队列", "File", "Файл", "文件")
             ),
             "the /status answer describes the queue",
+        )
+
+        # A stranger is recorded for the window, never answered and never served.
+        stranger = 888
+        server.updates = [
+            {
+                "update_id": 25,
+                "message": {
+                    "message_id": 25,
+                    "chat": {"id": stranger, "type": "private"},
+                    "from": {"id": stranger, "is_bot": False, "first_name": "Guest", "username": "guest"},
+                    "date": int(time.time()),
+                    "text": "/start",
+                },
+            },
+        ]
+        e2e.wait_for(
+            lambda: account_of(read_state(root), stranger) is not None,
+            timeout=30,
+            what="the second request to be recorded",
+        )
+        check(
+            account_of(read_state(root), stranger)["status"] == "pending",
+            "a stranger only asks",
+        )
+        check(
+            not any(item.get("chat_id") == stranger for item in server.sent),
+            "and is not answered",
+        )
+        server.updates = [voice_update(26, stranger, server.media)]
+        e2e.wait_for(
+            lambda: read_state(root)["offset"] > 26,
+            timeout=30,
+            what="the stranger's file to be ignored",
+        )
+        check(
+            read_state(root)["current"] is None and not read_state(root)["queue"],
+            "a pending account cannot queue files",
+        )
+        check(
+            not any(item.get("reply_to_message_id") == 26 for item in server.sent),
+            "and gets no transcript",
+        )
+        write_access(root, "decline", stranger)
+        e2e.wait_for(
+            lambda: account_of(read_state(root), stranger) is None,
+            timeout=30,
+            what="the declined request to disappear",
+        )
+        check(True, "a declined request is forgotten")
+
+        # Several strangers at once: one button refuses them all, and a refused
+        # account may ask again later.
+        server.updates = [
+            start_update(27, 889, "Guest1", "guest1"),
+            start_update(28, 890, "Guest2", "guest2"),
+        ]
+        e2e.wait_for(
+            lambda: account_of(read_state(root), 889) is not None
+            and account_of(read_state(root), 890) is not None,
+            timeout=30,
+            what="two more requests",
+        )
+        write_access(root, "decline_all")
+        e2e.wait_for(
+            lambda: account_of(read_state(root), 889) is None
+            and account_of(read_state(root), 890) is None,
+            timeout=30,
+            what="every request to be refused",
+        )
+        check(
+            account_of(read_state(root), owner)["status"] == "allowed",
+            "refusing every request keeps the account with access",
+        )
+        server.updates = [start_update(29, 889, "Guest1", "guest1")]
+        e2e.wait_for(
+            lambda: account_of(read_state(root), 889) is not None,
+            timeout=30,
+            what="the repeated request",
+        )
+        check(
+            account_of(read_state(root), 889)["status"] == "pending",
+            "a refused account may ask again",
+        )
+        write_access(root, "decline", 889)
+        e2e.wait_for(
+            lambda: account_of(read_state(root), 889) is None,
+            timeout=30,
+            what="the repeated request to be refused",
         )
 
         e2e.wait_for(
@@ -428,6 +592,47 @@ def main():
             if name.endswith(".state.json") or name in ("session.json", "live.json")
         ]
         check(not state_files, f"no runtime JSON files in the data directory (got {state_files})")
+
+        # Access can be taken back: the bot ignores the account from that moment.
+        before_removal = len(server.sent)
+        write_access(root, "remove", owner)
+        e2e.wait_for(
+            lambda: account_of(read_state(root), owner) is None,
+            timeout=30,
+            what="the account to be removed",
+        )
+        check(True, "the window closes the bot to the account")
+        e2e.wait_for(
+            lambda: len(server.sent) > before_removal,
+            timeout=30,
+            what="the removal notice",
+        )
+        notice = server.sent[before_removal]
+        check(
+            notice.get("chat_id") == owner and notice.get("reply_to_message_id") is None,
+            "the account is told once",
+        )
+        server.updates = [
+            {
+                "update_id": 60,
+                "message": {
+                    "message_id": 60,
+                    "chat": {"id": owner, "type": "private"},
+                    "from": {"id": owner, "is_bot": False, "first_name": "Owner", "username": "owner"},
+                    "date": int(time.time()),
+                    "text": "/status",
+                },
+            },
+        ]
+        e2e.wait_for(
+            lambda: read_state(root)["offset"] > 60,
+            timeout=30,
+            what="the removed account to be ignored",
+        )
+        check(
+            not any(item.get("reply_to_message_id") == 60 for item in server.sent),
+            "and is ignored afterwards",
+        )
     finally:
         daemon.stop()
         server.shutdown()

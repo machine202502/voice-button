@@ -104,6 +104,21 @@ node api-demo/server.mjs      # http://127.0.0.1:8080/
 There is no authentication: keep the host on `127.0.0.1` unless the network is
 trusted. Browser microphones work only on localhost or over HTTPS.
 
+## Telegram
+
+A bot can take the audio instead of the microphone: send it a voice note,
+audio, video, a video note or a file with audio, and the text comes back in the
+same chat and goes to History with the `telegram` source. Telegram gives a bot
+at most 20 MB per incoming file, and only private chats are served.
+
+Who may use the bot is a list, not one owner. **External access → Telegram →
+Accounts with access** shows it. A new account sends `/start` to the bot, its
+request appears under **Waiting for approval**, and **Allow** opens the bot to
+it; **Remove** takes the access back, drops that account's queued files and tells
+it once. An account that is not allowed is never answered, and its files are
+neither downloaded nor transcribed. An installation that already had an owner
+keeps it as the first allowed account.
+
 ## Phone
 
 A phone can dictate into the same app: it opens a page served by the desktop,

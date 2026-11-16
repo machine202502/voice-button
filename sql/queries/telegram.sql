@@ -70,6 +70,40 @@ WHERE (vb_lower(text) LIKE vb_lower(?1) ESCAPE '\'
     OR vb_lower(file_name) LIKE vb_lower(?1) ESCAPE '\')
   AND {{range}};
 
+-- name: accounts
+-- What the window shows and the bot checks: the allowed accounts first, then
+-- the requests that still wait for the owner, each in arrival order.
+SELECT user_id, status, name, username, added_at, last_seen_at
+FROM telegram_account
+ORDER BY CASE status WHEN 'allowed' THEN 0 ELSE 1 END, added_at, user_id;
+
+-- name: account_put
+-- A message from an account refreshes the name it shows and when it was last
+-- seen; a stranger who writes /start becomes a pending row. `status` and
+-- `added_at` never change here — only the window's decision changes them.
+INSERT INTO telegram_account(user_id, status, name, username, added_at, last_seen_at)
+VALUES (?1, 'pending', ?2, ?3, ?4, ?4)
+ON CONFLICT(user_id) DO UPDATE SET
+    name = excluded.name,
+    username = excluded.username,
+    last_seen_at = excluded.last_seen_at;
+
+-- name: account_allow
+UPDATE telegram_account SET status = 'allowed' WHERE user_id = ?1;
+
+-- name: account_remove
+DELETE FROM telegram_account WHERE user_id = ?1;
+
+-- name: account_clear
+-- "Remove all accounts" takes access away from everyone who had it and leaves
+-- the requests that still wait for a decision.
+DELETE FROM telegram_account WHERE status = 'allowed';
+
+-- name: account_clear_pending
+-- "Decline all" forgets every request at once. A forgotten account is not
+-- blocked: its next /start inserts a new pending row.
+DELETE FROM telegram_account WHERE status = 'pending';
+
 -- name: test_chat_insert
 INSERT INTO telegram_chat(chat_id, message_id, at, sender, kind, file_name,
     seconds, text, error, added_at)

@@ -313,15 +313,46 @@ pub fn take_telegram_token_request(root: &Path) -> Option<TelegramTokenRequest> 
     })
 }
 
-pub fn request_telegram_reset(root: &Path) {
-    write_value(root, "request.telegram_reset", "1");
+/// A decision the window made about who may use the Telegram bot. The daemon
+/// applies it to the database and tells the account; the bot itself never grants
+/// access.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TelegramAccess {
+    Allow(i64),
+    Decline(i64),
+    DeclineAll,
+    Remove(i64),
+    Clear,
+}
+
+pub fn request_telegram_access(root: &Path, access: TelegramAccess) {
+    let (action, user) = match access {
+        TelegramAccess::Allow(user) => ("allow", user),
+        TelegramAccess::Decline(user) => ("decline", user),
+        TelegramAccess::DeclineAll => ("decline_all", 0),
+        TelegramAccess::Remove(user) => ("remove", user),
+        TelegramAccess::Clear => ("clear", 0),
+    };
+    let text = encode(&[
+        ("action", action.to_string()),
+        ("user", user.to_string()),
+    ]);
+    write_value(root, "request.telegram_access", &text);
     crate::ipc_event::notify(root);
 }
 
-pub fn take_telegram_reset(root: &Path) -> bool {
-    open(root)
-        .and_then(|store| store.kv_take("request.telegram_reset"))
-        .is_some()
+pub fn take_telegram_access_request(root: &Path) -> Option<TelegramAccess> {
+    let store = open(root)?;
+    let map = decode(&store.kv_take("request.telegram_access")?);
+    let user = number(&map, "user");
+    match field(&map, "action").as_str() {
+        "allow" => Some(TelegramAccess::Allow(user)),
+        "decline" => Some(TelegramAccess::Decline(user)),
+        "decline_all" => Some(TelegramAccess::DeclineAll),
+        "remove" => Some(TelegramAccess::Remove(user)),
+        "clear" => Some(TelegramAccess::Clear),
+        _ => None,
+    }
 }
 
 /// Ask the daemon to archive or unarchive one monolog.

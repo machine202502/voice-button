@@ -1,9 +1,10 @@
 //! The Telegram side of Voice Button.
 //!
 //! One long-polling thread receives updates, one worker turns queued media into
-//! text. The queue, the owner and the chat mirror live in the SQLite database
-//! so a restart resumes instead of forgetting. Only private chats are served;
-//! strangers are ignored silently.
+//! text. The queue, the accounts that may use the bot and the chat mirror live
+//! in the SQLite database so a restart resumes instead of forgetting. Only
+//! private chats are served; an account that is not allowed is ignored silently,
+//! and access is granted by the window, never by the bot.
 
 use anyhow::{anyhow, bail, Context, Result};
 use rusqlite::OptionalExtension;
@@ -326,15 +327,17 @@ impl Client {
     }
 
     fn send_text(&self, chat: i64, reply_to: i64, text: &str) -> Result<()> {
-        self.call(
-            "sendMessage",
-            &json!({
-                "chat_id": chat,
-                "text": text,
-                "reply_to_message_id": reply_to,
-                "disable_web_page_preview": true,
-            }),
-        )?;
+        let mut body = json!({
+            "chat_id": chat,
+            "text": text,
+            "disable_web_page_preview": true,
+        });
+        // A notice about access has no message to answer; asking Telegram to
+        // reply to message 0 would fail instead of being delivered.
+        if reply_to > 0 {
+            body["reply_to_message_id"] = json!(reply_to);
+        }
+        self.call("sendMessage", &body)?;
         Ok(())
     }
 
@@ -490,10 +493,40 @@ pub struct Job {
     pub started_at: String,
 }
 
+/// One Telegram account the bot knows about. `status` is `allowed` (it may use
+/// the bot) or `pending` (it asked with /start and waits for the window). The
+/// window is the only place that decides, so the bot has no roles of its own.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Account {
+    pub user_id: i64,
+    pub status: String,
+    pub name: String,
+    pub username: String,
+    pub added_at: String,
+    pub last_seen_at: String,
+}
+
+impl Account {
+    pub fn allowed(&self) -> bool {
+        self.status == "allowed"
+    }
+
+    /// How the account is named in the window: the Telegram name, the
+    /// @username, or a neutral word when the person has neither.
+    pub fn display(&self) -> String {
+        let name = self.name.trim();
+        let username = self.username.trim();
+        match (name.is_empty(), username.is_empty()) {
+            (false, false) => format!("{name} (@{username})"),
+            (false, true) => name.to_string(),
+            (true, false) => format!("@{username}"),
+            (true, true) => tr("User"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TelegramState {
-    #[serde(default)]
-    pub owner: Option<i64>,
     #[serde(default)]
     pub offset: i64,
     #[serde(default)]
@@ -575,16 +608,193 @@ fn write_job(
     Ok(())
 }
 
+fn read_account(row: &rusqlite::Row<'_>) -> rusqlite::Result<Account> {
+    Ok(Account {
+        user_id: row.get(0)?,
+        status: row.get(1)?,
+        name: row.get(2)?,
+        username: row.get(3)?,
+        added_at: row.get(4)?,
+        last_seen_at: row.get(5)?,
+    })
+}
+
+/// Everyone the bot knows: allowed accounts first, then pending requests.
+pub fn accounts(root: &Path) -> Vec<Account> {
+    let Some(store) = open_store(root) else {
+        return Vec::new();
+    };
+    let conn = store.conn();
+    let Ok(mut statement) = conn.prepare(crate::sql::query("telegram/accounts")) else {
+        return Vec::new();
+    };
+    statement
+        .query_map([], read_account)
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default()
+}
+
+/// Remember what the account calls itself now, and when it was last heard from.
+/// A stranger's /start inserts the row as pending; an existing row keeps the
+/// status and the date it was added.
+fn touch_account(root: &Path, message: &Value) {
+    let Some(store) = open_store(root) else {
+        return;
+    };
+    let user = message.get("from").cloned().unwrap_or_default();
+    let user_id = user.get("id").and_then(Value::as_i64).unwrap_or(0);
+    if user_id == 0 {
+        return;
+    }
+    let username = user
+        .get("username")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let _ = store.conn().execute(
+        crate::sql::query("telegram/account_put"),
+        rusqlite::params![user_id, profile_name(&user), username, now],
+    );
+}
+
+/// The Telegram display name alone: "Анна Петрова". The @username is kept in its
+/// own column, so the window can show both without parsing.
+fn profile_name(user: &Value) -> String {
+    let first = user.get("first_name").and_then(Value::as_str).unwrap_or("");
+    let last = user.get("last_name").and_then(Value::as_str).unwrap_or("");
+    format!("{} {}", first.trim(), last.trim()).trim().to_string()
+}
+
+fn allow_account(root: &Path, user_id: i64) {
+    if let Some(store) = open_store(root) {
+        let _ = store
+            .conn()
+            .execute(crate::sql::query("telegram/account_allow"), [user_id]);
+    }
+}
+
+fn remove_account(root: &Path, user_id: i64) {
+    if let Some(store) = open_store(root) {
+        let _ = store
+            .conn()
+            .execute(crate::sql::query("telegram/account_remove"), [user_id]);
+    }
+}
+
+/// Forget every request at once. Nothing is queued for a pending account, so
+/// only the rows go; a forgotten account may ask again with a new /start.
+fn forget_requests(root: &Path) {
+    if let Some(store) = open_store(root) {
+        let _ = store
+            .conn()
+            .execute(crate::sql::query("telegram/account_clear_pending"), []);
+    }
+}
+
+/// Decide what one request from the window does to the database.
+///
+/// `tell` is how the account is informed; it is called once per affected
+/// account and is separate from the change, so a test can watch the decisions
+/// without a network.
+fn apply_access_with(
+    dirs: &AppDirs,
+    state: &Arc<Mutex<TelegramState>>,
+    request: crate::ipc::TelegramAccess,
+    tell: &dyn Fn(i64, &str),
+) {
+    let before = accounts(&dirs.root);
+    match request {
+        crate::ipc::TelegramAccess::Allow(user_id) => {
+            let Some(account) = before.iter().find(|account| account.user_id == user_id) else {
+                return;
+            };
+            if account.allowed() {
+                return;
+            }
+            allow_account(&dirs.root, user_id);
+            tell(
+                user_id,
+                &tr("Access granted. Send a voice note or a file — I will return the text here."),
+            );
+        }
+        crate::ipc::TelegramAccess::Decline(user_id) => {
+            // A refusal only forgets a request; a granted account is removed
+            // with its own button, never by a stray "decline".
+            let Some(account) = before.iter().find(|account| account.user_id == user_id) else {
+                return;
+            };
+            if account.allowed() {
+                return;
+            }
+            remove_account(&dirs.root, user_id);
+        }
+        crate::ipc::TelegramAccess::DeclineAll => {
+            forget_requests(&dirs.root);
+        }
+        crate::ipc::TelegramAccess::Remove(user_id) => {
+            let Some(account) = before.iter().find(|account| account.user_id == user_id) else {
+                return;
+            };
+            if !account.allowed() {
+                return;
+            }
+            forget(dirs, state, user_id);
+            tell(user_id, &tr("Access to this bot has been revoked."));
+        }
+        crate::ipc::TelegramAccess::Clear => {
+            for account in before.iter().filter(|account| account.allowed()) {
+                forget(dirs, state, account.user_id);
+                tell(account.user_id, &tr("Access to this bot has been revoked."));
+            }
+        }
+    }
+}
+
+/// Remove an account and drop the files it still had waiting. The file that is
+/// already being transcribed runs to its end: stopping a decoder mid-segment
+/// costs more than one finished reply.
+fn forget(dirs: &AppDirs, state: &Arc<Mutex<TelegramState>>, user_id: i64) {
+    remove_account(&dirs.root, user_id);
+    let mut state = state.lock().unwrap();
+    let before = state.queue.len();
+    state.queue.retain(|job| job.chat_id != user_id);
+    if state.queue.len() != before {
+        save_state(dirs, &state);
+    }
+}
+
+/// Apply one decision from the window and tell the account about it. The database
+/// is the source of truth; the message is sent from a thread of its own, so a
+/// slow network never holds the daemon's loop.
+pub fn apply_access(
+    dirs: &AppDirs,
+    shared: &Arc<Shared>,
+    state: &Arc<Mutex<TelegramState>>,
+    request: crate::ipc::TelegramAccess,
+) {
+    let (_, token, proxy, base) = settings(dirs, shared);
+    apply_access_with(dirs, state, request, &|chat, text| {
+        if token.trim().is_empty() {
+            return;
+        }
+        let (token, proxy, base, text) = (token.clone(), proxy.clone(), base.clone(), text.to_string());
+        std::thread::spawn(move || match Client::new(token, &proxy, &base) {
+            Ok(client) => {
+                if let Err(error) = client.send_text(chat, 0, &text) {
+                    crate::log::log(&format!("telegram: access notice: {error:#}"));
+                }
+            }
+            Err(error) => crate::log::log(&format!("telegram: access notice: {error:#}")),
+        });
+    });
+}
+
 fn load_state(dirs: &AppDirs) -> TelegramState {
     let Some(store) = open_store(&dirs.root) else {
         return TelegramState::default();
     };
     let mut state = TelegramState::default();
-    state.owner = store
-        .kv_get("telegram.owner")
-        .ok()
-        .flatten()
-        .and_then(|value| value.parse().ok());
     state.offset = store
         .kv_get("telegram.offset")
         .ok()
@@ -620,13 +830,6 @@ fn save_state(dirs: &AppDirs, state: &TelegramState) {
     let Ok(transaction) = conn.transaction() else {
         return;
     };
-    let _ = transaction.execute(
-        crate::sql::query("telegram/kv_put"),
-        rusqlite::params![
-            "telegram.owner",
-            state.owner.map(|id| id.to_string()).unwrap_or_default()
-        ],
-    );
     let _ = transaction.execute(
         crate::sql::query("telegram/kv_put"),
         rusqlite::params!["telegram.offset", state.offset.to_string()],
@@ -696,14 +899,7 @@ fn read_chat(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatEntry> {
     })
 }
 
-pub fn reset_owner(root: &Path) {
-    if let Some(store) = open_store(root) {
-        let _ = store.kv_delete("telegram.owner");
-    }
-}
-
-/// One page of the chat, oldest first, for the window's lazy list.
-///
+/// One page of the chat, oldest first, for the window's lazy list.///
 /// The bounds follow the bot's own clock: a message belongs to the day it was
 /// processed, not to the day printed on the file it carried. `at` is still read
 /// for older rows that predate the column, so old data keeps working.
@@ -802,7 +998,7 @@ pub fn chat_search_count(dirs: &AppDirs, range: DateFilter, needle: &str) -> usi
 /// What the settings window shows about the bot, without the token.
 #[derive(Debug, Clone, Default)]
 pub struct Snapshot {
-    pub owner: Option<i64>,
+    pub accounts: Vec<Account>,
     pub queued: usize,
     pub current: Option<Job>,
     pub last_error: Option<String>,
@@ -814,71 +1010,89 @@ pub fn snapshot(root: &Path) -> Snapshot {
         models: std::path::PathBuf::new(),
     });
     Snapshot {
-        owner: state.owner,
+        accounts: accounts(root),
         queued: state.queue.len(),
         current: state.current,
         last_error: state.last_error,
     }
 }
 
-pub fn status_text(dirs: &AppDirs) -> String {
-    let state = load_state(dirs);
-    status_of(&state)
-}
-
-fn status_of(state: &TelegramState) -> String {
-    let Some(job) = state.current.as_ref().or_else(|| state.queue.front()) else {
-        return tr("Queue is empty.");
-    };
-    let place = if state.current.is_some() {
-        tr("now")
-    } else {
-        trf("in queue: {count}", &[("count", &state.queue.len().to_string())])
-    };
-    let percent = if job.seconds > 0.0 {
-        (job.done_seconds / job.seconds * 100.0).clamp(0.0, 100.0)
-    } else {
-        job.progress.clamp(0.0, 100.0)
-    };
-    let remaining = (job.seconds - job.done_seconds).max(0.0);
-    let started = chrono::DateTime::parse_from_rfc3339(&job.started_at)
-        .ok()
-        .map(|at| (chrono::Local::now() - at.with_timezone(&chrono::Local)).num_seconds())
-        .filter(|seconds| *seconds > 0);
-    let eta = match (started, job.done_seconds) {
-        (Some(elapsed), done) if done > 0.5 && elapsed > 0 => {
-            let speed = done / elapsed as f32;
-            format!("{:.0} {}", remaining / speed.max(0.05), tr("s"))
+/// The answer to /status. It is about the caller's own files: another account's
+/// file name is none of its business, so only the number of other files is
+/// mentioned.
+fn status_of(state: &TelegramState, from: i64) -> String {
+    let mine_current = state.current.as_ref().filter(|job| job.chat_id == from);
+    let mine_queued: Vec<&Job> = state.queue.iter().filter(|job| job.chat_id == from).collect();
+    let others = (state.current.is_some() as usize + state.queue.len())
+        - (mine_current.is_some() as usize + mine_queued.len());
+    let own = mine_current.or_else(|| mine_queued.first().copied());
+    let text = match own {
+        None => tr("Queue is empty."),
+        Some(job) => {
+            let place = if mine_current.is_some() {
+                tr("now")
+            } else {
+                let position = state
+                    .queue
+                    .iter()
+                    .position(|queued| queued.update_id == job.update_id)
+                    .map(|index| index + 1)
+                    .unwrap_or(1);
+                trf("in queue: {count}", &[("count", &position.to_string())])
+            };
+            let percent = if job.seconds > 0.0 {
+                (job.done_seconds / job.seconds * 100.0).clamp(0.0, 100.0)
+            } else {
+                job.progress.clamp(0.0, 100.0)
+            };
+            let remaining = (job.seconds - job.done_seconds).max(0.0);
+            let started = chrono::DateTime::parse_from_rfc3339(&job.started_at)
+                .ok()
+                .map(|at| (chrono::Local::now() - at.with_timezone(&chrono::Local)).num_seconds())
+                .filter(|seconds| *seconds > 0);
+            let eta = match (started, job.done_seconds) {
+                (Some(elapsed), done) if done > 0.5 && elapsed > 0 => {
+                    let speed = done / elapsed as f32;
+                    format!("{:.0} {}", remaining / speed.max(0.05), tr("s"))
+                }
+                _ => "—".to_string(),
+            };
+            let file = if job.file_name.is_empty() {
+                tr("unnamed")
+            } else {
+                job.file_name.clone()
+            };
+            let stage = if job.stage.is_empty() {
+                tr("queued")
+            } else {
+                tr(&job.stage)
+            };
+            let error = job
+                .error
+                .as_ref()
+                .map(|error| trf("Error: {error}", &[("error", error)]))
+                .unwrap_or_else(|| tr("No error."));
+            trf(
+                "File: {file}\nStage: {stage}\nDone: {done} / {total} s ({percent}%)\nPosition: {place}\nETA: {eta}\n{error}",
+                &[
+                    ("file", &file),
+                    ("stage", &stage),
+                    ("done", &format!("{:.1}", job.done_seconds)),
+                    ("total", &format!("{:.1}", job.seconds)),
+                    ("percent", &format!("{:.0}", percent)),
+                    ("place", &place),
+                    ("eta", &eta),
+                    ("error", &error),
+                ],
+            )
         }
-        _ => "—".to_string(),
     };
-    let file = if job.file_name.is_empty() {
-        tr("unnamed")
-    } else {
-        job.file_name.clone()
-    };
-    let stage = if job.stage.is_empty() {
-        tr("queued")
-    } else {
-        tr(&job.stage)
-    };
-    let error = job
-        .error
-        .as_ref()
-        .map(|error| trf("Error: {error}", &[("error", error)]))
-        .unwrap_or_else(|| tr("No error."));
-    trf(
-        "File: {file}\nStage: {stage}\nDone: {done} / {total} s ({percent}%)\nPosition: {place}\nETA: {eta}\n{error}",
-        &[
-            ("file", &file),
-            ("stage", &stage),
-            ("done", &format!("{:.1}", job.done_seconds)),
-            ("total", &format!("{:.1}", job.seconds)),
-            ("percent", &format!("{:.0}", percent)),
-            ("place", &place),
-            ("eta", &eta),
-            ("error", &error),
-        ],
+    if others == 0 {
+        return text;
+    }
+    format!(
+        "{text}\n{}",
+        trf("Also waiting: {count} from other accounts.", &[("count", &others.to_string())])
     )
 }
 
@@ -919,8 +1133,17 @@ fn settings(dirs: &AppDirs, shared: &Arc<Shared>) -> (bool, String, String, Stri
 
 /// Start the polling and worker threads. They live as long as the daemon and
 /// wait quietly while the setting is off or no token is stored.
-pub fn spawn(dirs: AppDirs, shared: Arc<Shared>, asr: Arc<crate::asr_engine::Engine>) {
+///
+/// The state is returned because the daemon also applies the window's access
+/// decisions: a removed account must leave the in-memory queue at once, not at
+/// the next reload.
+pub fn spawn(
+    dirs: AppDirs,
+    shared: Arc<Shared>,
+    asr: Arc<crate::asr_engine::Engine>,
+) -> Arc<Mutex<TelegramState>> {
     let state = Arc::new(Mutex::new(load_state(&dirs)));
+    let applied = state.clone();
     // A downloaded take is a temporary file: it is deleted as soon as its job
     // ends. Files found here belong to a run that crashed mid-job, so they are
     // removed before the worker starts.
@@ -949,9 +1172,6 @@ pub fn spawn(dirs: AppDirs, shared: Arc<Shared>, asr: Arc<crate::asr_engine::Eng
                 ) {
                     crate::log::log(&format!("telegram: cannot store the token: {error:#}"));
                 }
-            }
-            if crate::ipc::take_telegram_reset(&poll_dirs.root) {
-                reset_owner(&poll_dirs.root);
             }
             let (enabled, token, proxy, base) = settings(&poll_dirs, &poll_shared);
             if !enabled || token.trim().is_empty() {
@@ -1051,6 +1271,7 @@ pub fn spawn(dirs: AppDirs, shared: Arc<Shared>, asr: Arc<crate::asr_engine::Eng
         finish_job(&client, &dirs, &state, &job, outcome);
         set_background(&shared, false);
     });
+    applied
 }
 
 /// The bot names the computer's time zone explicitly; the app deliberately
@@ -1141,6 +1362,11 @@ fn sender_label(message: &Value) -> String {
         .unwrap_or_else(|| tr("User"))
 }
 
+fn is_start(text: &str) -> bool {
+    let text = text.trim();
+    text == "/start" || text.starts_with("/start ") || text.starts_with("/start@")
+}
+
 fn handle_update(
     client: &dyn Api,
     dirs: &AppDirs,
@@ -1161,33 +1387,35 @@ fn handle_update(
         .and_then(|from| from.get("id"))
         .and_then(Value::as_i64)
         .unwrap_or(0);
+    if from == 0 {
+        return Ok(());
+    }
     let text = message.get("text").and_then(Value::as_str).unwrap_or("");
-    let owner = state.lock().unwrap().owner;
-
-    if text.trim() == "/start" {
-        if owner.is_none() {
-            {
-                let mut state = state.lock().unwrap();
-                state.owner = Some(from);
-            }
-            save_state(dirs, &state.lock().unwrap());
-            client.send_text(
-                chat_id,
-                message_id,
-                &tr("I am here. Send a voice note, audio, video, video note or a file with audio — I will return the text here. /status shows the queue."),
-            )?;
-        } else if owner == Some(from) {
-            client.send_text(chat_id, message_id, &tr("The bot is already connected to you."))?;
-        }
+    let start = is_start(text);
+    let account = accounts(&dirs.root)
+        .into_iter()
+        .find(|account| account.user_id == from);
+    // A stranger may only ask: /start becomes a pending row the window shows,
+    // and even that gets no answer. Anything else from an unknown account is
+    // not downloaded, not queued and not mentioned.
+    if account.is_none() && !start {
+        return Ok(());
+    }
+    touch_account(&dirs.root, message);
+    let Some(account) = account else {
+        return Ok(());
+    };
+    if !account.allowed() {
         return Ok(());
     }
 
-    if owner != Some(from) {
+    if start {
+        client.send_text(chat_id, message_id, &tr("The bot is already connected to you."))?;
         return Ok(());
     }
 
     if text.trim() == "/status" {
-        let answer = status_of(&state.lock().unwrap());
+        let answer = status_of(&state.lock().unwrap(), from);
         client.send_text(chat_id, message_id, &answer)?;
         return Ok(());
     }
@@ -1640,19 +1868,128 @@ mod tests {
         })
     }
 
+    fn allow(dirs: &AppDirs, user: i64) {
+        apply_access_with(
+            dirs,
+            &Arc::new(Mutex::new(TelegramState::default())),
+            crate::ipc::TelegramAccess::Allow(user),
+            &|_, _| {},
+        );
+    }
+
+    fn job_for(chat: i64, file: &str) -> Job {
+        Job {
+            update_id: chat * 10,
+            chat_id: chat,
+            message_id: 1,
+            file_id: "f".into(),
+            file_name: file.into(),
+            kind: "voice".into(),
+            sender: String::new(),
+            original_at: String::new(),
+            size: 1,
+            seconds: 10.0,
+            done_seconds: 0.0,
+            stage: "queued".into(),
+            progress: 0.0,
+            text: String::new(),
+            error: None,
+            received_at: String::new(),
+            started_at: String::new(),
+        }
+    }
+
     #[test]
-    fn the_first_start_owns_the_bot_and_others_are_silent() {
-        let dirs = dirs("owner");
+    fn a_stranger_asks_for_access_and_gets_no_answer() {
+        let dirs = dirs("pending");
         let api = Fake::new(1000);
         let state = Arc::new(Mutex::new(TelegramState::default()));
         handle_update(&api, &dirs, &state, &start(1, 111, "/start")).unwrap();
-        assert_eq!(state.lock().unwrap().owner, Some(111));
-        assert_eq!(api.sent().len(), 1);
-        handle_update(&api, &dirs, &state, &start(2, 222, "/start")).unwrap();
-        assert_eq!(state.lock().unwrap().owner, Some(111), "a stranger does not take over");
-        assert_eq!(api.sent().len(), 1, "and gets no answer");
-        handle_update(&api, &dirs, &state, &voice(3, 222, 1000)).unwrap();
-        assert!(state.lock().unwrap().queue.is_empty(), "a stranger cannot queue files");
+        let list = accounts(&dirs.root);
+        assert_eq!(list.len(), 1, "the request is recorded for the window");
+        assert_eq!(list[0].user_id, 111);
+        assert!(!list[0].allowed());
+        assert!(api.sent().is_empty(), "a stranger gets no answer");
+        assert!(state.lock().unwrap().queue.is_empty());
+        handle_update(&api, &dirs, &state, &voice(2, 111, 1000)).unwrap();
+        assert!(
+            state.lock().unwrap().queue.is_empty(),
+            "a pending account cannot queue files"
+        );
+        assert!(api.sent().is_empty(), "and is not told why");
+        // A second stranger is recorded too, not mixed with the first.
+        handle_update(&api, &dirs, &state, &start(3, 222, "/start")).unwrap();
+        assert_eq!(accounts(&dirs.root).len(), 2);
+        let _ = std::fs::remove_dir_all(&dirs.root);
+    }
+
+    #[test]
+    fn an_allowed_account_uses_the_bot_like_the_old_owner() {
+        let dirs = dirs("allowed");
+        let api = Fake::new(1000);
+        let state = Arc::new(Mutex::new(TelegramState::default()));
+        handle_update(&api, &dirs, &state, &start(1, 111, "/start")).unwrap();
+        let told = Mutex::new(Vec::new());
+        apply_access_with(
+            &dirs,
+            &state,
+            crate::ipc::TelegramAccess::Allow(111),
+            &|chat, text| told.lock().unwrap().push((chat, text.to_string())),
+        );
+        assert!(accounts(&dirs.root)[0].allowed());
+        assert_eq!(
+            *told.lock().unwrap(),
+            vec![(111, tr("Access granted. Send a voice note or a file — I will return the text here."))]
+        );
+        // A second /start is answered, because the account is already allowed.
+        handle_update(&api, &dirs, &state, &start(2, 111, "/start")).unwrap();
+        assert!(api
+            .sent()
+            .iter()
+            .any(|text| text.contains(&tr("The bot is already connected to you."))));
+        handle_update(&api, &dirs, &state, &voice(3, 111, 1000)).unwrap();
+        assert_eq!(state.lock().unwrap().queue.len(), 1);
+        // The same decision is not applied twice: the second call says nothing.
+        apply_access_with(
+            &dirs,
+            &state,
+            crate::ipc::TelegramAccess::Allow(111),
+            &|chat, text| told.lock().unwrap().push((chat, text.to_string())),
+        );
+        assert_eq!(told.lock().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dirs.root);
+    }
+
+    #[test]
+    fn the_account_keeps_the_name_it_last_wrote_with() {
+        let dirs = dirs("profile");
+        let api = Fake::new(1000);
+        let state = Arc::new(Mutex::new(TelegramState::default()));
+        let profile = |update_id: i64, username: &str| {
+            json!({
+                "update_id": update_id,
+                "message": {
+                    "message_id": update_id,
+                    "chat": { "id": 333, "type": "private" },
+                    "from": {
+                        "id": 333,
+                        "first_name": "Анна",
+                        "last_name": "Петрова",
+                        "username": username,
+                    },
+                    "text": "/start",
+                }
+            })
+        };
+        handle_update(&api, &dirs, &state, &profile(1, "anna")).unwrap();
+        let account = accounts(&dirs.root).pop().unwrap();
+        assert_eq!(account.display(), "Анна Петрова (@anna)");
+        assert!(account.last_seen_at.ends_with('Z'));
+        // The same id with a new @username is the same account, renamed.
+        handle_update(&api, &dirs, &state, &profile(2, "anna-new")).unwrap();
+        let account = accounts(&dirs.root).pop().unwrap();
+        assert_eq!(account.display(), "Анна Петрова (@anna-new)");
+        assert_eq!(accounts(&dirs.root).len(), 1);
         let _ = std::fs::remove_dir_all(&dirs.root);
     }
 
@@ -1662,6 +1999,7 @@ mod tests {
         let api = Fake::new(1000);
         let state = Arc::new(Mutex::new(TelegramState::default()));
         handle_update(&api, &dirs, &state, &start(1, 111, "/start")).unwrap();
+        allow(&dirs, 111);
         handle_update(&api, &dirs, &state, &voice(2, 111, 1000)).unwrap();
         let queued = state.lock().unwrap().queue.front().cloned().unwrap();
         assert_eq!(queued.file_id, "f1");
@@ -1678,6 +2016,7 @@ mod tests {
         let api = Fake::new(MAX_FILE + 1);
         let state = Arc::new(Mutex::new(TelegramState::default()));
         handle_update(&api, &dirs, &state, &start(1, 111, "/start")).unwrap();
+        allow(&dirs, 111);
         handle_update(&api, &dirs, &state, &voice(2, 111, MAX_FILE + 1)).unwrap();
         assert!(state.lock().unwrap().queue.is_empty());
         assert!(api.sent().iter().any(|text| text.contains("20 MB") || text.contains("20 МБ")));
@@ -1685,14 +2024,18 @@ mod tests {
     }
 
     #[test]
-    fn only_the_owner_gets_status() {
+    fn a_stranger_cannot_ask_for_status() {
         let dirs = dirs("status");
         let api = Fake::new(1000);
         let state = Arc::new(Mutex::new(TelegramState::default()));
         handle_update(&api, &dirs, &state, &start(1, 111, "/start")).unwrap();
-        handle_update(&api, &dirs, &state, &start(2, 222, "/status")).unwrap();
+        allow(&dirs, 111);
+        // A pending account asks and hears nothing.
+        handle_update(&api, &dirs, &state, &start(2, 222, "/start")).unwrap();
+        handle_update(&api, &dirs, &state, &start(3, 222, "/status")).unwrap();
         assert!(!api.sent().iter().any(|text| text.contains(&tr("Queue is empty."))));
-        handle_update(&api, &dirs, &state, &start(3, 111, "/status")).unwrap();
+        // The allowed account does get an answer.
+        handle_update(&api, &dirs, &state, &start(4, 111, "/status")).unwrap();
         assert!(api.sent().iter().any(|text| text.contains(&tr("Queue is empty."))));
         let _ = std::fs::remove_dir_all(&dirs.root);
     }
@@ -1719,11 +2062,36 @@ mod tests {
             received_at: String::new(),
             started_at: String::new(),
         });
-        let text = status_of(&state);
+        let text = status_of(&state, 1);
         assert!(text.contains("long.ogg"));
         assert!(text.contains("расшифровка"));
         assert!(text.contains("25.0 / 100.0"));
         assert!(text.contains("25%"));
+    }
+
+    #[test]
+    fn status_is_about_the_callers_own_files() {
+        let mut state = TelegramState::default();
+        state.current = Some(job_for(111, "mine.ogg"));
+        state.queue.push_back(job_for(222, "theirs.ogg"));
+        let mine = status_of(&state, 111);
+        assert!(mine.contains("mine.ogg"));
+        assert!(!mine.contains("theirs.ogg"), "another account's file is not named");
+        assert!(mine.contains(&trf(
+            "Also waiting: {count} from other accounts.",
+            &[("count", &1.to_string())]
+        )));
+        let theirs = status_of(&state, 222);
+        assert!(theirs.contains("theirs.ogg"));
+        assert!(!theirs.contains("mine.ogg"));
+        assert!(theirs.contains(&tr("in queue: {count}").split("{count}").next().unwrap()));
+        let outsider = status_of(&state, 333);
+        assert!(outsider.contains(&tr("Queue is empty.")));
+        assert!(!outsider.contains("mine.ogg") && !outsider.contains("theirs.ogg"));
+        assert!(outsider.contains(&trf(
+            "Also waiting: {count} from other accounts.",
+            &[("count", &2.to_string())]
+        )));
     }
 
     #[test]
@@ -1877,10 +2245,9 @@ mod tests {
     }
 
     #[test]
-    fn the_queue_survives_a_reload_and_the_owner_can_be_reset() {
+    fn the_queue_survives_a_reload() {
         let dirs = dirs("reload");
         let mut state = TelegramState::default();
-        state.owner = Some(99);
         state.queue.push_back(Job {
             update_id: 5,
             chat_id: 1,
@@ -1902,11 +2269,161 @@ mod tests {
         });
         save_state(&dirs, &state);
         let loaded = load_state(&dirs);
-        assert_eq!(loaded.owner, Some(99));
         assert_eq!(loaded.queue.len(), 1);
         assert_eq!(loaded.queue[0].file_name, "pending.ogg");
-        reset_owner(&dirs.root);
-        assert_eq!(load_state(&dirs).owner, None, "the reset clears the owner");
+        let _ = std::fs::remove_dir_all(&dirs.root);
+    }
+
+    #[test]
+    fn removing_an_account_drops_its_files_and_tells_it_once() {
+        let dirs = dirs("remove");
+        let api = Fake::new(1000);
+        let state = Arc::new(Mutex::new(TelegramState::default()));
+        for user in [111, 222] {
+            handle_update(&api, &dirs, &state, &start(1, user, "/start")).unwrap();
+            allow(&dirs, user);
+        }
+        handle_update(&api, &dirs, &state, &voice(2, 111, 1000)).unwrap();
+        handle_update(&api, &dirs, &state, &voice(3, 222, 1000)).unwrap();
+        assert_eq!(state.lock().unwrap().queue.len(), 2);
+        let told = Mutex::new(Vec::new());
+        apply_access_with(
+            &dirs,
+            &state,
+            crate::ipc::TelegramAccess::Remove(111),
+            &|chat, text| told.lock().unwrap().push((chat, text.to_string())),
+        );
+        assert!(accounts(&dirs.root).iter().all(|account| account.user_id != 111));
+        assert_eq!(
+            state.lock().unwrap().queue.len(),
+            1,
+            "the removed account leaves the queue at once"
+        );
+        assert_eq!(
+            load_state(&dirs).queue.len(),
+            1,
+            "and the database does not bring it back"
+        );
+        assert_eq!(
+            *told.lock().unwrap(),
+            vec![(111, tr("Access to this bot has been revoked."))]
+        );
+        // After the removal the account is a stranger again: media is ignored.
+        handle_update(&api, &dirs, &state, &voice(4, 111, 1000)).unwrap();
+        assert_eq!(state.lock().unwrap().queue.len(), 1);
+        assert!(api.sent().is_empty(), "the bot says nothing to it");
+        let _ = std::fs::remove_dir_all(&dirs.root);
+    }
+
+    #[test]
+    fn a_declined_request_is_forgotten_and_gets_no_message() {
+        let dirs = dirs("decline");
+        let api = Fake::new(1000);
+        let state = Arc::new(Mutex::new(TelegramState::default()));
+        handle_update(&api, &dirs, &state, &start(1, 222, "/start")).unwrap();
+        let told = Mutex::new(Vec::new());
+        apply_access_with(
+            &dirs,
+            &state,
+            crate::ipc::TelegramAccess::Decline(222),
+            &|chat, text| told.lock().unwrap().push((chat, text.to_string())),
+        );
+        assert!(accounts(&dirs.root).is_empty());
+        assert!(told.lock().unwrap().is_empty(), "a refusal is silent");
+        let _ = std::fs::remove_dir_all(&dirs.root);
+    }
+
+    #[test]
+    fn declining_everything_forgets_all_requests_and_keeps_the_accounts() {
+        let dirs = dirs("decline-all");
+        let api = Fake::new(1000);
+        let state = Arc::new(Mutex::new(TelegramState::default()));
+        handle_update(&api, &dirs, &state, &start(1, 111, "/start")).unwrap();
+        allow(&dirs, 111);
+        for user in [222, 333, 444] {
+            handle_update(&api, &dirs, &state, &start(2, user, "/start")).unwrap();
+        }
+        assert_eq!(accounts(&dirs.root).len(), 4);
+        let told = Mutex::new(Vec::new());
+        apply_access_with(
+            &dirs,
+            &state,
+            crate::ipc::TelegramAccess::DeclineAll,
+            &|chat, text| told.lock().unwrap().push((chat, text.to_string())),
+        );
+        let list = accounts(&dirs.root);
+        assert_eq!(list.len(), 1, "only the account with access is left");
+        assert_eq!(list[0].user_id, 111);
+        assert!(list[0].allowed());
+        assert!(told.lock().unwrap().is_empty(), "every refusal is silent");
+        let _ = std::fs::remove_dir_all(&dirs.root);
+    }
+
+    #[test]
+    fn a_refused_account_may_ask_again() {
+        let dirs = dirs("decline-again");
+        let api = Fake::new(1000);
+        let state = Arc::new(Mutex::new(TelegramState::default()));
+        handle_update(&api, &dirs, &state, &start(1, 222, "/start")).unwrap();
+        apply_access_with(
+            &dirs,
+            &state,
+            crate::ipc::TelegramAccess::DeclineAll,
+            &|_, _| {},
+        );
+        assert!(accounts(&dirs.root).is_empty());
+        // No blocklist: the next /start is a fresh request for the window.
+        handle_update(&api, &dirs, &state, &start(2, 222, "/start")).unwrap();
+        let list = accounts(&dirs.root);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].user_id, 222);
+        assert!(!list[0].allowed());
+        assert!(api.sent().is_empty(), "and it is still not answered");
+        let _ = std::fs::remove_dir_all(&dirs.root);
+    }
+
+    #[test]
+    fn removing_everything_keeps_the_requests_that_still_wait() {
+        let dirs = dirs("clear");
+        let api = Fake::new(1000);
+        let state = Arc::new(Mutex::new(TelegramState::default()));
+        handle_update(&api, &dirs, &state, &start(1, 111, "/start")).unwrap();
+        allow(&dirs, 111);
+        handle_update(&api, &dirs, &state, &start(2, 222, "/start")).unwrap();
+        apply_access_with(&dirs, &state, crate::ipc::TelegramAccess::Clear, &|_, _| {});
+        let list = accounts(&dirs.root);
+        assert_eq!(list.len(), 1, "the pending request survives");
+        assert_eq!(list[0].user_id, 222);
+        assert!(!list[0].allowed());
+        let _ = std::fs::remove_dir_all(&dirs.root);
+    }
+
+    #[test]
+    fn the_single_old_owner_becomes_the_first_allowed_account() {
+        // A database from before the list: the schema, one owner in `kv`, and a
+        // migration cursor just below the accounts migration.
+        let dirs = dirs("legacy-accounts");
+        {
+            let store = open_store(&dirs.root).expect("store");
+            let conn = store.conn();
+            conn.execute(
+                crate::sql::query("telegram/kv_put"),
+                rusqlite::params!["telegram.owner", "4321"],
+            )
+            .unwrap();
+            conn.execute_batch("DROP TABLE telegram_account;").unwrap();
+            conn.pragma_update(None, "user_version", 1).unwrap();
+        }
+        // Opening the store runs the repair exactly as an upgrade would.
+        let list = accounts(&dirs.root);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].user_id, 4321);
+        assert!(list[0].allowed(), "the former owner keeps the access it had");
+        let store = open_store(&dirs.root).expect("store");
+        assert!(
+            store.kv_get("telegram.owner").unwrap().is_none(),
+            "the old key is gone, so a downgrade cannot grant access twice"
+        );
         let _ = std::fs::remove_dir_all(&dirs.root);
     }
 

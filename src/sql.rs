@@ -30,10 +30,16 @@ const QUERY_FILES: &[(&str, &str)] = &[
 ];
 
 /// Migrations in application order, named by their file stem.
-const MIGRATION_FILES: &[(&str, &str)] = &[(
-    "001_telegram_added_at",
-    include_str!("../sql/migrations/001_telegram_added_at.sql"),
-)];
+const MIGRATION_FILES: &[(&str, &str)] = &[
+    (
+        "001_telegram_added_at",
+        include_str!("../sql/migrations/001_telegram_added_at.sql"),
+    ),
+    (
+        "002_telegram_accounts",
+        include_str!("../sql/migrations/002_telegram_accounts.sql"),
+    ),
+];
 
 const SCHEMA: &str = include_str!("../sql/schema.sql");
 

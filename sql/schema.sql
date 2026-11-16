@@ -86,6 +86,19 @@ CREATE TABLE IF NOT EXISTS telegram_chat (
 CREATE INDEX IF NOT EXISTS telegram_chat_at ON telegram_chat(at, id);
 CREATE INDEX IF NOT EXISTS telegram_chat_added ON telegram_chat(added_at, id);
 
+-- Who may use the bot. `pending` means the account sent /start and waits for the
+-- window's decision; `allowed` means it is served. Telegram user ids never
+-- change, so the id is the key and the name is only what it looked like the
+-- last time it wrote.
+CREATE TABLE IF NOT EXISTS telegram_account (
+    user_id INTEGER PRIMARY KEY,
+    status TEXT NOT NULL DEFAULT 'pending',
+    name TEXT NOT NULL DEFAULT '',
+    username TEXT NOT NULL DEFAULT '',
+    added_at TEXT NOT NULL DEFAULT '',
+    last_seen_at TEXT NOT NULL DEFAULT ''
+);
+
 CREATE TABLE IF NOT EXISTS site_client (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     token TEXT NOT NULL DEFAULT '',

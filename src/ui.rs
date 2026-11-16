@@ -968,7 +968,10 @@ impl MainWindow {
                 });
                 data.site_pairing = Some(state::SitePairing {
                     token: "7f3c9a2e5b41d0c8".to_string(),
-                    until: (chrono::Local::now() + chrono::Duration::minutes(5)).to_rfc3339(),
+                    // A committed screenshot must not depend on the clock: a
+                    // fixed far-future deadline keeps the link alive and the
+                    // printed time the same on every run.
+                    until: "2099-12-31T23:59:00+00:00".to_string(),
                 });
                 data.site_network = Some(crate::site::network::State {
                     port: 8443,
@@ -1080,10 +1083,18 @@ impl MainWindow {
     }
 
     fn capture(&self, path: &std::path::Path) {
+        // The walk starts a few frames after the window is created, while
+        // Windows is still animating it into place: the first shot would catch
+        // the desktop around a half-drawn window. Wait once until it is settled.
+        static SETTLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let hwnd = find_own_window();
-        if hwnd != 0 {
-            capture_window(hwnd, path);
+        if hwnd == 0 {
+            return;
         }
+        if !SETTLED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        capture_window(hwnd, path);
     }
 }
 
@@ -1093,7 +1104,15 @@ fn capture_window(hwnd: isize, path: &std::path::Path) {
         BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC,
         SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, HGDIOBJ, SRCCOPY,
     };
-    use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetWindowRect, SetWindowPos, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    };
+
+    #[link(name = "dwmapi")]
+    extern "system" {
+        /// Blocks until the compositor has presented what was handed to it.
+        fn DwmFlush() -> i32;
+    }
 
     if hwnd == 0 {
         return;
@@ -1102,6 +1121,20 @@ fn capture_window(hwnd: isize, path: &std::path::Path) {
     // is our own window handle; the DIB bits pointer stays valid while bmp lives.
     unsafe {
         let hwnd = hwnd as windows_sys::Win32::Foundation::HWND;
+        // The shot is copied from the screen, so a window raised over ours would
+        // be in it. The walk runs for seconds on a machine that is in use: put
+        // our window back on top and wait for the compositor to present it
+        // before the copy. NOACTIVATE keeps the user's focus where it is.
+        SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
+        DwmFlush();
         let mut rect: RECT = std::mem::zeroed();
         if GetWindowRect(hwnd, &mut rect) == 0 {
             return;
@@ -1785,11 +1818,6 @@ fn telegram_settings(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs, form: &
         }
     });
     if let Some(snapshot) = &form.snapshot {
-        let owner = snapshot
-            .owner
-            .map(|id| id.to_string())
-            .unwrap_or_else(|| tr("nobody yet — send /start to the bot").to_string());
-        ui.label(trf("Owner: {owner}", &[("owner", &owner)]));
         ui.label(trf("In queue: {count}", &[("count", &snapshot.queued.to_string())]));
         if let Some(current) = &snapshot.current {
             let stage = telegram_stage_label(&current.stage);
@@ -1801,10 +1829,118 @@ fn telegram_settings(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs, form: &
         if let Some(error) = &snapshot.last_error {
             ui.label(RichText::new(error).color(p.red).small());
         }
-        if ui.button(tr("Reset the bot owner")).clicked() {
-            crate::ipc::request_telegram_reset(&dirs.root);
+        let allowed: Vec<&crate::telegram::Account> = snapshot
+            .accounts
+            .iter()
+            .filter(|account| account.allowed())
+            .collect();
+        let pending: Vec<&crate::telegram::Account> = snapshot
+            .accounts
+            .iter()
+            .filter(|account| !account.allowed())
+            .collect();
+        ui.separator();
+        egui::CollapsingHeader::new(trf(
+            "Accounts with access ({count})",
+            &[("count", &allowed.len().to_string())],
+        ))
+        .id_source("telegram_accounts")
+        .default_open(true)
+        .show(ui, |ui| {
+            if allowed.is_empty() {
+                ui.label(
+                    RichText::new(tr(
+                        "Nobody has access yet. Send /start to the bot from the account that may use it, then allow it here.",
+                    ))
+                    .small()
+                    .weak(),
+                );
+                return;
+            }
+            egui::ScrollArea::vertical()
+                .id_source("telegram_accounts_scroll")
+                .max_height(150.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    for account in &allowed {
+                        ui.horizontal(|ui| {
+                            ui.label(telegram_account_row(account));
+                            if ui.small_button(tr("Remove")).clicked() {
+                                crate::ipc::request_telegram_access(
+                                    &dirs.root,
+                                    crate::ipc::TelegramAccess::Remove(account.user_id),
+                                );
+                            }
+                        });
+                    }
+                });
+            if ui.button(tr("Remove all accounts")).clicked() {
+                crate::ipc::request_telegram_access(&dirs.root, crate::ipc::TelegramAccess::Clear);
+            }
+        });
+        if !pending.is_empty() {
+            // Requests can pile up while nobody is at the computer, so the list
+            // stays closed until it is looked at. "Decline all" sits in the title
+            // row, one click away without opening it.
+            egui::collapsing_header::CollapsingState::load_with_default_open(
+                ui.ctx(),
+                ui.make_persistent_id("telegram_pending"),
+                false,
+            )
+            .show_header(ui, |ui| {
+                ui.label(trf(
+                    "Waiting for approval ({count})",
+                    &[("count", &pending.len().to_string())],
+                ));
+                ui.add_space(8.0);
+                if ui.small_button(tr("Decline all")).clicked() {
+                    crate::ipc::request_telegram_access(
+                        &dirs.root,
+                        crate::ipc::TelegramAccess::DeclineAll,
+                    );
+                }
+            })
+            .body(|ui| {
+                egui::ScrollArea::vertical()
+                    .id_source("telegram_pending_scroll")
+                    .max_height(150.0)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        for account in &pending {
+                            ui.horizontal(|ui| {
+                                ui.label(telegram_account_row(account));
+                                if ui.small_button(tr("Allow")).clicked() {
+                                    crate::ipc::request_telegram_access(
+                                        &dirs.root,
+                                        crate::ipc::TelegramAccess::Allow(account.user_id),
+                                    );
+                                }
+                                if ui.small_button(tr("Decline")).clicked() {
+                                    crate::ipc::request_telegram_access(
+                                        &dirs.root,
+                                        crate::ipc::TelegramAccess::Decline(account.user_id),
+                                    );
+                                }
+                            });
+                        }
+                    });
+            });
         }
     }
+}
+
+/// One account in the list: who it is, the id that actually decides access, and
+/// when it last wrote.
+fn telegram_account_row(account: &crate::telegram::Account) -> String {
+    let seen = if account.last_seen_at.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " · {}",
+            trf("last seen {when}", &[("when", &telegram_date_label(&account.last_seen_at))])
+        )
+    };
+    format!("{} · id {}{seen}", account.display(), account.user_id)
 }
 
 fn telegram_date_label(value: &str) -> String {

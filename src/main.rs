@@ -603,9 +603,6 @@ fn apply_site_db_requests(
             voice_button::log::log(&format!("telegram: cannot store the token: {error:#}"));
         }
     }
-    if ipc::take_telegram_reset(root) {
-        voice_button::telegram::reset_owner(root);
-    }
     if change != SiteDbChange::default() {
         if let Err(e) = db.save() {
             log::log(&format!("cannot save the phone database: {e:#}"));
@@ -1034,7 +1031,8 @@ fn run_daemon() {
     ));
     // The Telegram bot waits for its switch and token, then polls in its own
     // threads; it is lower priority than the phone and the microphone.
-    voice_button::telegram::spawn(dirs.clone(), shared.clone(), asr.clone());
+    let telegram_state =
+        voice_button::telegram::spawn(dirs.clone(), shared.clone(), asr.clone());
     // The phone layer: the runtime opens the database, starts the queue pump
     // and binds the HTTPS port. Binding happens here, so a busy port is
     // reported instead of vanishing into a thread.
@@ -1541,6 +1539,13 @@ fn run_daemon() {
                 } else {
                     show_ui(&mut ui_child, "settings");
                 }
+            }
+        }
+        // UI → daemon: who may use the Telegram bot. The window decides, the
+        // daemon writes the decision and tells the account.
+        if read_requests {
+            if let Some(access) = ipc::take_telegram_access_request(&dirs.root) {
+                voice_button::telegram::apply_access(&dirs, &shared, &telegram_state, access);
             }
         }
         // Publish download progress for the UI process (throttled).
