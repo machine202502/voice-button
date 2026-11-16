@@ -128,10 +128,14 @@ function New-ThirdPartyNotice {
 if ($MyInvocation.InvocationName -ne '.') {
     $ErrorActionPreference = 'Stop'
     $Root = Resolve-Path (Join-Path $PSScriptRoot '..')
-    # whisper.cpp's Vulkan shader generator builds CMake scratch files with a
-    # path so long that MSBuild's file tracker fails under target\release\...
-    # Keep the build directory short on Windows.
-    if (-not $env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR = 'C:\vbt' }
+    # Local builds land in tmp/ (see .cargo/config.toml); CI sets
+    # CARGO_TARGET_DIR itself and keeps its own layout. The 8.3 short name keeps
+    # whisper.cpp's CMake scratch paths under the Windows limit.
+    if (-not $env:CARGO_TARGET_DIR) {
+        $short = (& cmd /c "for %I in (`"$Root`") do @echo %~sI") 2>$null
+        if (-not $short) { $short = $Root.Path }
+        $env:CARGO_TARGET_DIR = Join-Path $short.Trim() 'tmp'
+    }
     $TargetDir = $env:CARGO_TARGET_DIR
     Set-Location $Root
     if (-not $Version) {
@@ -153,7 +157,7 @@ if ($MyInvocation.InvocationName -ne '.') {
         if (-not (Test-Path $exe)) { throw "Missing executable: $exe" }
     }
 
-    $dist = Join-Path $Root 'dist'
+    $dist = if ($env:VB_DIST_DIR) { $env:VB_DIST_DIR } else { Join-Path $Root 'tmp\dist' }
     New-Item -ItemType Directory -Force -Path $dist | Out-Null
 
     # The app imports the Visual C++ runtime. Install it silently during setup
@@ -237,7 +241,7 @@ if ($MyInvocation.InvocationName -ne '.') {
         "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
     ) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
     if (-not $iscc) { throw 'Inno Setup 6 (ISCC.exe) was not found' }
-    & $iscc "/DAppVersion=$Version" "/DSourceDir=$TargetDir\release" "/DRedistDir=$redistDir" "/DThirdParty=$thirdParty" (Join-Path $Root 'installer\voice-button.iss')
+    & $iscc "/DAppVersion=$Version" "/DSourceDir=$TargetDir\release" "/DRedistDir=$redistDir" "/DThirdParty=$thirdParty" "/DOutDir=$dist" (Join-Path $Root 'installer\voice-button.iss')
     if ($LASTEXITCODE -ne 0) { throw 'ISCC failed' }
     Write-Host "Installer: $dist\voice-button-$Version-windows-x64-setup.exe"
 }

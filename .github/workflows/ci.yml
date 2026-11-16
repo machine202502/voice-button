@@ -12,6 +12,8 @@ permissions:
 jobs:
   test:
     runs-on: windows-latest
+    env:
+      CARGO_TARGET_DIR: C:/vbt
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4

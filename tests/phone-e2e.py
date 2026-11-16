@@ -23,6 +23,7 @@ Exit code 0 means every check passed.
 import base64
 import json
 import os
+import pathlib
 import shutil
 import socket
 import sqlite3
@@ -42,7 +43,11 @@ import urllib.error
 import urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-EXE = os.path.join(os.environ.get("VBT_DIR", r"C:\vbt\release"), "voice-button.exe")
+EXE = os.path.join(
+    os.environ.get("VBT_DIR", str(pathlib.Path(__file__).resolve().parent.parent / "tmp")),
+    "release",
+    "voice-button.exe",
+)
 CHROME = os.path.join(
     os.environ["LOCALAPPDATA"], "ms-playwright", "chromium-1248", "chrome-win64", "chrome.exe"
 )

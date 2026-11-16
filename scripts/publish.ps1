@@ -9,6 +9,8 @@ if ($cargo -notmatch '(?m)^version\s*=\s*"([^"]+)"') { throw 'Could not read Car
 $Version = $Matches[1]
 if (-not $Tag) { $Tag = "v$Version" }
 
+# The release keeps its own layout: artifacts in dist/, next to the checkout.
+$env:VB_DIST_DIR = Join-Path $Root 'dist'
 & (Join-Path $PSScriptRoot 'package.ps1') -Version $Version
 if ($LASTEXITCODE -ne 0) { throw 'package.ps1 failed' }
 $portable = Join-Path $Root "dist\voice-button-$Version-windows-x64.zip"

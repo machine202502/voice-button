@@ -1,6 +1,12 @@
-﻿# whisper.cpp's Vulkan shader generator writes CMake scratch files whose paths
-# overflow the Windows limit inside a deep target\ directory (MSBuild FTK1011).
-# Keeping the build directory short avoids it; the packaging script uses the
-# same location.
+﻿# Local build products live in `tmp/` inside the checkout; the packaging script
+# puts the installer and the portable ZIP in `tmp/dist/`.
+#
+# whisper.cpp's Vulkan shader generator builds CMake scratch paths that reach the
+# Windows 259 character limit, and this checkout is deep enough to go past it: the
+# long path is 264 characters. The scripts resolve the 8.3 short name of the
+# checkout (`C:\SHARED~1\reps\VOICE-~1`, 256 characters) and pass it in
+# CARGO_TARGET_DIR, so builds can be started from anywhere. A plain `cargo build`
+# in a shell that sits on the long path would hit the limit — use
+# `scripts\build.ps1` there, or set CARGO_TARGET_DIR to the short `tmp` yourself.
 [build]
-target-dir = "C:/vbt"
+target-dir = "tmp"

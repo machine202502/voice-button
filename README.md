@@ -231,9 +231,29 @@ whole table. The window shows no page controls: the list is one endless scroll.
 Requirements: Rust MSVC, CMake, and Visual Studio Build Tools for whisper.cpp.
 The ONNX Runtime dependency obtains its native binaries during the build.
 
+Build products go to **`tmp/` in the checkout**, not to `target/`: `.cargo/config.toml`
+sets `target-dir = "tmp"` and the packaging script writes the installer and the portable
+ZIP to `tmp/dist/`. The folder is ignored by git and safe to delete when the disk is short.
+
+One catch: whisper.cpp's Vulkan shader generator builds CMake scratch paths that reach
+the Windows 259 character limit, and a deep checkout goes past it (this one is five
+characters too long). `scripts/build.ps1` therefore resolves the 8.3 short name of the
+checkout (`C:\SHARED~1\reps\VOICE-~1`, which fits) and passes it in `CARGO_TARGET_DIR`,
+so it works from any shell. For the same reason the **debug** profile does not fit at
+all — build and test in release, which is what CI runs too. CI and the release workflow
+keep their own layout: they set `CARGO_TARGET_DIR=C:/vbt` and publish from `dist/`, so a
+local build and a runner never share a directory.
+
 ```powershell
-cargo build --release --bins
-cargo test --release
+.\scripts\build.ps1                    # cargo build --release --bins
+.\scripts\build.ps1 test --release --lib
+```
+
+The executables land in `tmp\release\`:
+
+```powershell
+.\tmp\release\voice-button.exe
+.\tmp\release\voice-button-ui.exe
 ```
 
 End-to-end checks decode the eight-minute recording in `tests/assets` and need a
@@ -256,13 +276,14 @@ python tests\phone-e2e.py
 
 The browser test copies `src/web` to where the daemon serves the page, starts the
 daemon in a temporary profile and drives Chromium over the DevTools protocol. It
-needs the Playwright Chromium and the models in the app's data directory.
+needs the Playwright Chromium and the models in the app's data directory. It looks
+for the daemon in `tmp\release\`; `VBT_DIR` points it elsewhere.
 
 To refresh the UI snapshots in `tests/snapshots/`:
 
 ```powershell
 $env:VB_SNAPSHOT = "tests/snapshots"
-.\target\release\voice-button.exe
+.\tmp\release\voice-button.exe
 Remove-Item Env:VB_SNAPSHOT
 ```
 
@@ -274,7 +295,7 @@ With Inno Setup 6 installed:
 ./scripts/package.ps1
 ```
 
-This creates both release forms in `dist/`:
+This creates both release forms in `tmp/dist/`:
 
 - `voice-button-VERSION-windows-x64.zip` — portable, run `voice-button.exe`.
 - `voice-button-VERSION-windows-x64-setup.exe` — installer for all users.
@@ -283,8 +304,9 @@ Both packages contain the two executables, `LICENSE`, `NOTICE`, `AISOFTWARE`,
 and `THIRD-PARTY.txt`. The portable zip also carries the Visual C++ runtime
 DLLs and the Vulkan loader, so it runs on a clean machine. The installer runs
 `vc_redist.x64.exe` silently during setup and installs the same DLLs app-local.
-`scripts/publish.ps1` attaches them to a GitHub release
-using the authenticated GitHub CLI.
+`scripts/publish.ps1` attaches them to a GitHub release using the authenticated
+GitHub CLI; it is the one caller that writes to `dist/` instead, so the release
+workflow keeps its own layout next to the checkout.
 
 CI tests pushes and pull requests. A version change in `Cargo.toml` on `master`
 publishes a release. The static site in `site/` deploys to GitHub Pages and

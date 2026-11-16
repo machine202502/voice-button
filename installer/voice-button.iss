@@ -10,6 +10,9 @@
 #ifndef RedistDir
   #define RedistDir "..\dist\redist"
 #endif
+#ifndef OutDir
+  #define OutDir "..\dist"
+#endif
 
 [Setup]
 AppId={{B7B65B4A-2D91-4D0B-9DF2-5E4FC8A0A6D1}
@@ -22,7 +25,7 @@ AppUpdatesURL=https://github.com/machine202502/voice-button/releases
 DefaultDirName={autopf}\Voice Button
 DefaultGroupName=Voice Button
 DisableProgramGroupPage=yes
-OutputDir=..\dist
+OutputDir={#OutDir}
 OutputBaseFilename=voice-button-{#AppVersion}-windows-x64-setup
 SetupIconFile=..\assets\icon.ico
 UninstallDisplayIcon={app}\voice-button.exe
