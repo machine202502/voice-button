@@ -85,6 +85,22 @@ pub struct Config {
     pub play_error_sound: bool,
     #[serde(default = "default_true")]
     pub play_end_sound: bool,
+    /// How long the recognizer stays in memory after the last dictation, in
+    /// minutes. Five by default: a usual day keeps it hot, and a forgotten app
+    /// gives the memory back. Zero means "never unload".
+    #[serde(default = "default_model_idle_minutes")]
+    pub model_idle_minutes: u32,
+    /// What the window remembers between runs: the source and date filters of
+    /// the history, the monologs and the Telegram log. The window process is
+    /// short-lived, so the filters cannot live in it.
+    #[serde(default = "sources_all")]
+    pub history_sources: String,
+    #[serde(default = "range_all")]
+    pub history_range: SavedRange,
+    #[serde(default = "range_all")]
+    pub monolog_range: SavedRange,
+    #[serde(default = "range_today")]
+    pub telegram_range: SavedRange,
     /// Global start/stop shortcut, e.g. "Ctrl+Alt+R". Empty (the default)
     /// means the shortcut is not bound.
     #[serde(default = "default_hotkey")]
@@ -161,6 +177,91 @@ fn default_sound_volume() -> f32 {
     0.5
 }
 
+/// Five minutes of silence is "the person is done dictating for now".
+fn default_model_idle_minutes() -> u32 {
+    5
+}
+
+/// A date filter as the settings file keeps it: the name of the preset and, for
+/// a hand-picked period, its two days.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedRange {
+    #[serde(default = "range_preset_today")]
+    pub preset: String,
+    /// `YYYY-MM-DD`; empty unless `preset` is `period`.
+    #[serde(default)]
+    pub from: String,
+    #[serde(default)]
+    pub to: String,
+}
+
+impl Default for SavedRange {
+    fn default() -> Self {
+        Self {
+            preset: "today".to_string(),
+            from: String::new(),
+            to: String::new(),
+        }
+    }
+}
+
+impl SavedRange {
+    pub fn from_filter(filter: crate::dates::DateFilter) -> Self {
+        let period = filter.preset == crate::dates::Preset::Period;
+        Self {
+            preset: filter.preset.key().to_string(),
+            from: if period {
+                filter.from.format("%Y-%m-%d").to_string()
+            } else {
+                String::new()
+            },
+            to: if period {
+                filter.to.format("%Y-%m-%d").to_string()
+            } else {
+                String::new()
+            },
+        }
+    }
+
+    /// The filter to start the window with. A hand-edited or outdated value must
+    /// not break the list, so anything unreadable falls back to the defaults.
+    pub fn to_filter(&self) -> crate::dates::DateFilter {
+        let preset = crate::dates::Preset::parse(&self.preset).unwrap_or_default();
+        let mut filter = crate::dates::DateFilter::preset(preset);
+        if preset == crate::dates::Preset::Period {
+            let today = chrono::Local::now().date_naive();
+            let day = |text: &str| chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d").ok();
+            let from = day(&self.from).unwrap_or(today);
+            let to = day(&self.to).unwrap_or(from).max(from);
+            filter.from = from;
+            filter.to = to;
+        }
+        filter
+    }
+}
+
+fn range_preset_today() -> String {
+    "today".to_string()
+}
+
+fn sources_all() -> String {
+    "all".to_string()
+}
+
+/// Every list but Telegram starts on "all time": that is what the window showed
+/// before the filters were remembered.
+fn range_all() -> SavedRange {
+    SavedRange {
+        preset: "all".to_string(),
+        from: String::new(),
+        to: String::new(),
+    }
+}
+
+fn range_today() -> SavedRange {
+    SavedRange::default()
+}
+
 fn default_vad_sensitivity() -> f32 {
     1.0
 }
@@ -198,6 +299,11 @@ impl Default for Config {
             play_error_sound: true,
             play_end_sound: true,
             sound_volume: 0.5,
+            model_idle_minutes: 5,
+            history_sources: "all".to_string(),
+            history_range: range_all(),
+            monolog_range: range_all(),
+            telegram_range: range_today(),
             vad_sensitivity: 1.0,
             hotkey: String::new(),
             append_hotkey: String::new(),
@@ -349,7 +455,53 @@ pub fn load_config(root: &std::path::Path) -> Config {
 
 #[cfg(test)]
 mod tests {
-    use super::{defaults_for_language, Backend};
+    use super::{defaults_for_language, Backend, Config, SavedRange};
+
+    #[test]
+    fn the_chosen_filters_survive_a_restart() {
+        // The window keeps the filters in the settings file; a hand-picked
+        // period must come back with the same two days.
+        use crate::dates::{DateFilter, Preset};
+        let mut period = DateFilter::preset(Preset::Period);
+        period.from = chrono::NaiveDate::from_ymd_opt(2026, 2, 10).unwrap();
+        period.to = chrono::NaiveDate::from_ymd_opt(2026, 2, 14).unwrap();
+        let saved = SavedRange::from_filter(period);
+        let text = serde_json::to_string(&saved).expect("serializes");
+        let back: SavedRange = serde_json::from_str(&text).expect("parses");
+        assert_eq!(back.to_filter(), period);
+        assert_eq!(SavedRange::from_filter(DateFilter::everything()).to_filter(), DateFilter::everything());
+        assert_eq!(SavedRange::from_filter(DateFilter::today()).to_filter(), DateFilter::today());
+    }
+
+    #[test]
+    fn an_old_config_opens_the_lists_where_they_opened_before() {
+        // Before the filters were remembered the history and the monologs opened
+        // on everything and the Telegram log on today.
+        let mut value = serde_json::to_value(Config::default()).expect("a config serializes");
+        let object = value.as_object_mut().expect("a config is an object");
+        for key in ["history_sources", "history_range", "monolog_range", "telegram_range"] {
+            object.remove(key);
+        }
+        let old: Config = serde_json::from_value(value).expect("the old config loads");
+        assert_eq!(old.history_sources, "all");
+        assert_eq!(old.history_range.to_filter(), crate::dates::DateFilter::everything());
+        assert_eq!(old.monolog_range.to_filter(), crate::dates::DateFilter::everything());
+        assert_eq!(old.telegram_range.to_filter(), crate::dates::DateFilter::today());
+    }
+
+    #[test]
+    fn the_model_is_unloaded_after_five_idle_minutes_by_default() {
+        // A config written before the setting existed must still get the default,
+        // and five minutes is the value the window shows.
+        let mut value = serde_json::to_value(Config::default()).expect("a config serializes");
+        value
+            .as_object_mut()
+            .expect("a config is an object")
+            .remove("model_idle_minutes");
+        let old: Config = serde_json::from_value(value).expect("the old config loads");
+        assert_eq!(old.model_idle_minutes, 5);
+        assert_eq!(Config::default().model_idle_minutes, 5);
+    }
 
     #[test]
     fn russian_systems_get_the_gigaam_rnnt_model() {

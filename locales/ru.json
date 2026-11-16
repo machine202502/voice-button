@@ -336,6 +336,9 @@
     "Subtract one day": "На день назад",
     "Add one day": "На день вперёд",
     "Add one month": "На месяц вперёд",
-    "Add one year": "На год вперёд"
+    "Add one year": "На год вперёд",
+    "Keep the model in memory, minutes": "Держать модель в памяти, минут",
+    "never": "никогда",
+    "After this many minutes without dictation the model is unloaded and the memory is given back; the next dictation loads it again. Zero keeps it always.": "Столько минут без диктовки — модель выгружается и память возвращается; следующая диктовка загрузит её снова. Ноль — держать всегда."
   }
 }

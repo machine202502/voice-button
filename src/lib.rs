@@ -17,6 +17,7 @@ pub mod http;
 pub mod i18n;
 pub mod icons;
 pub mod ipc;
+pub mod ipc_event;
 pub mod lazy_list;
 pub mod log;
 pub mod model_manager;

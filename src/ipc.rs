@@ -129,6 +129,7 @@ pub struct DownloadSnapshot {
 
 pub fn write_download_request(root: &Path, model_id: &str) {
     write_value(root, "request.download", model_id);
+    crate::ipc_event::notify(root);
 }
 
 /// Returns the requested model id and consumes the request.
@@ -140,6 +141,7 @@ pub fn take_download_request(root: &Path) -> Option<String> {
 
 pub fn request_cancel(root: &Path) {
     write_value(root, "request.download_cancel", "1");
+    crate::ipc_event::notify(root);
 }
 
 pub fn cancel_requested(root: &Path) -> bool {
@@ -265,6 +267,7 @@ pub fn read_site_state(root: &Path) -> Option<SiteSnapshot> {
 /// Ask the daemon for a fresh pairing token (the "Connect phone" button).
 pub fn request_site_pair(root: &Path) {
     write_value(root, "request.site_pair", "1");
+    crate::ipc_event::notify(root);
 }
 
 pub fn take_site_pair_request(root: &Path) -> bool {
@@ -276,6 +279,7 @@ pub fn take_site_pair_request(root: &Path) -> bool {
 /// Ask the daemon to disconnect the phone (the "Disconnect" button).
 pub fn request_site_revoke(root: &Path) {
     write_value(root, "request.site_revoke", "1");
+    crate::ipc_event::notify(root);
 }
 
 pub fn take_site_revoke_request(root: &Path) -> bool {
@@ -297,6 +301,7 @@ pub fn request_telegram_token(root: &Path, token: &str, proxy: &str) {
         ("proxy", proxy.to_string()),
     ]);
     write_value(root, "request.telegram_token", &text);
+    crate::ipc_event::notify(root);
 }
 
 pub fn take_telegram_token_request(root: &Path) -> Option<TelegramTokenRequest> {
@@ -310,6 +315,7 @@ pub fn take_telegram_token_request(root: &Path) -> Option<TelegramTokenRequest> 
 
 pub fn request_telegram_reset(root: &Path) {
     write_value(root, "request.telegram_reset", "1");
+    crate::ipc_event::notify(root);
 }
 
 pub fn take_telegram_reset(root: &Path) -> bool {
@@ -331,6 +337,7 @@ pub fn request_site_archive(root: &Path, monolog: u64, archived: bool) {
         ("archived", (archived as u8).to_string()),
     ]);
     write_value(root, "request.site_archive", &text);
+    crate::ipc_event::notify(root);
 }
 
 pub fn take_site_archive_request(root: &Path) -> Option<SiteArchiveRequest> {
@@ -349,6 +356,7 @@ pub fn request_site_network(root: &Path, enable: bool) {
         "request.site_network",
         if enable { "enable" } else { "disable" },
     );
+    crate::ipc_event::notify(root);
 }
 
 pub fn take_site_network(root: &Path) -> Option<bool> {
@@ -467,6 +475,7 @@ fn set_flag(root: &Path, key: &str, active: bool) {
     } else if let Some(store) = open(root) {
         let _ = store.kv_delete(key);
     }
+    crate::ipc_event::notify(root);
 }
 
 fn flag(root: &Path, key: &str) -> bool {
@@ -563,6 +572,7 @@ pub struct FileSnapshot {
 
 pub fn write_file_request(root: &Path, path: &str) {
     write_value(root, "request.file", path);
+    crate::ipc_event::notify(root);
 }
 
 /// Returns the requested file path and consumes the request.
@@ -574,6 +584,7 @@ pub fn take_file_request(root: &Path) -> Option<String> {
 
 pub fn request_file_cancel(root: &Path) {
     write_value(root, "request.file_cancel", "1");
+    crate::ipc_event::notify(root);
 }
 
 pub fn file_cancel_requested(root: &Path) -> bool {
@@ -627,6 +638,7 @@ pub fn remove_file_state(root: &Path) {
 /// The value is the interactor kind, `user` or `server`.
 pub fn write_record_request(root: &Path, interactor: &str) {
     write_value(root, "request.record", interactor);
+    crate::ipc_event::notify(root);
 }
 
 /// Returns the pending interactor and consumes the request.

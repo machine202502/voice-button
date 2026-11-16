@@ -15,6 +15,8 @@ const PASTE_HOTKEY_ID: i32 = 3;
 #[derive(Clone, Debug)]
 pub enum TrayAction {
     RecordToggle,
+    /// The window wrote a request: read it now instead of on the next check.
+    Wake,
     /// Start/stop a recording whose result is appended to the last message.
     RecordAppend,
     /// Start/stop a recording whose result is pasted at the caret of the

@@ -89,6 +89,29 @@ impl HistoryFilter {
             HistoryFilter::Telegram => vec![state::Source::Telegram],
         }
     }
+
+    /// The stable name the settings file keeps.
+    fn key(self) -> &'static str {
+        match self {
+            HistoryFilter::All => "all",
+            HistoryFilter::User => "user",
+            HistoryFilter::Server => "server",
+            HistoryFilter::File => "file",
+            HistoryFilter::Phone => "phone",
+            HistoryFilter::Telegram => "telegram",
+        }
+    }
+
+    fn from_key(key: &str) -> Self {
+        match key {
+            "user" => HistoryFilter::User,
+            "server" => HistoryFilter::Server,
+            "file" => HistoryFilter::File,
+            "phone" => HistoryFilter::Phone,
+            "telegram" => HistoryFilter::Telegram,
+            _ => HistoryFilter::All,
+        }
+    }
 }
 
 /// UI process entry point. Launched by the daemon as
@@ -270,6 +293,12 @@ fn run_ui(config: config::Config, history: state::History, dirs: AppDirs, tab: S
     // The window owns its colours now; the OS theme must not repaint it, and
     // the palette starts from the saved theme (dark when the file has none).
     let initial_theme = config.theme;
+    // The filters belong to the person, not to this window: they are read back
+    // from the settings file and written there when they change.
+    let saved_source_filter = HistoryFilter::from_key(&config.history_sources);
+    let saved_history_range = config.history_range.to_filter();
+    let saved_monolog_range = config.monolog_range.to_filter();
+    let saved_telegram_range = config.telegram_range.to_filter();
     let shared = Arc::new(Shared::new(config, history));
     let store = match Store::open(&dirs.root) {
         Ok(store) => Arc::new(store),
@@ -340,18 +369,24 @@ fn run_ui(config: config::Config, history: state::History, dirs: AppDirs, tab: S
         },
         show_about: false,
         expanded_history: None,
-        history_filter: HistoryFilter::All,
-        history_range: crate::dates::DateFilter::everything(),
+        history_filter: saved_source_filter,
+        history_range: saved_history_range,
         history_search: String::new(),
         history_paged: Paged::new(),
         history_heights: crate::lazy_list::LazyList::new(0.0, 20.0),
         history_key: None,
         history_query: None,
+        saved_filters: Some((
+            saved_source_filter,
+            saved_history_range,
+            saved_monolog_range,
+            saved_telegram_range,
+        )),
         download_done_seen: false,
         api_copied_at: 0.0,
         site_qr: None,
         phone: PhoneState {
-            monolog_range: crate::dates::DateFilter::everything(),
+            monolog_range: saved_monolog_range,
             ..PhoneState::default()
         },
         telegram_chat: Paged::new(),
@@ -359,7 +394,7 @@ fn run_ui(config: config::Config, history: state::History, dirs: AppDirs, tab: S
         telegram_key: None,
         telegram_form: TelegramForm::default(),
         telegram_search: String::new(),
-        telegram_range: crate::dates::DateFilter::default(),
+        telegram_range: saved_telegram_range,
         snapshot_dir: std::env::var("VB_SNAPSHOT").ok().map(PathBuf::from),
         snapshot_frame: 0,
         applied_theme: Some(theme::resolve(initial_theme)),
@@ -583,6 +618,14 @@ pub struct MainWindow {
     history_heights: crate::lazy_list::LazyList,
     history_key: Option<(u64, HistoryFilter, String, crate::dates::DateFilter)>,
     history_query: Option<(HistoryFilter, String, crate::dates::DateFilter)>,
+    /// The filters last written to the settings file: a difference means the
+    /// person changed one and it must be saved.
+    saved_filters: Option<(
+        HistoryFilter,
+        crate::dates::DateFilter,
+        crate::dates::DateFilter,
+        crate::dates::DateFilter,
+    )>,
     download_done_seen: bool,
     /// egui timestamp of the last "Copy" click on the API address; drives the
     /// transient "Copied!" feedback in the API tab.
@@ -712,6 +755,24 @@ impl eframe::App for MainWindow {
                 ),
             }
         });
+        // The chosen slice of every list is the person's, not this window's: it
+        // outlives the window in the settings file, so closing and reopening the
+        // app does not throw the filters away.
+        let filters = (
+            self.history_filter,
+            self.history_range,
+            self.phone.monolog_range,
+            self.telegram_range,
+        );
+        if self.saved_filters != Some(filters) {
+            self.saved_filters = Some(filters);
+            let (sources, history, monologs, telegram) = filters;
+            data.config.history_sources = sources.key().to_string();
+            data.config.history_range = config::SavedRange::from_filter(history);
+            data.config.monolog_range = config::SavedRange::from_filter(monologs);
+            data.config.telegram_range = config::SavedRange::from_filter(telegram);
+            apply_settings(&mut data, &self.dirs);
+        }
         // A finished download may make a pending model selection applicable.
         let download_done = data.download.as_ref().map(|d| d.done).unwrap_or(false);
         if download_done && !self.download_done_seen {
@@ -1389,6 +1450,33 @@ fn settings_body(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs) {
             .arg(&dirs.models)
             .spawn();
     }
+    ui.separator();
+    // The recognizer is the largest thing the app holds in memory, so it is let
+    // go after a while instead of sitting there all day.
+    let mut idle_minutes = data.config.model_idle_minutes;
+    if ui
+        .add(
+            egui::Slider::new(&mut idle_minutes, 0..=60)
+                .text(tr("Keep the model in memory, minutes"))
+                .custom_formatter(|value, _| {
+                    if value < 0.5 {
+                        tr("never")
+                    } else {
+                        format!("{value:.0}")
+                    }
+                }),
+        )
+        .changed()
+    {
+        data.config.model_idle_minutes = idle_minutes;
+        apply_settings(data, dirs);
+    }
+    ui.label(
+        RichText::new(tr(
+            "After this many minutes without dictation the model is unloaded and the memory is given back; the next dictation loads it again. Zero keeps it always.",
+        ))
+        .weak(),
+    );
     ui.separator();
     ui.heading(tr("Sounds"));
     let mut sounds_changed = false;

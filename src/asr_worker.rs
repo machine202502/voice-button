@@ -6,7 +6,8 @@ use crate::config;
 use crate::state::ModelChoice;
 use crate::transcribe::{self, Transcriber};
 use std::io::BufReader;
-use std::time::Instant;
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::time::{Duration, Instant};
 
 /// Hard ceiling for one decode, independent of the model.
 ///
@@ -17,18 +18,64 @@ use std::time::Instant;
 /// instead of relying on every caller.
 const MAX_SEGMENT_SECONDS: f32 = 45.0;
 
+/// What the reader thread hands over: one request, or the closed pipe.
+enum Incoming {
+    Frame(Vec<u8>, Vec<u8>),
+    Closed,
+}
+
 pub fn run() -> ! {
     let dirs = config::app_dirs();
     crate::log::init_child(&dirs.root);
     crate::log::log("asr worker started");
-    let stdin = std::io::stdin();
-    let mut reader = BufReader::new(stdin.lock());
+    // Frames are read on their own thread so the loop below can wait with a
+    // timeout: that is how an idle worker gives the model's memory back without
+    // dying and without slowing the next dictation down for long.
+    let (frames_tx, frames_rx) = mpsc::channel::<Incoming>();
+    std::thread::spawn(move || {
+        let stdin = std::io::stdin();
+        let mut reader = BufReader::new(stdin.lock());
+        loop {
+            let incoming = match read_frame(&mut reader) {
+                Ok((json, payload)) => Incoming::Frame(json, payload),
+                Err(_) => Incoming::Closed,
+            };
+            let closed = matches!(incoming, Incoming::Closed);
+            if frames_tx.send(incoming).is_err() || closed {
+                break;
+            }
+        }
+    });
     let mut stdout = std::io::stdout();
     let mut loaded: Option<(String, Box<dyn Transcriber>)> = None;
+    let mut idle_minutes = config::load_config(&dirs.root).model_idle_minutes;
     loop {
-        let (json, payload) = match read_frame(&mut reader) {
-            Ok(frame) => frame,
-            Err(_) => std::process::exit(0),
+        // Zero means "keep the model forever"; then the wait is only a wake-up
+        // for the setting itself.
+        let wait = if idle_minutes == 0 {
+            Duration::from_secs(3600)
+        } else {
+            Duration::from_secs(u64::from(idle_minutes) * 60)
+        };
+        let incoming = match frames_rx.recv_timeout(wait) {
+            Ok(incoming) => incoming,
+            Err(RecvTimeoutError::Timeout) => {
+                // The setting may have changed while the worker slept.
+                idle_minutes = config::load_config(&dirs.root).model_idle_minutes;
+                if idle_minutes > 0 && loaded.is_some() {
+                    // Leaving the process behind would keep ~40 MB for nothing:
+                    // the daemon starts a fresh worker on the next dictation.
+                    crate::log::log(&format!(
+                        "asr worker: model unloaded after {idle_minutes} min without dictation, exiting"
+                    ));
+                    std::process::exit(0);
+                }
+                continue;
+            }
+            Err(RecvTimeoutError::Disconnected) => std::process::exit(0),
+        };
+        let Incoming::Frame(json, payload) = incoming else {
+            std::process::exit(0);
         };
         let began = Instant::now();
         let reply = match serde_json::from_slice::<Request>(&json) {

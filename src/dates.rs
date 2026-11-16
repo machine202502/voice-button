@@ -136,6 +136,28 @@ impl Preset {
             Preset::All => "All time",
         }
     }
+
+    /// The stable name the settings file keeps: never translated, never changed.
+    pub fn key(self) -> &'static str {
+        match self {
+            Preset::Today => "today",
+            Preset::Yesterday => "yesterday",
+            Preset::Week => "week",
+            Preset::Period => "period",
+            Preset::All => "all",
+        }
+    }
+
+    pub fn parse(key: &str) -> Option<Self> {
+        match key {
+            "today" => Some(Preset::Today),
+            "yesterday" => Some(Preset::Yesterday),
+            "week" => Some(Preset::Week),
+            "period" => Some(Preset::Period),
+            "all" => Some(Preset::All),
+            _ => None,
+        }
+    }
 }
 
 /// Midnight `days` days ago, in UTC.

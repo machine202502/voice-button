@@ -336,6 +336,9 @@
     "Subtract one day": "Subtract one day",
     "Add one day": "Add one day",
     "Add one month": "Add one month",
-    "Add one year": "Add one year"
+    "Add one year": "Add one year",
+    "Keep the model in memory, minutes": "Keep the model in memory, minutes",
+    "never": "never",
+    "After this many minutes without dictation the model is unloaded and the memory is given back; the next dictation loads it again. Zero keeps it always.": "After this many minutes without dictation the model is unloaded and the memory is given back; the next dictation loads it again. Zero keeps it always."
   }
 }

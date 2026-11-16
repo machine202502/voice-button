@@ -336,6 +336,9 @@
     "Subtract one day": "前一天",
     "Add one day": "后一天",
     "Add one month": "下个月",
-    "Add one year": "下一年"
+    "Add one year": "下一年",
+    "Keep the model in memory, minutes": "模型在内存中保留的分钟数",
+    "never": "永不",
+    "After this many minutes without dictation the model is unloaded and the memory is given back; the next dictation loads it again. Zero keeps it always.": "超过这么多分钟没有听写后，模型会被卸载并释放内存；下次听写会重新加载它。零表示一直保留。"
   }
 }

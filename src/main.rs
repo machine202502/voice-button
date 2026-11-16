@@ -994,6 +994,10 @@ fn run_daemon() {
     let mut last_site_check = std::time::Instant::now();
     let mut last_background = false;
     let (action_tx, action_rx) = mpsc::channel::<tray::TrayAction>();
+    // The window writes its requests into the runtime database and signals this
+    // event; the daemon waits on it instead of reopening the database every
+    // 50 ms. The clone stays here, the sender itself goes to the tray thread.
+    let wake_tx = action_tx.clone();
     let tray_cmds = tray::start(
         action_tx,
         voice_button::hotkey::parse(&cfg.hotkey),
@@ -1002,6 +1006,21 @@ fn run_daemon() {
         cfg.swap_mouse_buttons,
     );
     let (events_tx, events_rx) = mpsc::channel::<AppEvent>();
+    // The window → daemon channel is event driven: a request is written first and
+    // signalled second, so this thread only ever runs when there is work. Without
+    // it the daemon would have to poll the database in its main loop, which cost
+    // about a tenth of a core doing nothing.
+    if let Some(wake) = voice_button::ipc_event::Wake::create(&dirs.root) {
+        std::thread::Builder::new()
+            .name("ipc-wake".into())
+            .spawn(move || loop {
+                wake.wait();
+                if wake_tx.send(tray::TrayAction::Wake).is_err() {
+                    break;
+                }
+            })
+            .ok();
+    }
     // The holiday microphone and the two service entries follow the settings and
     // the clock, so they are pushed to the tray instead of rebuilt with it.
     let mut holiday_applied: Option<Option<String>> = None;
@@ -1056,19 +1075,30 @@ fn run_daemon() {
     let mut published_download: Option<ipc::DownloadSnapshot> = None;
     let mut last_publish = std::time::Instant::now();
     let mut last_rotate = std::time::Instant::now();
+    // Requests from the window are read on its signal, and at this slow safety
+    // cadence in case a signal was missed (an older window that only writes).
+    let mut check_requests = true;
+    let mut last_request_check = std::time::Instant::now();
     daemon::set_status(&shared, &tray_cmds, &dirs, Status::Idle);
     loop {
         // Keep the last real foreground window around: a tray click puts the
         // taskbar in front, and the paste must still find the user's app.
         track_paste_target();
-        let action = match action_rx.recv_timeout(Duration::from_millis(50)) {
+        // A long wait is free: hotkeys, tray clicks and window requests all wake
+        // it, so nothing feels slower than before.
+        let action = match action_rx.recv_timeout(Duration::from_millis(500)) {
             Ok(action) => Some(action),
             Err(mpsc::RecvTimeoutError::Timeout) => None,
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
         if let Some(action) = action {
-            log::log(&format!("main got action {action:?}"));
+            if !matches!(action, tray::TrayAction::Wake) {
+                log::log(&format!("main got action {action:?}"));
+            }
             match &action {
+                tray::TrayAction::Wake => {
+                    check_requests = true;
+                }
                 tray::TrayAction::RecordToggle
                 | tray::TrayAction::RecordAppend
                 | tray::TrayAction::RecordPaste => {
@@ -1379,8 +1409,19 @@ fn run_daemon() {
                 }
             }
         }
+        // Read the window's requests only when it rang, or on the slow safety
+        // tick. Every one of them opens the runtime database, which is far too
+        // expensive to do twenty times a second for nothing.
+        if last_request_check.elapsed() >= Duration::from_secs(5) {
+            check_requests = true;
+        }
+        let read_requests = check_requests;
+        if read_requests {
+            check_requests = false;
+            last_request_check = std::time::Instant::now();
+        }
         // UI → daemon: cancel the imported file that is being transcribed.
-        if ipc::file_cancel_requested(&dirs.root) {
+        if read_requests && ipc::file_cancel_requested(&dirs.root) {
             ipc::clear_file_cancel(&dirs.root);
             if let Some(runtime) = daemon::try_runtime() {
                 if let Some(handle) = runtime.file.lock().unwrap().take() {
@@ -1389,78 +1430,84 @@ fn run_daemon() {
             }
         }
         // UI → daemon: transcribe an audio file the user picked.
-        if let Some(path) = ipc::take_file_request(&dirs.root) {
-            let name = std::path::Path::new(&path)
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("audio")
-                .to_string();
-            let busy = {
-                let data = shared.lock();
-                data.session.is_some()
-                    || recorder.is_active()
-                    || data.recovering
-                    || matches!(
-                        data.status,
-                        Status::Recording | Status::Transcribing | Status::File
-                    )
-            };
-            if let Some(runtime) = daemon::try_runtime() {
-                if busy {
-                    ipc::write_file_state(
-                        &dirs.root,
-                        &ipc::FileSnapshot {
-                            path: path.clone(),
-                            name,
-                            error: Some(voice_button::i18n::tr(
-                                "The app is busy with another recording",
-                            )),
-                            running: false,
-                            ..Default::default()
-                        },
-                    );
-                } else {
-                    daemon::set_status(&shared, &tray_cmds, &dirs, Status::File);
-                    match session::start_file(
-                        shared.clone(),
-                        dirs.clone(),
-                        events_tx.clone(),
-                        runtime.asr.clone(),
-                        std::path::PathBuf::from(&path),
-                    ) {
-                        Ok(handle) => *runtime.file.lock().unwrap() = Some(handle),
-                        Err(e) => {
-                            log::log(&format!("cannot start the file transcription: {e:#}"));
-                            ipc::write_file_state(
-                                &dirs.root,
-                                &ipc::FileSnapshot {
-                                    path: path.clone(),
-                                    name,
-                                    error: Some(voice_button::i18n::trf(
-                                        "Could not start transcribing the file: {error}",
-                                        &[("error", &format!("{e:#}"))],
-                                    )),
-                                    running: false,
-                                    ..Default::default()
-                                },
-                            );
-                            daemon::set_status(&shared, &tray_cmds, &dirs, Status::Idle);
+        if read_requests {
+            if let Some(path) = ipc::take_file_request(&dirs.root) {
+                let name = std::path::Path::new(&path)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("audio")
+                    .to_string();
+                let busy = {
+                    let data = shared.lock();
+                    data.session.is_some()
+                        || recorder.is_active()
+                        || data.recovering
+                        || matches!(
+                            data.status,
+                            Status::Recording | Status::Transcribing | Status::File
+                        )
+                };
+                if let Some(runtime) = daemon::try_runtime() {
+                    if busy {
+                        ipc::write_file_state(
+                            &dirs.root,
+                            &ipc::FileSnapshot {
+                                path: path.clone(),
+                                name,
+                                error: Some(voice_button::i18n::tr(
+                                    "The app is busy with another recording",
+                                )),
+                                running: false,
+                                ..Default::default()
+                            },
+                        );
+                    } else {
+                        daemon::set_status(&shared, &tray_cmds, &dirs, Status::File);
+                        match session::start_file(
+                            shared.clone(),
+                            dirs.clone(),
+                            events_tx.clone(),
+                            runtime.asr.clone(),
+                            std::path::PathBuf::from(&path),
+                        ) {
+                            Ok(handle) => *runtime.file.lock().unwrap() = Some(handle),
+                            Err(e) => {
+                                log::log(&format!("cannot start the file transcription: {e:#}"));
+                                ipc::write_file_state(
+                                    &dirs.root,
+                                    &ipc::FileSnapshot {
+                                        path: path.clone(),
+                                        name,
+                                        error: Some(voice_button::i18n::trf(
+                                            "Could not start transcribing the file: {error}",
+                                            &[("error", &format!("{e:#}"))],
+                                        )),
+                                        running: false,
+                                        ..Default::default()
+                                    },
+                                );
+                                daemon::set_status(&shared, &tray_cmds, &dirs, Status::Idle);
+                            }
                         }
                     }
                 }
+        
             }
         }
+
         // UI → daemon: model download requests. The download thread is owned
         // by the daemon, so it keeps running while the UI is closed.
-        if let Some(model_id) = ipc::take_download_request(&dirs.root) {
-            let busy = shared
-                .lock()
-                .download
-                .as_ref()
-                .map(|d| !d.done && d.error.is_none())
-                .unwrap_or(false);
-            if !busy {
-                model_manager::start_download(shared.clone(), dirs.models.clone(), model_id);
+        if read_requests {
+            if let Some(model_id) = ipc::take_download_request(&dirs.root) {
+                let busy = shared
+                    .lock()
+                    .download
+                    .as_ref()
+                    .map(|d| !d.done && d.error.is_none())
+                    .unwrap_or(false);
+                if !busy {
+                    model_manager::start_download(shared.clone(), dirs.models.clone(), model_id);
+                }
             }
         }
         // API server → daemon: start/stop requests, answered per request.
@@ -1475,23 +1522,25 @@ fn run_daemon() {
             );
         }
         // UI → daemon: start/stop recording.
-        if let Some(interactor_json) = ipc::take_record_request(&dirs.root) {
-            let interactor = parse_interactor(&interactor_json);
-            if daemon::recording_allowed(&shared, &dirs) || recorder.is_active() {
-                // The UI start button always records a fresh message.
-                toggle_record(
-                    interactor,
-                    None,
-                    &mut recorder,
-                    &shared,
-                    &dirs,
-                    &tray_cmds,
-                    events_tx.clone(),
-                    false,
-                    false,
-                );
-            } else {
-                show_ui(&mut ui_child, "settings");
+        if read_requests {
+            if let Some(interactor_json) = ipc::take_record_request(&dirs.root) {
+                let interactor = parse_interactor(&interactor_json);
+                if daemon::recording_allowed(&shared, &dirs) || recorder.is_active() {
+                    // The UI start button always records a fresh message.
+                    toggle_record(
+                        interactor,
+                        None,
+                        &mut recorder,
+                        &shared,
+                        &dirs,
+                        &tray_cmds,
+                        events_tx.clone(),
+                        false,
+                        false,
+                    );
+                } else {
+                    show_ui(&mut ui_child, "settings");
+                }
             }
         }
         // Publish download progress for the UI process (throttled).
@@ -1678,9 +1727,11 @@ fn run_daemon() {
         if let Some(runtime) = phone.as_ref() {
             let db = runtime.hub().db_handle();
             let url = voice_button::site::gate::display_url(runtime.port);
-            let change = {
+            let change = if read_requests {
                 let mut db = db.lock().unwrap();
                 apply_site_db_requests(&dirs.root, &mut db)
+            } else {
+                SiteDbChange::default()
             };
             if change.pairing {
                 log::log("phone: a new pairing token was issued");
@@ -1702,22 +1753,24 @@ fn run_daemon() {
                     publish_site_state(&dirs.root, true, runtime.port, url, paired);
                 }
             }
-        } else if let Some(request) = ipc::take_site_archive_request(&dirs.root) {
-            // With the server off the daemon still owns the file and may
-            // archive a monolog: nothing else writes it right now.
-            match voice_button::site::db::Db::open(&dirs.root) {
-                Ok(mut db) => {
-                    db.archive_monolog(request.monolog, request.archived);
-                    if let Err(e) = db.save() {
-                        log::log(&format!("cannot save the phone database: {e:#}"));
+        } else if read_requests {
+            if let Some(request) = ipc::take_site_archive_request(&dirs.root) {
+                // With the server off the daemon still owns the file and may
+                // archive a monolog: nothing else writes it right now.
+                match voice_button::site::db::Db::open(&dirs.root) {
+                    Ok(mut db) => {
+                        db.archive_monolog(request.monolog, request.archived);
+                        if let Err(e) = db.save() {
+                            log::log(&format!("cannot save the phone database: {e:#}"));
+                        }
                     }
+                    Err(e) => log::log(&format!("cannot open the phone database: {e:#}")),
                 }
-                Err(e) => log::log(&format!("cannot open the phone database: {e:#}")),
             }
         }
         // Internet access: the script opens the firewall and, where it can,
         // the router. It shows a UAC prompt, so it runs on its own thread.
-        if !ipc::site_network_busy(&dirs.root) {
+        if read_requests && !ipc::site_network_busy(&dirs.root) {
             if let Some(enable) = ipc::take_site_network(&dirs.root) {
                 ipc::set_site_network_busy(&dirs.root, true);
                 let root = dirs.root.clone();
@@ -1756,9 +1809,13 @@ fn run_daemon() {
         // The Settings window asks for the shortcut(s) to be released while it
         // captures a new combination, otherwise its keystrokes would toggle
         // recording instead of reaching the input.
-        let capturing = ipc::hotkey_capture_active(&dirs.root)
-            || ipc::append_hotkey_capture_active(&dirs.root)
-            || ipc::paste_hotkey_capture_active(&dirs.root);
+        let capturing = if read_requests {
+            ipc::hotkey_capture_active(&dirs.root)
+                || ipc::append_hotkey_capture_active(&dirs.root)
+                || ipc::paste_hotkey_capture_active(&dirs.root)
+        } else {
+            last_hotkey_capture
+        };
         if capturing {
             // The settings window may not have keyboard focus and a released
             // global hotkey no longer swallows the keys, so the daemon watches

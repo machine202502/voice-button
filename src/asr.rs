@@ -163,7 +163,15 @@ impl AsrClient {
     }
 
     pub fn decode(&mut self, model: &str, samples: &[f32], rate: u32) -> Result<Reply> {
-        let restart = self.child.is_none() || self.loaded.as_deref() != Some(model);
+        // A worker that unloaded its model and exited, or one that died, is
+        // restarted here instead of failing the segment: the next dictation must
+        // simply load the model again.
+        let exited = self
+            .child
+            .as_mut()
+            .and_then(|child| child.try_wait().ok().flatten())
+            .is_some();
+        let restart = self.child.is_none() || exited || self.loaded.as_deref() != Some(model);
         if restart {
             self.reset();
             if self.recent_restarts() >= MAX_RESTARTS {
