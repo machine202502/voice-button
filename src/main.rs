@@ -487,6 +487,9 @@ fn toggle_record(
                 paste_target: (target != 0).then_some(target),
                 clipboard: true,
                 buffer: runtime.buffer.clone(),
+                mode: session::SessionMode::Live,
+                // The person is waiting for their own text: no budget.
+                tail_budget: None,
             };
             match session::start(
                 shared.clone(),
@@ -1050,6 +1053,7 @@ fn run_daemon() {
         buffer: recorder.buffer_handle(),
         asr: asr.clone(),
         session: Mutex::new(None),
+        lazy: Mutex::new(None),
         file: Mutex::new(None),
     });
     // Recordings interrupted by the previous crash are transcribed before the
@@ -1159,6 +1163,8 @@ fn run_daemon() {
                     source,
                     audio,
                     at,
+                    session: session_id,
+                    lazy: lazy_take,
                 } => {
                     // The session is still open while its text is being stored;
                     // it says who started this recording.
@@ -1226,7 +1232,7 @@ fn run_daemon() {
                         let data = shared.lock();
                         (data.config.play_end_sound, data.config.sound_volume)
                     };
-                    if end_cue(play, source == voice_button::history::Source::Site) {
+                    if end_cue(play, source == voice_button::history::Source::Site || lazy_take) {
                         voice_button::sound::play_end(volume);
                     }
                     if !text_is_empty {
@@ -1325,28 +1331,51 @@ fn run_daemon() {
                             session::keep_for_recovery(&dir);
                         }
                     }
-                    // Close the session: the server (if it owns the session) can
-                    // now read the text, and the next request may start.
-                    let finished = shared.lock().session.take();
-                    if let Some(runtime) = daemon::try_runtime() {
-                        *runtime.session.lock().unwrap() = None;
-                        *runtime.file.lock().unwrap() = None;
-                    }
-                    ipc::write_session(&dirs.root, None);
-                    if let Some(session) = finished {
-                        if session.owner.kind == InteractorKind::Server {
+                    if lazy_take {
+                        // A lazy take owns no session: its text is the caller's
+                        // answer, and the violet icon goes out with it.
+                        let take = shared.lock().lazy.take();
+                        if let Some(runtime) = daemon::try_runtime() {
+                            *runtime.lazy.lock().unwrap() = None;
+                        }
+                        if let Some(take) = take.filter(|take| take.id == session_id) {
                             shared.lock().api_result = Some(ApiResult {
-                                session: session.id,
+                                session: take.id,
                                 text: api_text,
                                 model: api_model,
                                 at: now_stamp(),
-                                stopped_by: session
-                                    .stopped_by
-                                    .map(|interactor| interactor.kind)
-                                    .unwrap_or(InteractorKind::Server),
+                                stopped_by: InteractorKind::Server,
                                 error: None,
                             });
                         }
+                    } else {
+                        // Close the session: the server (if it owns the session)
+                        // can now read the text, and the next request may start.
+                        let finished = shared.lock().session.take();
+                        if let Some(runtime) = daemon::try_runtime() {
+                            *runtime.session.lock().unwrap() = None;
+                            *runtime.file.lock().unwrap() = None;
+                        }
+                        ipc::write_session(&dirs.root, None);
+                        if let Some(session) = finished {
+                            if session.id == session_id
+                                && session.owner.kind == InteractorKind::Server
+                            {
+                                shared.lock().api_result = Some(ApiResult {
+                                    session: session.id,
+                                    text: api_text,
+                                    model: api_model,
+                                    at: now_stamp(),
+                                    stopped_by: session
+                                        .stopped_by
+                                        .map(|interactor| interactor.kind)
+                                        .unwrap_or(InteractorKind::Server),
+                                    error: None,
+                                });
+                            }
+                        }
+                        ipc::clear_live(&dirs.root);
+                        daemon::set_status(&shared, &tray_cmds, &dirs, Status::Idle);
                     }
                     if entry_state.is_partial() {
                         let _ = tray_cmds.send(tray::TrayCommand::Notify(
@@ -1355,8 +1384,6 @@ fn run_daemon() {
                             ),
                         ));
                     }
-                    ipc::clear_live(&dirs.root);
-                    daemon::set_status(&shared, &tray_cmds, &dirs, Status::Idle);
                 }
                 AppEvent::Cancelled => {
                     if let Some(runtime) = daemon::try_runtime() {
@@ -1374,36 +1401,62 @@ fn run_daemon() {
                         "recovered the recording from {at}: {chars} chars, {failed_segments} failed segments"
                     ));
                 }
-                AppEvent::Failed(msg) => {
+                AppEvent::Failed { message: msg, lazy } => {
                     shared.set_error(msg.clone());
-                    if let Some(runtime) = daemon::try_runtime() {
-                        *runtime.session.lock().unwrap() = None;
-                    }
-                    // A failed API session may still be receiving; let its
-                    // worker leave the loop instead of previewing forever.
-                    if let Some(stream) = shared.lock().stream.take() {
-                        stream.stop.store(true, Ordering::SeqCst);
-                    }
-                    let finished = shared.lock().session.take();
-                    ipc::write_session(&dirs.root, None);
-                    if let Some(session) = finished {
-                        if session.owner.kind == InteractorKind::Server {
-                            let model = selected_model(&effective_config(&shared.lock()));
+                    if lazy {
+                        // A lazy take that could not write its audio: the live
+                        // session, the microphone and the tray are not its.
+                        let take = shared.lock().lazy.take();
+                        if let Some(runtime) = daemon::try_runtime() {
+                            *runtime.lazy.lock().unwrap() = None;
+                        }
+                        if let Some(take) = take {
+                            let model = take
+                                .model
+                                .as_ref()
+                                .map(voice_button::state::ModelChoice::api_id)
+                                .unwrap_or_else(|| {
+                                    selected_model(&effective_config(&shared.lock()))
+                                });
                             shared.lock().api_result = Some(ApiResult {
-                                session: session.id,
+                                session: take.id,
                                 text: String::new(),
                                 model,
                                 at: now_stamp(),
-                                stopped_by: session
-                                    .stopped_by
-                                    .map(|interactor| interactor.kind)
-                                    .unwrap_or(InteractorKind::Server),
+                                stopped_by: InteractorKind::Server,
                                 error: Some(msg),
                             });
                         }
+                    } else {
+                        if let Some(runtime) = daemon::try_runtime() {
+                            *runtime.session.lock().unwrap() = None;
+                        }
+                        // A failed API session may still be receiving; let its
+                        // worker leave the loop instead of previewing forever.
+                        if let Some(stream) = shared.lock().stream.take() {
+                            stream.stop.store(true, Ordering::SeqCst);
+                        }
+                        let finished = shared.lock().session.take();
+                        ipc::write_session(&dirs.root, None);
+                        if let Some(session) = finished {
+                            if session.owner.kind == InteractorKind::Server {
+                                let model = selected_model(&effective_config(&shared.lock()));
+                                shared.lock().api_result = Some(ApiResult {
+                                    session: session.id,
+                                    text: String::new(),
+                                    model,
+                                    at: now_stamp(),
+                                    stopped_by: session
+                                        .stopped_by
+                                        .map(|interactor| interactor.kind)
+                                        .unwrap_or(InteractorKind::Server),
+                                    error: Some(msg),
+                                });
+                            }
+                        }
+                        ipc::clear_live(&dirs.root);
+                        daemon::set_status(&shared, &tray_cmds, &dirs, Status::Idle);
                     }
-                    ipc::clear_live(&dirs.root);
-                    daemon::set_status(&shared, &tray_cmds, &dirs, Status::Idle);
                 }
             }
         }
@@ -1930,8 +1983,9 @@ mod tests {
     use voice_button::config::{AppDirs, Config, PasteSeparator};
     use voice_button::history::History;
     use voice_button::recorder::Recorder;
+    use voice_button::session::SessionMode;
     use voice_button::state::{
-        HistoryChunk, HistoryEntry, Interactor, Session, Shared, Status, StreamSession,
+        HistoryChunk, HistoryEntry, Interactor, LazyTake, Session, Shared, Status, StreamSession,
     };
 
     #[test]
@@ -1966,6 +2020,7 @@ mod tests {
                 std::path::PathBuf::from("voice-button.exe"),
             )),
             session: Mutex::new(None),
+            lazy: Mutex::new(None),
             file: Mutex::new(None),
         });
     }
@@ -2048,6 +2103,7 @@ mod tests {
             ApiAction::StreamStart {
                 model: None,
                 sample_rate: 16_000,
+                mode: SessionMode::Live,
             },
             &mut recorder,
             &shared,
@@ -2058,6 +2114,134 @@ mod tests {
             ApiResponse::Rejected("the app is busy with another session".to_string())
         );
         assert!(shared.lock().stream.is_none());
+        let _ = std::fs::remove_dir_all(&dirs.root);
+    }
+
+    fn lazy_take(id: u64) -> LazyTake {
+        LazyTake {
+            id,
+            model: None,
+            sample_rate: 16_000,
+            buffer: Arc::new(Mutex::new(Vec::new())),
+            received_samples: 0,
+            live_text: String::new(),
+            closed: false,
+            queued: 0,
+            waiting: false,
+        }
+    }
+
+    /// A lazy take is background work: the person dictating is not a reason to
+    /// refuse it, and it is not a reason to refuse the person either.
+    #[test]
+    fn a_lazy_take_is_not_refused_because_the_user_is_dictating() {
+        let shared = empty_shared();
+        shared.lock().session = Some(user_session());
+        shared.lock().status = Status::Recording;
+        let dirs = temp_dirs("api-lazy-user-busy");
+        let mut recorder = Recorder::new();
+        let answer = ask(
+            ApiAction::StreamStart {
+                model: None,
+                sample_rate: 16_000,
+                mode: SessionMode::Lazy,
+            },
+            &mut recorder,
+            &shared,
+            &dirs,
+        );
+        // Nothing about the dictation refuses it: the only remaining reason is
+        // that this throwaway data directory has no model.
+        assert_eq!(
+            answer,
+            ApiResponse::Rejected("no downloaded model to transcribe with".to_string())
+        );
+        let _ = std::fs::remove_dir_all(&dirs.root);
+    }
+
+    #[test]
+    fn a_lazy_take_does_not_block_a_live_session_or_a_second_lazy_one() {
+        let shared = empty_shared();
+        shared.lock().lazy = Some(lazy_take(9));
+        let dirs = temp_dirs("api-lazy-live");
+        let mut recorder = Recorder::new();
+        // The live path does not look at the lazy take at all.
+        let live = ask(
+            ApiAction::StreamStart {
+                model: None,
+                sample_rate: 16_000,
+                mode: SessionMode::Live,
+            },
+            &mut recorder,
+            &shared,
+            &dirs,
+        );
+        assert_eq!(
+            live,
+            ApiResponse::Rejected("no downloaded model to transcribe with".to_string())
+        );
+        // A second lazy take is refused by its own rule, before any model check.
+        let second = ask(
+            ApiAction::StreamStart {
+                model: None,
+                sample_rate: 16_000,
+                mode: SessionMode::Lazy,
+            },
+            &mut recorder,
+            &shared,
+            &dirs,
+        );
+        assert_eq!(
+            second,
+            ApiResponse::Rejected("a lazy take is already open".to_string())
+        );
+        let _ = std::fs::remove_dir_all(&dirs.root);
+    }
+
+    #[test]
+    fn lazy_audio_is_accepted_until_the_caller_stops() {
+        let shared = empty_shared();
+        shared.lock().lazy = Some(lazy_take(11));
+        let dirs = temp_dirs("api-lazy-chunks");
+        let mut recorder = Recorder::new();
+        let answer = ask(
+            ApiAction::StreamChunk {
+                session: 11,
+                samples: vec![0.1; 1600],
+            },
+            &mut recorder,
+            &shared,
+            &dirs,
+        );
+        assert_eq!(
+            answer,
+            ApiResponse::ChunkAccepted {
+                received_ms: 100,
+                live: String::new()
+            }
+        );
+        assert_eq!(shared.lock().lazy.as_ref().unwrap().received_samples, 1600);
+        assert!(!shared.lock().background_has(voice_button::state::BackgroundJob::Api));
+
+        let answer = ask(
+            ApiAction::StreamStop { session: 11 },
+            &mut recorder,
+            &shared,
+            &dirs,
+        );
+        assert_eq!(answer, ApiResponse::StreamStopped);
+        assert!(shared.lock().lazy.as_ref().unwrap().closed);
+        // Late audio after stop is refused, exactly like a live session's.
+        let answer = ask(
+            ApiAction::StreamChunk {
+                session: 11,
+                samples: vec![0.0; 8],
+            },
+            &mut recorder,
+            &shared,
+            &dirs,
+        );
+        assert!(matches!(answer, ApiResponse::Rejected(_)));
         let _ = std::fs::remove_dir_all(&dirs.root);
     }
 

@@ -6,6 +6,10 @@
   --weak: #9aa3b2;
   --accent: #2fbf71;
   --rec: #e2483d;
+  /* The live API session: the tray's raspberry, not the page's own red. */
+  --rec-api: #ff4d7a;
+  /* The tray's violet: background work, the lazy mode. */
+  --lazy: #b9a2f0;
   --queue: #e0a23a;
   --line: #2a2f3a;
 }
@@ -55,6 +59,8 @@ select, input[type="text"] {
 select { min-width: 260px; }
 input[type="text"] { width: 210px; font-family: ui-monospace, Consolas, monospace; }
 label.inline { color: var(--weak); font-size: 13px; }
+/* A label and its control stay on one line when the row wraps. */
+.inline-group { display: inline-flex; align-items: center; gap: 8px; }
 
 button.chip { cursor: pointer; }
 
@@ -76,6 +82,17 @@ button#mic[data-state="recording"] {
   background: var(--rec); color: #fff;
   box-shadow: 0 0 0 6px rgba(226, 72, 61, .16);
   animation: pulse 1.4s ease-in-out infinite;
+}
+/* Somebody else's live session: same alarm, the tray's raspberry. */
+button#mic[data-state="server"] {
+  background: var(--rec-api); color: #fff;
+  box-shadow: 0 0 0 6px rgba(255, 77, 122, .16);
+  animation: pulse 1.4s ease-in-out infinite;
+}
+/* The lazy mode: background work, the tray's violet, no pulse. */
+button#mic[data-state="lazy"] {
+  background: var(--lazy); color: #141c0a;
+  box-shadow: 0 0 0 6px rgba(185, 162, 240, .14);
 }
 button#mic[data-state="busy"] { background: #3a4150; color: var(--weak); cursor: wait; }
 

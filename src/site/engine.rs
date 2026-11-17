@@ -66,18 +66,10 @@ pub fn model_ready(shared: &Arc<Shared>) -> bool {
 }
 
 /// Is the engine somebody else's? The phone waits, it never takes the
-/// microphone away from the person using the computer.
+/// microphone away from the person using the computer. One definition lives in
+/// `state`, so the phone and a lazy API take cannot disagree about it.
 pub fn engine_busy(shared: &Arc<Shared>) -> bool {
-    let data = shared.lock();
-    data.status != Status::Idle
-        || data.session.is_some()
-        || data.stream.is_some()
-        || data.recovering
-        || data
-            .file
-            .as_ref()
-            .map(|file| file.running || file.total_seconds <= 0.0)
-            .unwrap_or(false)
+    shared.lock().engine_busy()
 }
 
 /// One step of the queue with the answers the app currently gives.

@@ -21,6 +21,7 @@
 use crate::config::Backend;
 use crate::http::{self, Request, Response};
 use crate::model_manager;
+use crate::session::SessionMode;
 use crate::state::{self, ModelChoice, Shared};
 use std::io::ErrorKind;
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
@@ -49,6 +50,9 @@ pub enum ApiAction {
     StreamStart {
         model: Option<ModelChoice>,
         sample_rate: u32,
+        /// `Live` blocks the microphone and answers as the audio arrives;
+        /// `Lazy` waits for the engine and never blocks the person.
+        mode: SessionMode,
     },
     StreamChunk {
         session: u64,
@@ -248,29 +252,53 @@ fn status_json(shared: &Shared) -> serde_json::Value {
     };
     let session = data.session.as_ref();
     let stream = data.stream.as_ref();
+    let lazy = data.lazy.as_ref();
     let model = session
         .and_then(|s| s.model_label())
+        .or_else(|| lazy.and_then(|take| take.model.as_ref().map(ModelChoice::api_id)))
         .unwrap_or_else(|| selected_model(&data.config).api_id());
-    let received_ms = stream.map(|s| {
-        s.received_samples
-            .saturating_mul(1000)
-            .saturating_div(s.sample_rate.max(1) as u64)
-    });
+    let received_ms = stream
+        .map(|s| s.received_ms())
+        .or_else(|| lazy.map(|take| take.received_ms()));
+    let sample_rate = stream
+        .map(|s| s.sample_rate)
+        .or_else(|| lazy.map(|take| take.sample_rate));
+    // One session at a time, but two kinds of it: a live one owns the
+    // microphone, a lazy one owns nothing and waits.
+    let mode = match (stream.is_some(), lazy.is_some()) {
+        (true, _) => Some("live"),
+        (false, true) => Some("lazy"),
+        (false, false) => None,
+    };
     // Only the stream's own preview is exposed; a local dictation of the user
     // never reaches the caller.
-    let live_text = stream.map(|s| s.live_text.clone()).unwrap_or_default();
+    let live_text = stream
+        .map(|s| s.live_text.clone())
+        .or_else(|| lazy.map(|take| take.live_text.clone()))
+        .unwrap_or_default();
     serde_json::json!({
         "service": "voice-button",
         "version": env!("CARGO_PKG_VERSION"),
         "state": state_name,
+        "mode": mode,
         "owner": session.map(|s| s.owner.kind.label()),
-        "sessionId": session.map(|s| s.id),
+        "sessionId": session.map(|s| s.id).or_else(|| lazy.map(|take| take.id)),
         "model": model,
         "receivedMs": received_ms,
-        "sampleRate": stream.map(|s| s.sample_rate),
+        "sampleRate": sample_rate,
         "liveText": live_text,
-        // The same flag that paints the tray violet: a phone, a Telegram file
-        // or another background task is working right now.
+        // The lazy take in words a waiting caller can act on: is the engine
+        // free, and how much is still queued for it.
+        "lazy": lazy.map(|take| serde_json::json!({
+            "sessionId": take.id,
+            "receivedMs": take.received_ms(),
+            "queued": take.queued,
+            "waiting": take.waiting,
+            "closed": take.closed,
+            "text": take.live_text,
+        })),
+        // The same flag that paints the tray violet: a phone, a Telegram file,
+        // a lazy API take or another background task is working right now.
         "background": data.background_active(),
     })
 }
@@ -302,13 +330,21 @@ fn model_ready(root: &Path, choice: &ModelChoice) -> bool {
 
 fn live_json(shared: &Shared) -> serde_json::Value {
     let data = shared.lock();
-    match data.stream.as_ref() {
-        Some(stream) => serde_json::json!({
+    if let Some(stream) = data.stream.as_ref() {
+        return serde_json::json!({
             "text": stream.live_text,
-            "receivedMs": stream.received_samples.saturating_mul(1000).saturating_div(stream.sample_rate.max(1) as u64),
-        }),
-        None => serde_json::json!({ "text": "", "receivedMs": serde_json::Value::Null }),
+            "receivedMs": stream.received_ms(),
+        });
     }
+    if let Some(take) = data.lazy.as_ref() {
+        return serde_json::json!({
+            "text": take.live_text,
+            "receivedMs": take.received_ms(),
+            "waiting": take.waiting,
+            "queued": take.queued,
+        });
+    }
+    serde_json::json!({ "text": "", "receivedMs": serde_json::Value::Null })
 }
 
 fn text_json(shared: &Shared) -> serde_json::Value {
@@ -370,16 +406,33 @@ fn start_stream(request: &Request, root: &Path, commands: &mpsc::Sender<ApiReque
             _ => return error_response(400, "sampleRate must be between 8000 and 48000"),
         },
     };
+    let mode = match body.get("mode") {
+        None | Some(serde_json::Value::Null) => SessionMode::Live,
+        Some(serde_json::Value::String(text)) if text.trim().eq_ignore_ascii_case("live") => {
+            SessionMode::Live
+        }
+        Some(serde_json::Value::String(text)) if text.trim().eq_ignore_ascii_case("lazy") => {
+            SessionMode::Lazy
+        }
+        Some(_) => return error_response(400, "mode must be 'live' or 'lazy'"),
+    };
     match send_command(
         commands,
         ApiAction::StreamStart {
             model,
             sample_rate,
+            mode,
         },
     ) {
         Ok(ApiResponse::StreamStarted { session }) => json_response(
             200,
-            serde_json::json!({ "ok": true, "state": "recording", "sessionId": session, "sampleRate": sample_rate }),
+            serde_json::json!({
+                "ok": true,
+                "mode": mode.label(),
+                "state": if mode.is_lazy() { "lazy" } else { "recording" },
+                "sessionId": session,
+                "sampleRate": sample_rate,
+            }),
         ),
         Ok(ApiResponse::Rejected(message)) => error_response(409, message),
         Ok(_) => error_response(409, "unexpected daemon answer"),
@@ -449,7 +502,10 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::history::History;
-    use crate::state::{ApiResult, Interactor, InteractorKind, Session, Status, StreamSession};
+    use crate::state::{
+        ApiResult, BackgroundJob, Interactor, InteractorKind, LazyTake, Session, Status,
+        StreamSession,
+    };
     use std::io::{Read, Write};
 
     fn shared() -> Arc<Shared> {
@@ -604,6 +660,81 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(value["sessionId"], 7);
         assert_eq!(value["state"], "recording");
+        assert_eq!(value["mode"], "live", "live is the default mode");
+    }
+
+    #[test]
+    fn a_lazy_start_is_answered_as_lazy() {
+        let server = start(
+            &shared(),
+            &temp_root("lazy-start"),
+            answering(ApiResponse::StreamStarted { session: 12 }),
+        );
+        let (status, _head, body) = rpc(
+            &server,
+            "POST",
+            "/api/record/start",
+            Some(r#"{"mode":"lazy"}"#),
+        );
+        assert_eq!(status, 200);
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["mode"], "lazy");
+        assert_eq!(value["state"], "lazy");
+        assert_eq!(value["sessionId"], 12);
+    }
+
+    #[test]
+    fn an_unknown_session_mode_is_rejected_locally() {
+        let (commands, _rx) = mpsc::channel();
+        let server = start(&shared(), &temp_root("bad-mode"), commands);
+        let (status, _head, body) = rpc(
+            &server,
+            "POST",
+            "/api/record/start",
+            Some(r#"{"mode":"turbo"}"#),
+        );
+        assert_eq!(status, 400);
+        assert!(body.contains("mode"));
+    }
+
+    #[test]
+    fn status_reports_a_lazy_take_as_lazy_and_waiting() {
+        let shared = shared();
+        {
+            let mut data = shared.lock();
+            data.lazy = Some(LazyTake {
+                id: 21,
+                model: None,
+                sample_rate: 16_000,
+                buffer: Arc::new(std::sync::Mutex::new(Vec::new())),
+                received_samples: 16_000,
+                live_text: "привет".to_string(),
+                closed: false,
+                queued: 2,
+                waiting: true,
+            });
+            data.background.insert(BackgroundJob::Api);
+        }
+        let (commands, _rx) = mpsc::channel();
+        let server = start(&shared, &temp_root("lazy-status"), commands);
+        let (status, _head, body) = rpc(&server, "GET", "/api/status", None);
+        assert_eq!(status, 200);
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["state"], "idle", "the mic is not taken by a lazy take");
+        assert_eq!(value["mode"], "lazy");
+        assert_eq!(value["sessionId"], 21);
+        assert_eq!(value["lazy"]["waiting"], true);
+        assert_eq!(value["lazy"]["queued"], 2);
+        assert_eq!(value["lazy"]["receivedMs"], 1000);
+        assert_eq!(value["liveText"], "привет");
+        assert_eq!(value["background"], true);
+
+        // The live endpoint answers for the lazy take too.
+        let (status, _head, body) = rpc(&server, "GET", "/api/record/live", None);
+        assert_eq!(status, 200);
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["text"], "привет");
+        assert_eq!(value["waiting"], true);
     }
 
     #[test]
@@ -742,7 +873,7 @@ mod tests {
         assert!(head.contains("application/json"));
         let doc: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(doc["service"], "voice-button");
-        assert_eq!(doc["helpVersion"], 1);
+        assert_eq!(doc["helpVersion"], 2);
         assert!(doc["baseUrl"]
             .as_str()
             .unwrap()

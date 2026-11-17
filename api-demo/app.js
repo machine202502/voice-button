@@ -6,6 +6,7 @@ import { encodePcm16 } from './pcm.js';
 const $ = (id) => document.getElementById(id);
 const STORAGE_API = 'voice-button-api';
 const STORAGE_MODEL = 'voice-button-api-model';
+const STORAGE_MODE = 'voice-button-api-mode';
 const DEFAULT_API = 'http://127.0.0.1:8931';
 const CHUNK_MS = 250;
 
@@ -35,6 +36,11 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function apiBase() {
   return ($('api').value || DEFAULT_API).trim().replace(/\/+$/, '');
+}
+
+/** The mode the next take uses: the exclusive live one, or the lazy one. */
+function chosenMode() {
+  return $('mode').value === 'lazy' ? 'lazy' : 'live';
 }
 
 function setError(text) {
@@ -92,9 +98,27 @@ async function loadModels() {
 
 function describe(status) {
   const owner = status.owner;
+  // The lazy take is background work: it has no `state: recording` of its own,
+  // it reports what is queued and whether the engine belongs to the person.
+  if (status.mode === 'lazy' && status.lazy) {
+    const lazy = status.lazy;
+    if (lazy.waiting) {
+      return {
+        state: 'lazy',
+        big: 'Ждёт движок',
+        sub: `В очереди ${lazy.queued} сегм. Продолжит сам, когда движок освободится.`,
+      };
+    }
+    const seconds = ((lazy.receivedMs || 0) / 1000).toFixed(1);
+    return {
+      state: 'lazy',
+      big: lazy.closed ? 'Дочитывает' : 'Ленивая расшифровка',
+      sub: `Принято ${seconds} с · в очереди ${lazy.queued} · микрофон свободен.`,
+    };
+  }
   if (status.state === 'recording') {
     if (owner === 'server') {
-      return { state: 'recording', big: 'Запись (сервер)', sub: 'Идёт чья-то API-сессия.' };
+      return { state: 'server', big: 'Запись (сервер)', sub: 'Идёт чья-то API-сессия.' };
     }
     return { state: 'busy', big: 'Приложение занято', sub: 'Сейчас диктует пользователь в приложении — попробуйте через несколько секунд.' };
   }
@@ -112,6 +136,7 @@ function render(status) {
   connected(true);
   const view = describe(status);
   const mic = $('mic');
+  $('mode').disabled = capturing || busy;
   if (busy) {
     mic.dataset.state = 'busy';
   } else if (capturing) {
@@ -174,7 +199,14 @@ async function poll() {
 async function startCapture() {
   if (busy || capturing) return;
   setError('');
-  if (lastStatus && lastStatus.state === 'recording' && lastStatus.owner !== 'server') {
+  // A lazy take is accepted while the person dictates; only the exclusive mode
+  // has to wait for the microphone to be free.
+  if (
+    chosenMode() === 'live' &&
+    lastStatus &&
+    lastStatus.state === 'recording' &&
+    lastStatus.owner !== 'server'
+  ) {
     setError('В приложении уже идёт запись пользователя — дождитесь её окончания.');
     return;
   }
@@ -204,10 +236,12 @@ async function startCapture() {
     node.port.onmessage = (event) => queue.push(event.data);
 
     const model = $('model').value;
+    const payload = { sampleRate: ctx.sampleRate, mode: chosenMode() };
+    if (model) payload.model = model;
     const started = await api('/api/record/start', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(model ? { model, sampleRate: ctx.sampleRate } : { sampleRate: ctx.sampleRate }),
+      body: JSON.stringify(payload),
     });
     audio = graph;
     session = started.sessionId;
@@ -350,6 +384,12 @@ $('model').addEventListener('change', () => {
 });
 
 $('api').value = localStorage.getItem(STORAGE_API) || DEFAULT_API;
+$('mode').value = localStorage.getItem(STORAGE_MODE) === 'lazy' ? 'lazy' : 'live';
+$('mode').addEventListener('change', () => {
+  localStorage.setItem(STORAGE_MODE, chosenMode());
+  setError('');
+  poll();
+});
 loadModels();
 poll();
 setInterval(poll, 500);

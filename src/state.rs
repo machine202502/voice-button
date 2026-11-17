@@ -43,10 +43,19 @@ pub enum AppEvent {
         /// Timestamp for the history entry. The phone owns the time of its own
         /// messages, so it travels with the event instead of being "now".
         at: Option<String>,
+        /// The session that produced this text. A live session and a lazy take
+        /// can be open at once, so the result names its owner explicitly.
+        session: u64,
+        /// A lazy API take: background work, so no end cue and no status change.
+        lazy: bool,
     },
     /// A file transcription was cancelled by the user.
     Cancelled,
-    Failed(String),
+    Failed {
+        message: String,
+        /// A lazy take: the failure must not clear the live session's slots.
+        lazy: bool,
+    },
     /// A crash-interrupted recording was transcribed into the history.
     Recovered {
         chars: usize,
@@ -201,6 +210,15 @@ pub struct StreamSession {
     pub stop: Arc<AtomicBool>,
 }
 
+impl StreamSession {
+    /// Milliseconds of audio received so far.
+    pub fn received_ms(&self) -> u64 {
+        self.received_samples
+            .saturating_mul(1000)
+            .saturating_div(self.sample_rate.max(1) as u64)
+    }
+}
+
 /// Result of the last API-owned session, readable by the caller that started
 /// it. The server never sees the user's own dictations.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -211,6 +229,36 @@ pub struct ApiResult {
     pub at: String,
     pub stopped_by: InteractorKind,
     pub error: Option<String>,
+}
+
+/// A lazy API take: audio from a caller that is transcribed whenever the engine
+/// is free, so the microphone stays available and nothing is queued in front of
+/// the person. It has no `Session` and no `Status::Recording`: that is exactly
+/// what tells the phone, the API and the tray that this is background work.
+pub struct LazyTake {
+    pub id: u64,
+    pub model: Option<ModelChoice>,
+    pub sample_rate: u32,
+    /// Mono f32 samples, appended by the API thread and drained by the session.
+    pub buffer: Arc<Mutex<Vec<f32>>>,
+    pub received_samples: u64,
+    /// Latest preview produced by the session thread.
+    pub live_text: String,
+    /// The caller said stop: no more audio is accepted.
+    pub closed: bool,
+    /// Segments cut and not decoded yet.
+    pub queued: usize,
+    /// The engine belongs to the person right now, so those segments wait.
+    pub waiting: bool,
+}
+
+/// Milliseconds of audio received by a lazy take.
+impl LazyTake {
+    pub fn received_ms(&self) -> u64 {
+        self.received_samples
+            .saturating_mul(1000)
+            .saturating_div(self.sample_rate.max(1) as u64)
+    }
 }
 
 /// Session info published to the UI process (it cannot read the daemon's
@@ -297,6 +345,9 @@ pub struct Data {
     /// violet and no sound is played for any of them; the phone is one, and
     /// more will come, so this is a set and not a flag.
     pub background: std::collections::BTreeSet<BackgroundJob>,
+    /// A lazy API take: audio from a caller, transcribed when the engine is
+    /// free. `None` when no such take is open.
+    pub lazy: Option<LazyTake>,
     /// A pairing link the window can show as a QR code, read from
     /// the phone database (the daemon owns it; the window only mirrors the
     /// client record).
@@ -315,6 +366,8 @@ pub enum BackgroundJob {
     Phone,
     /// A Telegram file is being downloaded, decoded or transcribed.
     Telegram,
+    /// A lazy API take the engine is decoding right now.
+    Api,
 }
 
 impl Data {
@@ -327,6 +380,24 @@ impl Data {
     /// phone, not for its own violet icon.
     pub fn background_has(&self, job: BackgroundJob) -> bool {
         self.background.contains(&job)
+    }
+
+    /// Is the recognizer somebody else's right now? The phone's queue and a
+    /// lazy API take both ask this before every segment: the person at the
+    /// computer (and the live API session) always comes first.
+    ///
+    /// A lazy take is deliberately absent from this list — it is the state
+    /// this predicate protects, not a claim on the engine.
+    pub fn engine_busy(&self) -> bool {
+        self.status != Status::Idle
+            || self.session.is_some()
+            || self.stream.is_some()
+            || self.recovering
+            || self
+                .file
+                .as_ref()
+                .map(|file| file.running || file.total_seconds <= 0.0)
+                .unwrap_or(false)
     }
 }
 
@@ -391,6 +462,7 @@ impl Shared {
                 file_seen: None,
                 site: None,
                 background: std::collections::BTreeSet::new(),
+                lazy: None,
                 site_pairing: None,
                 site_network: None,
                 site_network_busy: false,
@@ -466,12 +538,16 @@ pub fn load_history(root: &std::path::Path) -> History {
 
 #[cfg(test)]
 mod tests {
-    use super::{Interactor, ModelChoice, Session};
+    use super::{
+        BackgroundJob, Interactor, LazyTake, ModelChoice, Session, Shared, Status, StreamSession,
+    };
     use crate::config::{Backend, Config};
     use crate::dates::DateFilter;
+    use crate::history::History;
     use crate::site::db::{message_count, message_page, monolog_count, monolog_page, Db};
     use crate::site::monolog::Stage;
     use crate::store::Store;
+    use std::sync::Arc;
 
     #[test]
     fn the_window_reads_saved_monologs_and_messages_by_page() {
@@ -558,5 +634,75 @@ mod tests {
         // The user's own selection is untouched.
         assert_eq!(cfg.backend, Backend::Onnx);
         assert_eq!(cfg.onnx_model, "gigaam-v3-rnnt-punct");
+    }
+
+    fn fresh_shared() -> Shared {
+        Shared::new(Config::default(), History::from_entries(Vec::new()))
+    }
+
+    fn lazy_take(id: u64) -> LazyTake {
+        LazyTake {
+            id,
+            model: None,
+            sample_rate: 16_000,
+            buffer: Arc::new(std::sync::Mutex::new(Vec::new())),
+            received_samples: 0,
+            live_text: String::new(),
+            closed: false,
+            queued: 0,
+            waiting: false,
+        }
+    }
+
+    /// The whole point of the lazy mode: it is a user of the engine, not an
+    /// owner of it. The microphone stays available and the phone keeps moving.
+    #[test]
+    fn a_lazy_take_does_not_claim_the_engine() {
+        let shared = fresh_shared();
+        assert!(!shared.lock().engine_busy());
+        shared.lock().lazy = Some(lazy_take(3));
+        let data = shared.lock();
+        assert_eq!(data.status, Status::Idle);
+        assert!(data.session.is_none(), "a lazy take is not a session");
+        assert!(data.stream.is_none(), "a lazy take is not a live stream");
+        assert!(
+            !data.engine_busy(),
+            "the microphone and the phone must stay free while a lazy take waits"
+        );
+        assert!(!data.background_has(BackgroundJob::Api));
+    }
+
+    #[test]
+    fn every_live_state_still_claims_the_engine() {
+        let streaming = fresh_shared();
+        streaming.lock().stream = Some(StreamSession {
+            id: 1,
+            model: None,
+            sample_rate: 16_000,
+            buffer: Arc::new(std::sync::Mutex::new(Vec::new())),
+            received_samples: 0,
+            live_text: String::new(),
+            stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
+        assert!(
+            streaming.lock().engine_busy(),
+            "a live API session owns the engine"
+        );
+
+        let dictating = fresh_shared();
+        dictating.lock().status = Status::Recording;
+        assert!(
+            dictating.lock().engine_busy(),
+            "the person's dictation owns the engine"
+        );
+
+        let sessioned = fresh_shared();
+        sessioned.lock().session = Some(Session {
+            id: 2,
+            owner: Interactor::server(),
+            model: None,
+            stopped_by: None,
+        });
+        assert!(sessioned.lock().engine_busy());
     }
 }

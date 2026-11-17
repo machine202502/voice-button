@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use super::{MAX_AUDIO_CHUNK, MAX_REQUEST};
 
 /// Version of the document shape itself, bumped when fields change meaning.
-const HELP_VERSION: u32 = 1;
+const HELP_VERSION: u32 = 2;
 
 pub fn document(base_url: &str) -> Value {
     json!({
@@ -53,12 +53,16 @@ pub fn document(base_url: &str) -> Value {
             "silence": "Empty or fully silent audio produces an empty text, not an error."
         },
         "session": {
-            "rule": "One session at a time, owned by the API caller (owner = \"server\").",
+            "rule": "One session at a time, owned by the API caller (owner = \"server\"). Two modes: live and lazy.",
+            "modes": {
+                "live": "Default. The session takes the engine and the microphone is unavailable while it runs; the person's dictation has priority and a start during it returns 409. Start and end cues play, and the tray shows the API recording red.",
+                "lazy": "Background work: the take never blocks the microphone or the phone. Audio is accepted at any time, cut into segments, and each segment is decoded as soon as the engine is free; while the person records, the take waits and then continues where it stopped. No sound is played, the tray is violet while the take holds audio (from the first chunk until its text is out — the same background colour the phone and Telegram use), and one lazy take at a time is allowed. Start returns 409 \"a lazy take is already open\" for a second one."
+            },
             "lifecycle": "POST /api/record/start -> many POST /api/record/audio -> POST /api/record/stop -> poll GET /api/status until sessionId is null -> GET /api/record/text",
-            "liveText": "GET /api/status and GET /api/record/live return a growing partial transcript while audio arrives (ONNX models re-decode the buffer about once a second; Whisper only returns the final text).",
-            "userPriority": "If the user is dictating in the app, POST /api/record/start returns 409 and nothing is interrupted. The user may also stop the API session from the app: the audio received so far is still transcribed, saved to history, and reported with stoppedBy = \"user\".",
-            "abandonment": "There is no idle timeout. If the caller disappears without calling stop, the session keeps recording until someone stops it in the app.",
-            "sideEffects": "The text is saved to the app's history with source = \"server\" and is NOT copied to the clipboard. Start/end sound cues and the tray icon behave as for any recording."
+            "liveText": "GET /api/status and GET /api/record/live return a growing partial transcript while audio arrives (ONNX models re-decode the buffer about once a second; Whisper only returns the final text). A lazy take previews segment by segment.",
+            "userPriority": "If the user is dictating in the app, a live POST /api/record/start returns 409 and nothing is interrupted; a lazy take is still accepted and simply waits. The user may also stop a live API session from the app: the audio received so far is still transcribed, saved to history, and reported with stoppedBy = \"user\".",
+            "abandonment": "There is no idle timeout. If the caller disappears without calling stop, a live session keeps recording until someone stops it in the app; a lazy take stays queued.",
+            "sideEffects": "The text is saved to the app's history with source = \"server\" and is NOT copied to the clipboard. A live session plays the start/end cues and turns the tray to the API recording red; a lazy take is silent and paints the tray violet while it holds audio."
         },
         "endpoints": endpoints(),
         "errors": {
@@ -131,14 +135,17 @@ fn endpoints() -> Value {
                 "service": "voice-button",
                 "version": "0.2.6",
                 "state": "idle | recording | transcribing | nomodel",
+                "mode": "live | lazy | null",
                 "owner": "user | server | null",
                 "sessionId": 1,
                 "model": "Onnx/gigaam-v3-rnnt-punct",
                 "receivedMs": 1250,
                 "sampleRate": 16000,
-                "liveText": "partial transcript"
+                "liveText": "partial transcript",
+                "lazy": null,
+                "background": false
             },
-            "notes": "owner = \"user\" means the user is dictating in the app; wait before starting. receivedMs/sampleRate/liveText are null or empty when no API session is active. A local dictation of the user is never exposed here."
+            "notes": "owner = \"user\" means the user is dictating in the app; wait before starting a live session. mode = \"live\" is an exclusive API session, \"lazy\" a queued one; for a lazy take the lazy object reports {sessionId, receivedMs, queued, waiting, closed, text}, where waiting = true means the engine belongs to the person right now. receivedMs/sampleRate/liveText are null or empty when no API session is active. A local dictation of the user is never exposed here."
         },
         {
             "method": "GET",
@@ -154,14 +161,15 @@ fn endpoints() -> Value {
             "path": "/api/record/start",
             "summary": "Open a streaming session. The app starts listening for uploaded audio; the local microphone is not opened.",
             "contentType": "application/json",
-            "body": { "model": "Onnx/gigaam-v3-rnnt-punct", "sampleRate": 16000 },
+            "body": { "model": "Onnx/gigaam-v3-rnnt-punct", "sampleRate": 16000, "mode": "live" },
             "bodyFields": {
                 "model": "optional string '<Engine>/<id>'; omit to use the user's selected model",
-                "sampleRate": "optional integer 8000..48000, default 16000"
+                "sampleRate": "optional integer 8000..48000, default 16000",
+                "mode": "optional 'live' (default) or 'lazy'; lazy waits for the engine instead of claiming the microphone"
             },
-            "response": { "ok": true, "state": "recording", "sessionId": 1, "sampleRate": 16000 },
-            "errors": ["400 unknown or not downloaded model", "400 sampleRate out of range", "409 the app is busy with another session", "504 no answer from the app"],
-            "notes": "The session starts immediately; audio sent before the first chunk is simply empty. If the caller dies here, the session has to be stopped from the app."
+            "response": { "ok": true, "mode": "live", "state": "recording", "sessionId": 1, "sampleRate": 16000 },
+            "errors": ["400 unknown or not downloaded model", "400 sampleRate out of range", "400 mode is neither live nor lazy", "409 the app is busy with another session (live only)", "409 a lazy take is already open", "504 no answer from the app"],
+            "notes": "The session starts immediately; audio sent before the first chunk is simply empty. If the caller dies here, a live session has to be stopped from the app; a lazy take waits in the queue."
         },
         {
             "method": "POST",
@@ -282,6 +290,28 @@ curl -s -X POST {base_url}/api/record/start -H 'Content-Type: application/json' 
 curl -s -X POST "{base_url}/api/record/audio?session=1" -H 'Content-Type: application/octet-stream' --data-binary @chunk.pcm
 curl -s -X POST "{base_url}/api/record/stop?session=1"
 curl -s {base_url}/api/record/text"#)
+        },
+        {
+            "language": "curl",
+            "title": "Lazy take: send audio while the person works, read it later",
+            "code": format!(r#"# mode = "lazy" turns the session into background work: audio is accepted at
+# any time, cut into segments and decoded whenever the engine is free. No sound
+# is played and the tray is violet while the take holds audio.
+curl -s -X POST {base_url}/api/record/start -H 'Content-Type: application/json' -d '{{"sampleRate":16000,"mode":"lazy"}}'
+
+# Keep streaming: nothing is refused, and no interruption happens to the person.
+for chunk in chunk1.pcm chunk2.pcm chunk3.pcm; do
+  curl -s -X POST "{base_url}/api/record/audio?session=1" -H 'Content-Type: application/octet-stream' --data-binary "@$chunk"
+done
+
+# lazy.waiting = true means the engine belongs to the person right now; the take
+# keeps its audio and continues by itself. lazy.text is the growing transcript.
+curl -s {base_url}/api/status
+
+curl -s -X POST "{base_url}/api/record/stop?session=1"
+# After stop the take is finished when status.state is "idle" and lazy.closed
+# is true; the text is then in GET /api/record/text as well.
+curl -s {base_url}/api/record/text"#)
         }
     ])
 }
@@ -315,7 +345,67 @@ mod tests {
         }
         assert_eq!(doc["audio"]["format"], "pcm_s16le");
         assert_eq!(doc["audio"]["channels"], 1);
-        assert_eq!(doc["session"]["rule"], "One session at a time, owned by the API caller (owner = \"server\").");
+        assert!(
+            doc["session"]["rule"]
+                .as_str()
+                .unwrap()
+                .contains("Two modes: live and lazy"),
+            "the contract must name both session modes"
+        );
+        assert!(doc["session"]["modes"]["live"].is_string());
+        assert!(doc["session"]["modes"]["lazy"].is_string());
         assert!(!doc["examples"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_start_endpoint_documents_the_lazy_mode() {
+        let doc = document("http://127.0.0.1:8931");
+        let start = endpoint(&doc, "/api/record/start");
+        assert_eq!(start["bodyFields"]["mode"].as_str().unwrap().contains("lazy"), true);
+        assert!(start["response"]["mode"].is_string());
+        assert_eq!(doc["helpVersion"], 2);
+    }
+
+    fn endpoint<'a>(doc: &'a serde_json::Value, path: &str) -> &'a serde_json::Value {
+        doc["endpoints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|endpoint| endpoint["path"] == path)
+            .unwrap_or_else(|| panic!("{path} is documented"))
+    }
+
+    /// An integrator who only calls GET /api/help must learn that a lazy mode
+    /// exists, how it differs from the live one, and how to see its state.
+    #[test]
+    fn the_lazy_mode_is_documented_where_an_integrator_looks() {
+        let doc = document("http://127.0.0.1:8931");
+        let lazy = doc["session"]["modes"]["lazy"]
+            .as_str()
+            .expect("the lazy mode is described");
+        assert!(lazy.contains("engine is free"), "it says when audio is decoded");
+        assert!(lazy.contains("violet"), "it says how the app shows the take");
+        assert!(lazy.contains("409"), "it says a second take is refused");
+
+        let start = endpoint(&doc, "/api/record/start");
+        assert!(
+            start["bodyFields"]["mode"].as_str().unwrap().contains("lazy"),
+            "start accepts the mode"
+        );
+        let status = endpoint(&doc, "/api/status");
+        assert!(status["response"]["mode"].is_string(), "status reports the mode");
+        assert!(
+            status["notes"].as_str().unwrap().contains("lazy"),
+            "the status notes explain the lazy object"
+        );
+        assert!(
+            doc["examples"].as_array().unwrap().iter().any(|example| {
+                example["code"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("\"mode\":\"lazy\"")
+            }),
+            "an example sends a lazy take end to end"
+        );
     }
 }

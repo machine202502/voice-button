@@ -7,6 +7,7 @@
 //! segment is never longer than `MAX_SEGMENT`, and a failing engine costs the
 //! session nothing but that segment.
 
+use crate::asr::Reply;
 use crate::asr_engine::{Engine, Priority};
 use crate::audio::{read_wav, Resampler, WavWriter};
 use crate::config::AppDirs;
@@ -14,11 +15,12 @@ use crate::history::EntryState;
 use crate::ipc;
 use crate::log;
 use crate::segmenter::{Segment, Segmenter, MIN_SPEECH};
-use crate::state::{AppEvent, Interactor, InteractorKind, ModelChoice, Shared};
+use crate::state::{AppEvent, BackgroundJob, Interactor, InteractorKind, ModelChoice, Shared};
 use crate::stitch::Stitcher;
 use crate::transcribe;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -27,6 +29,44 @@ use std::time::Duration;
 
 /// Audio handed to the recognizer is 16 kHz mono, like every model expects.
 pub const SAMPLE_RATE: u32 = 16_000;
+
+/// How a session gets the engine.
+///
+/// A live session asks for it immediately: the person is speaking, or an API
+/// caller is streaming and waiting for text. A lazy API take waits instead —
+/// it is background work, so a segment waits while the person at the computer
+/// (or the phone's queue) holds the engine, and goes in as soon as it is free.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionMode {
+    Live,
+    Lazy,
+}
+
+impl SessionMode {
+    pub fn is_lazy(self) -> bool {
+        self == SessionMode::Lazy
+    }
+
+    /// The word the API uses for this mode.
+    pub fn label(self) -> &'static str {
+        match self {
+            SessionMode::Live => "live",
+            SessionMode::Lazy => "lazy",
+        }
+    }
+}
+
+/// The recognizer a session talks to. Production passes the scheduler in
+/// `asr_engine`; tests pass a fake and look at what was asked of it.
+pub trait Recognizer: Send + Sync {
+    fn decode(&self, priority: Priority, model: &str, samples: &[f32], rate: u32) -> Result<Reply>;
+}
+
+impl Recognizer for Engine {
+    fn decode(&self, priority: Priority, model: &str, samples: &[f32], rate: u32) -> Result<Reply> {
+        Engine::decode(self, priority, model, samples, rate)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct SessionStart {
@@ -39,6 +79,11 @@ pub struct SessionStart {
     pub paste_target: Option<isize>,
     pub clipboard: bool,
     pub buffer: Arc<Mutex<Vec<f32>>>,
+    pub mode: SessionMode,
+    /// Real time allowed for the tail once the stream stops, for an exclusive
+    /// API session. `None` finishes the tail however long it takes (the user's
+    /// own dictation and a lazy take have no budget).
+    pub tail_budget: Option<Duration>,
 }
 
 pub struct SessionHandle {
@@ -203,7 +248,7 @@ pub fn start(
     shared: Arc<Shared>,
     dirs: AppDirs,
     events: mpsc::Sender<AppEvent>,
-    asr: Arc<Engine>,
+    asr: Arc<dyn Recognizer>,
     start: SessionStart,
 ) -> Result<SessionHandle> {
     let dir = recordings_dir(&dirs.root).join(format!(
@@ -241,7 +286,7 @@ fn run(
     shared: Arc<Shared>,
     dirs: AppDirs,
     events: mpsc::Sender<AppEvent>,
-    asr: Arc<Engine>,
+    asr: Arc<dyn Recognizer>,
     start: SessionStart,
     dir: PathBuf,
     control: mpsc::Receiver<Control>,
@@ -271,10 +316,13 @@ fn run(
         Ok(wav) => wav,
         Err(e) => {
             log::log(&format!("session {}: cannot write audio: {e:#}", start.id));
-            let _ = events.send(AppEvent::Failed(crate::i18n::trf(
-                "Could not write the recording: {error}",
-                &[("error", &format!("{e:#}"))],
-            )));
+            let _ = events.send(AppEvent::Failed {
+                message: crate::i18n::trf(
+                    "Could not write the recording: {error}",
+                    &[("error", &format!("{e:#}"))],
+                ),
+                lazy: start.mode.is_lazy(),
+            });
             return;
         }
     };
@@ -313,38 +361,133 @@ fn run(
     );
 
     let mut resampled = Vec::new();
+    let mut pending: VecDeque<Segment> = VecDeque::new();
     let mut last_state = std::time::Instant::now();
     // If the engine dies on every segment, stop hammering it: the audio is
     // still written to disk and the recovery at the next start can retry.
     let mut consecutive_failures = 0usize;
     let mut degraded = false;
 
-    let mut feed = |samples: &[f32],
-                    wav: &mut WavWriter,
-                    segmenter: &mut Segmenter,
-                    stitcher: &mut Stitcher,
-                    persisted: &mut PersistedState| {
+    // Audio always reaches the disk and the segmenter, whatever the engine is
+    // doing: a lazy take must not lose sound while it waits, and a live
+    // recording must not stall behind the cut.
+    #[allow(clippy::too_many_arguments)]
+    fn accept_audio(
+        samples: &[f32],
+        wav: &mut WavWriter,
+        segmenter: &mut Segmenter,
+        resampler: &mut Option<Resampler>,
+        resampled: &mut Vec<f32>,
+        pending: &mut VecDeque<Segment>,
+        id: u64,
+    ) {
         resampled.clear();
         match resampler.as_mut() {
-            Some(resampler) => resampler.process(samples, &mut resampled),
+            Some(resampler) => resampler.process(samples, resampled),
             None => resampled.extend_from_slice(samples),
         }
         if resampled.is_empty() {
             return;
         }
-        if let Err(e) = wav.write(&resampled) {
-            log::log(&format!("session {}: audio write failed: {e:#}", start.id));
+        if let Err(e) = wav.write(resampled) {
+            log::log(&format!("session {id}: audio write failed: {e:#}"));
         }
-        let ready = segmenter.push(&resampled);
-        for segment in ready {
-            if degraded {
-                break;
+        pending.extend(segmenter.push(resampled));
+    }
+
+    let mut closed = false;
+    let mut flushed = false;
+    // The tail budget starts when the caller stops: from that moment the
+    // microphone is held by the app, so the person gets it back after at most
+    // this much real time — the segment already in the engine is finished.
+    let mut tail_deadline: Option<std::time::Instant> = None;
+    let mut tail_expired = false;
+    loop {
+        if !closed {
+            let drained = {
+                let mut buffer = start.buffer.lock().unwrap();
+                std::mem::take(&mut *buffer)
+            };
+            if !drained.is_empty() {
+                accept_audio(
+                    &drained,
+                    &mut wav,
+                    &mut segmenter,
+                    &mut resampler,
+                    &mut resampled,
+                    &mut pending,
+                    start.id,
+                );
             }
+            match control.try_recv() {
+                Ok(Control::Stop) | Err(mpsc::TryRecvError::Disconnected) => closed = true,
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if closed && !flushed {
+            // Everything still buffered belongs to the last moments of the
+            // recording; the tail joins the same queue instead of being decoded
+            // out of order.
+            let drained = {
+                let mut buffer = start.buffer.lock().unwrap();
+                std::mem::take(&mut *buffer)
+            };
+            if !drained.is_empty() {
+                accept_audio(
+                    &drained,
+                    &mut wav,
+                    &mut segmenter,
+                    &mut resampler,
+                    &mut resampled,
+                    &mut pending,
+                    start.id,
+                );
+            }
+            if let Some(tail) = segmenter.flush() {
+                pending.push_back(tail);
+            }
+            flushed = true;
+            tail_deadline = start
+                .tail_budget
+                .map(|budget| std::time::Instant::now() + budget);
+        }
+
+        // The engine's owner is read once per step: a segment already being
+        // decoded is not interrupted, so the next one re-checks.
+        let engine_busy = shared.lock().engine_busy();
+        if start.mode.is_lazy() {
+            publish_lazy(&shared, pending.len(), engine_busy);
+            // The same violet the phone and Telegram paint: background audio is
+            // in the app's hands — arriving, waiting for the engine, or being
+            // decoded. A take that has received nothing stays quiet, so an
+            // abandoned empty session cannot tint the tray for ever.
+            set_lazy_background(&shared, lazy_holds_audio(&shared, &pending, degraded));
+        }
+        // The budget is checked between segments, so the one already in the
+        // engine is finished rather than thrown away.
+        while !degraded && !pending.is_empty() && may_decode(start.mode, engine_busy) {
+            if let Some(deadline) = tail_deadline {
+                if std::time::Instant::now() >= deadline {
+                    tail_expired = true;
+                    break;
+                }
+            }
+            let segment = pending.pop_front().expect("checked above");
             let failures_before = persisted.failed_segments;
-            decode_segment(&asr, &model_id, &start, &shared, &dirs, &segment, stitcher, persisted, started_ms);
+            decode_segment(
+                &asr,
+                &model_id,
+                &start,
+                &shared,
+                &dirs,
+                &segment,
+                &mut stitcher,
+                &mut persisted,
+                started_ms,
+            );
             if persisted.failed_segments > failures_before {
                 consecutive_failures += 1;
-                if consecutive_failures >= 3 && !degraded {
+                if consecutive_failures >= 3 {
                     degraded = true;
                     log::log(&format!(
                         "session {}: the engine keeps failing; the rest of the recording goes to disk only",
@@ -358,64 +501,32 @@ fn run(
         persisted.seconds = wav.seconds();
         if last_state.elapsed() > Duration::from_millis(900) {
             last_state = std::time::Instant::now();
-            write_state(&dir, persisted);
+            write_state(&dir, &persisted);
         }
-    };
-
-    let mut stopped = false;
-    while !stopped {
-        let drained = {
-            let mut buffer = start.buffer.lock().unwrap();
-            std::mem::take(&mut *buffer)
-        };
-        if !drained.is_empty() {
-            feed(
-                &drained,
-                &mut wav,
-                &mut segmenter,
-                &mut stitcher,
-                &mut persisted,
-            );
+        if closed && flushed && (tail_expired || pending.is_empty() || degraded) {
+            break;
         }
-        match control.try_recv() {
-            Ok(Control::Stop) | Err(mpsc::TryRecvError::Disconnected) => stopped = true,
-            Err(mpsc::TryRecvError::Empty) => {}
-        }
-        if !stopped {
-            std::thread::sleep(Duration::from_millis(60));
-        }
+        std::thread::sleep(Duration::from_millis(60));
     }
-
-    // Everything still buffered belongs to the last moments of the recording.
-    let drained = {
-        let mut buffer = start.buffer.lock().unwrap();
-        std::mem::take(&mut *buffer)
-    };
-    if !drained.is_empty() {
-        feed(
-            &drained,
-            &mut wav,
-            &mut segmenter,
-            &mut stitcher,
-            &mut persisted,
-        );
+    if start.mode.is_lazy() {
+        // The take is over: the violet icon goes out with it.
+        set_lazy_background(&shared, false);
     }
-    if let Some(tail) = segmenter.flush() {
-        if !degraded {
-            decode_segment(
-                &asr,
-                &model_id,
-                &start,
-                &shared,
-                &dirs,
-                &tail,
-                &mut stitcher,
-                &mut persisted,
-                started_ms,
-            );
-        } else {
-            persisted.failed_segments += 1;
-        }
+    if tail_expired && !pending.is_empty() {
+        // The budget ran out: what is left stays on disk, and the entry is
+        // marked partial so the audio can be found and retried later.
+        let left = pending.len();
+        persisted.failed_segments += left;
+        pending.clear();
+        log::log(&format!(
+            "session {}: tail budget spent, {left} segment(s) left untranscribed",
+            start.id
+        ));
+    }
+    if degraded && !pending.is_empty() {
+        // The audio is on disk; the recovery can read it later.
+        persisted.failed_segments += pending.len();
+        pending.clear();
     }
 
     let seconds = wav.seconds();
@@ -433,13 +544,15 @@ fn run(
         text.chars().count(),
         persisted.failed_segments
     ));
-    ipc::write_live(
-        &dirs.root,
-        &ipc::LiveView {
-            text: text.clone(),
-            started: started_ms,
-        },
-    );
+    if !start.mode.is_lazy() {
+        ipc::write_live(
+            &dirs.root,
+            &ipc::LiveView {
+                text: text.clone(),
+                started: started_ms,
+            },
+        );
+    }
     let state = if persisted.failed_segments > 0 {
         EntryState::Partial
     } else {
@@ -459,7 +572,54 @@ fn run(
         },
         audio: None,
         at: None,
+        session: start.id,
+        // Lazy work has no cue: nobody at the computer is waiting for it.
+        lazy: start.mode.is_lazy(),
     });
+}
+
+/// A lazy take gives the engine up the moment the person needs it; a live one
+/// never waits.
+pub fn may_decode(mode: SessionMode, engine_busy: bool) -> bool {
+    !mode.is_lazy() || !engine_busy
+}
+
+/// Keep the API's view of a lazy take current: what the caller can see while it
+/// waits is exactly this.
+fn publish_lazy(shared: &Shared, queued: usize, engine_busy: bool) {
+    if let Some(take) = shared.lock().lazy.as_mut() {
+        take.queued = queued;
+        take.waiting = engine_busy && queued > 0;
+    }
+}
+
+/// Does the lazy take hold audio the app is responsible for? True from the first
+/// chunk until the text is out, so the tray shows the take the whole time it is
+/// the app's work — the same "background" the phone and Telegram paint.
+fn lazy_holds_audio(shared: &Shared, pending: &VecDeque<Segment>, degraded: bool) -> bool {
+    if degraded {
+        return false;
+    }
+    if !pending.is_empty() {
+        return true;
+    }
+    shared
+        .lock()
+        .lazy
+        .as_ref()
+        .map(|take| take.received_samples > 0)
+        .unwrap_or(false)
+}
+
+/// The tray is violet while the engine is decoding a lazy take — exactly the
+/// rule the phone's queue follows, so the two background jobs look the same.
+fn set_lazy_background(shared: &Shared, active: bool) {
+    let mut data = shared.lock();
+    if active {
+        data.background.insert(BackgroundJob::Api);
+    } else {
+        data.background.remove(&BackgroundJob::Api);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -471,7 +631,7 @@ fn priority(kind: InteractorKind) -> Priority {
 }
 
 fn decode_segment(
-    asr: &Arc<Engine>,
+    asr: &Arc<dyn Recognizer>,
     model_id: &str,
     start: &SessionStart,
     shared: &Arc<Shared>,
@@ -527,15 +687,24 @@ fn decode_segment(
                 reply.ms
             ));
             let text = stitcher.text();
-            ipc::write_live(
-                &dirs.root,
-                &ipc::LiveView {
-                    text: text.clone(),
-                    started,
-                },
-            );
+            // A lazy take is invisible to the window: its preview belongs to
+            // the caller that sent the audio, not to the person's live box.
+            if !start.mode.is_lazy() {
+                ipc::write_live(
+                    &dirs.root,
+                    &ipc::LiveView {
+                        text: text.clone(),
+                        started,
+                    },
+                );
+            }
             if start.interactor.kind == InteractorKind::Server {
-                if let Some(stream) = shared.lock().stream.as_mut() {
+                let mut data = shared.lock();
+                if start.mode.is_lazy() {
+                    if let Some(take) = data.lazy.as_mut() {
+                        take.live_text = text;
+                    }
+                } else if let Some(stream) = data.stream.as_mut() {
                     stream.live_text = text;
                 }
             }
@@ -681,7 +850,10 @@ fn run_file(
         snapshot.running = false;
         snapshot.error = Some(message.clone());
         ipc::write_file_state(&dirs.root, &snapshot);
-        let _ = events.send(AppEvent::Failed(message));
+        let _ = events.send(AppEvent::Failed {
+            message,
+            lazy: false,
+        });
         return;
     }
     if let Some(tail) = segmenter.flush() {
@@ -716,6 +888,8 @@ fn run_file(
         source: crate::history::Source::File,
         audio: Some(path.display().to_string()),
         at: None,
+        session: 0,
+        lazy: false,
     });
 }
 
@@ -969,5 +1143,434 @@ mod tests {
             "large-v3",
             "a session that names its model keeps it"
         );
+    }
+
+    /// The two ways a session takes the engine. These tests drive the real
+    /// session thread and the real segmenter; only the recognizer is a fake, so
+    /// "waits" and "continues" are observed rather than assumed.
+    mod modes {
+        use super::super::*;
+        use crate::config::Config;
+        use crate::history::History;
+        use crate::state::{Interactor, LazyTake, Status};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+
+        /// A recognizer that only counts: no model, no worker, no audio.
+        struct Counting {
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl Recognizer for Counting {
+            fn decode(
+                &self,
+                _priority: Priority,
+                _model: &str,
+                _samples: &[f32],
+                _rate: u32,
+            ) -> Result<Reply> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Reply {
+                    ok: true,
+                    ms: 1,
+                    ..Default::default()
+                })
+            }
+        }
+
+        fn temp_dirs(name: &str) -> AppDirs {
+            let root = std::env::temp_dir().join(format!(
+                "voice-button-session-{name}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(root.join("models")).expect("temp models");
+            AppDirs {
+                root: root.clone(),
+                models: root.join("models"),
+            }
+        }
+
+        /// Enough loud audio for the segmenter to cut a segment: speech is
+        /// measured by energy, and a tone is above the floor.
+        fn loud(seconds: f32) -> Vec<f32> {
+            let rate = SAMPLE_RATE as f32;
+            let count = (rate * seconds) as usize;
+            (0..count)
+                .map(|i| {
+                    let t = i as f32 / rate;
+                    0.35 * (2.0 * std::f32::consts::PI * 220.0 * t).sin()
+                })
+                .collect()
+        }
+
+        fn wait_for(limit: Duration, mut done: impl FnMut() -> bool) -> bool {
+            let started = Instant::now();
+            loop {
+                if done() {
+                    return true;
+                }
+                if started.elapsed() >= limit {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        fn session_start(
+            id: u64,
+            buffer: Arc<Mutex<Vec<f32>>>,
+            mode: SessionMode,
+        ) -> SessionStart {
+            SessionStart {
+                id,
+                interactor: Interactor::server(),
+                model: None,
+                rate: SAMPLE_RATE,
+                append: false,
+                paste_target: None,
+                clipboard: false,
+                buffer,
+                mode,
+                tail_budget: None,
+            }
+        }
+
+        #[test]
+        fn only_a_lazy_take_yields_the_engine() {
+            assert!(may_decode(SessionMode::Live, true));
+            assert!(may_decode(SessionMode::Live, false));
+            assert!(!may_decode(SessionMode::Lazy, true));
+            assert!(may_decode(SessionMode::Lazy, false));
+        }
+
+        #[test]
+        fn a_lazy_take_waits_for_the_user_and_then_continues() {
+            let shared = Arc::new(Shared::new(
+                Config::default(),
+                History::from_entries(Vec::new()),
+            ));
+            // The person is dictating: the engine is theirs.
+            shared.lock().status = Status::Recording;
+            let buffer = Arc::new(Mutex::new(loud(31.0)));
+            let calls = Arc::new(AtomicUsize::new(0));
+            shared.lock().lazy = Some(LazyTake {
+                id: 7,
+                model: None,
+                sample_rate: SAMPLE_RATE,
+                buffer: buffer.clone(),
+                received_samples: 31 * SAMPLE_RATE as u64,
+                live_text: String::new(),
+                closed: false,
+                queued: 0,
+                waiting: false,
+            });
+            let dirs = temp_dirs("lazy-waits");
+            let (events, _events_rx) = mpsc::channel();
+            let handle = start(
+                shared.clone(),
+                dirs.clone(),
+                events,
+                Arc::new(Counting {
+                    calls: calls.clone(),
+                }),
+                session_start(7, buffer, SessionMode::Lazy),
+            )
+            .expect("start the lazy take");
+
+            assert!(
+                wait_for(Duration::from_secs(5), || shared
+                    .lock()
+                    .lazy
+                    .as_ref()
+                    .map(|take| take.waiting)
+                    .unwrap_or(false)),
+                "the take must say that it is waiting for the engine"
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "a lazy take must not decode while the person records"
+            );
+            assert!(
+                shared.lock().background_has(BackgroundJob::Api),
+                "a take that holds audio is background work: the tray is violet"
+            );
+            assert_eq!(
+                shared.lock().status,
+                Status::Recording,
+                "a lazy take never changes the status: the mic is not its"
+            );
+
+            // The dictation is over: the segment that waited goes in.
+            shared.lock().status = Status::Idle;
+            assert!(
+                wait_for(Duration::from_secs(5), || calls.load(Ordering::SeqCst) > 0),
+                "the queued segment must run once the engine is free"
+            );
+            assert!(
+                !shared
+                    .lock()
+                    .lazy
+                    .as_ref()
+                    .map(|take| take.waiting)
+                    .unwrap_or(true),
+                "the take is no longer waiting"
+            );
+
+            handle.stop();
+            assert!(
+                wait_for(Duration::from_secs(5), || !shared
+                    .lock()
+                    .background_has(BackgroundJob::Api)),
+                "the violet icon must go out when nothing is left"
+            );
+            let _ = std::fs::remove_dir_all(&dirs.root);
+        }
+
+        /// A recognizer that stops inside its first `decode` until the test lets
+        /// it go, so the state *while the engine works* can be observed.
+        struct Gated {
+            started: mpsc::Sender<()>,
+            release: Mutex<Option<mpsc::Receiver<()>>>,
+        }
+
+        impl Recognizer for Gated {
+            fn decode(
+                &self,
+                _priority: Priority,
+                _model: &str,
+                _samples: &[f32],
+                _rate: u32,
+            ) -> Result<Reply> {
+                if let Some(release) = self.release.lock().unwrap().take() {
+                    let _ = self.started.send(());
+                    let _ = release.recv_timeout(Duration::from_secs(10));
+                }
+                Ok(Reply {
+                    ok: true,
+                    ms: 1,
+                    ..Default::default()
+                })
+            }
+        }
+
+        /// The lazy take is shown like the phone's work: the tray is violet
+        /// while the take holds audio, and goes out when it ends.
+        #[test]
+        fn a_lazy_take_is_violet_while_it_holds_audio_and_goes_out_with_it() {
+            let shared = Arc::new(Shared::new(
+                Config::default(),
+                History::from_entries(Vec::new()),
+            ));
+            let buffer = Arc::new(Mutex::new(loud(31.0)));
+            shared.lock().lazy = Some(LazyTake {
+                id: 9,
+                model: None,
+                sample_rate: SAMPLE_RATE,
+                buffer: buffer.clone(),
+                received_samples: 31 * SAMPLE_RATE as u64,
+                live_text: String::new(),
+                closed: false,
+                queued: 0,
+                waiting: false,
+            });
+            let dirs = temp_dirs("lazy-violet");
+            let (events, _events_rx) = mpsc::channel();
+            let (started_tx, started_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let handle = start(
+                shared.clone(),
+                dirs.clone(),
+                events,
+                Arc::new(Gated {
+                    started: started_tx,
+                    release: Mutex::new(Some(release_rx)),
+                }),
+                session_start(9, buffer, SessionMode::Lazy),
+            )
+            .expect("start the lazy take");
+
+            started_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the segment must reach the engine");
+            assert!(
+                shared.lock().background_has(BackgroundJob::Api),
+                "the tray must be violet while the engine decodes lazy audio"
+            );
+
+            release_tx.send(()).expect("let the decode finish");
+            handle.stop();
+            assert!(
+                wait_for(Duration::from_secs(5), || !shared
+                    .lock()
+                    .background_has(BackgroundJob::Api)),
+                "the violet icon goes out when the take is over"
+            );
+            let _ = std::fs::remove_dir_all(&dirs.root);
+        }
+
+        /// A recognizer that takes real time, like a model on a busy machine.
+        struct Slow {
+            per_segment: Duration,
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl Recognizer for Slow {
+            fn decode(
+                &self,
+                _priority: Priority,
+                _model: &str,
+                _samples: &[f32],
+                _rate: u32,
+            ) -> Result<Reply> {
+                std::thread::sleep(self.per_segment);
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Reply {
+                    ok: true,
+                    ms: 1,
+                    ..Default::default()
+                })
+            }
+        }
+
+        fn api_session_start(
+            id: u64,
+            buffer: Arc<Mutex<Vec<f32>>>,
+            budget: Option<Duration>,
+        ) -> SessionStart {
+            SessionStart {
+                id,
+                interactor: Interactor::server(),
+                model: None,
+                rate: SAMPLE_RATE,
+                append: false,
+                paste_target: None,
+                clipboard: false,
+                buffer,
+                mode: SessionMode::Live,
+                tail_budget: budget,
+            }
+        }
+
+        /// The caller stops with a backlog: the app finishes at most the
+        /// configured real time of it, keeps the rest on disk and hands the
+        /// microphone back.
+        #[test]
+        fn an_exclusive_tail_stops_when_its_budget_is_spent() {
+            let shared = Arc::new(Shared::new(
+                Config::default(),
+                History::from_entries(Vec::new()),
+            ));
+            let buffer = Arc::new(Mutex::new(loud(80.0)));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let dirs = temp_dirs("api-tail-budget");
+            let (events, events_rx) = mpsc::channel();
+            let handle = start(
+                shared.clone(),
+                dirs.clone(),
+                events,
+                Arc::new(Slow {
+                    per_segment: Duration::from_millis(400),
+                    calls: calls.clone(),
+                }),
+                api_session_start(11, buffer, Some(Duration::from_millis(250))),
+            )
+            .expect("start the API session");
+            // The stream ends at once, with several segments still queued.
+            handle.stop();
+
+            let event = events_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the session must finish");
+            match event {
+                AppEvent::Transcribed { state, .. } => assert!(
+                    state.is_partial(),
+                    "the budget left part of the tail untranscribed"
+                ),
+                other => panic!("unexpected event: {other:?}"),
+            }
+            assert!(
+                calls.load(Ordering::SeqCst) < 4,
+                "the budget must stop the tail before the whole backlog is read"
+            );
+            let _ = std::fs::remove_dir_all(&dirs.root);
+        }
+
+        /// Zero in the settings means "no limit": the old behaviour, the whole
+        /// tail is transcribed.
+        #[test]
+        fn a_tail_without_a_budget_is_transcribed_to_the_end() {
+            let shared = Arc::new(Shared::new(
+                Config::default(),
+                History::from_entries(Vec::new()),
+            ));
+            let buffer = Arc::new(Mutex::new(loud(80.0)));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let dirs = temp_dirs("api-tail-full");
+            let (events, events_rx) = mpsc::channel();
+            let handle = start(
+                shared.clone(),
+                dirs.clone(),
+                events,
+                Arc::new(Slow {
+                    per_segment: Duration::from_millis(20),
+                    calls: calls.clone(),
+                }),
+                api_session_start(12, buffer, None),
+            )
+            .expect("start the API session");
+            handle.stop();
+
+            let event = events_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the session must finish");
+            match event {
+                AppEvent::Transcribed { state, .. } => assert!(
+                    !state.is_partial(),
+                    "without a budget nothing is dropped"
+                ),
+                other => panic!("unexpected event: {other:?}"),
+            }
+            assert!(
+                calls.load(Ordering::SeqCst) >= 4,
+                "every segment, including the flushed tail, reaches the engine"
+            );
+            let _ = std::fs::remove_dir_all(&dirs.root);
+        }
+
+        #[test]
+        fn a_live_session_does_not_wait_for_the_user() {
+            let shared = Arc::new(Shared::new(
+                Config::default(),
+                History::from_entries(Vec::new()),
+            ));
+            shared.lock().status = Status::Recording;
+            let buffer = Arc::new(Mutex::new(loud(31.0)));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let dirs = temp_dirs("live-busy");
+            let (events, _events_rx) = mpsc::channel();
+            let handle = start(
+                shared.clone(),
+                dirs.clone(),
+                events,
+                Arc::new(Counting {
+                    calls: calls.clone(),
+                }),
+                session_start(8, buffer, SessionMode::Live),
+            )
+            .expect("start the live session");
+
+            assert!(
+                wait_for(Duration::from_secs(5), || calls.load(Ordering::SeqCst) > 0),
+                "a live session asks for the engine at once, even mid-dictation"
+            );
+            assert!(
+                !shared.lock().background_has(BackgroundJob::Api),
+                "a live session is not background work"
+            );
+            handle.stop();
+            let _ = std::fs::remove_dir_all(&dirs.root);
+        }
     }
 }

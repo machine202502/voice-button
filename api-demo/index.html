@@ -23,10 +23,27 @@
   <div class="models">
     <label class="inline" for="api">API:</label>
     <input type="text" id="api" spellcheck="false">
-    <label class="inline" for="model">Модель:</label>
-    <select id="model"><option value="">как в настройках приложения</option></select>
+    <span class="inline-group">
+      <label class="inline" for="model">Модель:</label>
+      <select id="model"><option value="">как в настройках приложения</option></select>
+    </span>
+    <span class="inline-group">
+      <label class="inline" for="mode">Режим:</label>
+      <select id="mode">
+        <option value="live">эксклюзивный (live)</option>
+        <option value="lazy">ленивый (lazy)</option>
+      </select>
+    </span>
     <button id="reload" class="chip" type="button">обновить</button>
   </div>
+
+  <p class="intro" id="mode-hint">
+    <b>Эксклюзивный</b> занимает движок и микрофон: пока сессия идёт, приложение не
+    пишет с микрофона, а трей показывает малиновый микрофончик API.
+    <b>Ленивый</b> работает как телефон: звук принимается всегда, расшифровка идёт
+    сегментами, когда движок свободен, а пока вы диктуете в приложении — ленивая
+    сессия ждёт и потом продолжает. Звуков в ленивом режиме нет, трей фиолетовый.
+  </p>
 
   <div class="stage">
     <button id="mic" data-state="idle" type="button" title="Start / stop">🎤</button>

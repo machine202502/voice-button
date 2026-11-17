@@ -3051,6 +3051,20 @@ fn api_body(
             );
             commit |= port.drag_stopped() || port.lost_focus();
         });
+        ui.horizontal(|ui| {
+            ui.label(tr("Finish the API tail, s:"));
+            let tail = ui.add(
+                egui::DragValue::new(&mut data.config.api_tail_seconds).clamp_range(0..=120),
+            );
+            commit |= tail.drag_stopped() || tail.lost_focus();
+            ui.label(RichText::new(tr("0 — to the end")).weak());
+        });
+        ui.label(
+            RichText::new(
+                tr("When the caller stops, the sound already sent is finished for at most this much real time. The microphone stays busy until the tail is done or this time is up; a segment already in the engine is finished."),
+            )
+            .weak(),
+        );
     });
     if commit {
         data.config.api_host = data.config.api_host.trim().to_string();

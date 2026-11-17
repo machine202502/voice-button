@@ -91,9 +91,18 @@ PCM and receives live and final text; the result is saved to history with the
 - `GET /api/models` lists the models this build can use. `start` may override
   the engine and model for that session only, without touching the user's
   settings.
+- Two modes. **Live** (the default) is an exclusive session: it takes the engine,
+  the microphone is unavailable while it runs, the start and end cues play and
+  the tray microphone is red — raspberry when the session belongs to an API
+  caller rather than to the person. **Lazy** (`"mode":"lazy"`) is background work
+  like the phone: audio is accepted at any time, cut into segments, and each
+  segment is decoded when the engine is free. While the person dictates, the
+  take waits and then continues where it stopped; nothing is played and the tray
+  is violet while the take holds audio — from the first chunk until its text is
+  out, the same background colour the phone and Telegram use.
 - One session at a time: while the user is dictating in the app, the API answers
-  409 instead of interrupting. The user can stop an API session from the window;
-  the text is still transcribed and saved.
+  409 instead of interrupting. The user can stop a live API session from the
+  window; the text is still transcribed and saved.
 
 A ready-made browser demo (microphone → app) lives in `api-demo/`:
 

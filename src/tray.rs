@@ -1,6 +1,6 @@
 use crate::hotkey::Hotkey;
 use crate::icons;
-use crate::state::Status;
+use crate::state::{InteractorKind, Status};
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
 use crate::i18n::tr;
@@ -35,7 +35,12 @@ pub enum TrayAction {
 }
 
 pub enum TrayCommand {
-    SetStatus(Status),
+    /// The status and who owns the session behind it: a recording started by
+    /// the API client is shown in its own red, not the user's.
+    SetStatus {
+        status: Status,
+        owner: Option<InteractorKind>,
+    },
     /// A background task is running: the icon is violet and no sound is played.
     SetBackground(bool),
     /// Replace the tray tooltip with a one-off message.
@@ -248,22 +253,31 @@ fn build_menu(telegram: bool, monologs: bool) -> (Menu, MenuIds, ServiceItems) {
 }
 
 /// Which icon a status asks for. Idle plus background work is a background task
-/// transcribed; anything the user does outranks that.
+/// transcribed; anything the user does outranks that. A recording owned by the
+/// API client is the same live state as the user's own, only not theirs, so it
+/// keeps the red family with its own hue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IconKind {
     Idle,
     Background,
     Recording,
+    /// A live API session: audio arrives from a caller, not from the microphone.
+    ApiRecording,
     Transcribing,
     Recovering,
     File,
     Disabled,
 }
 
-fn icon_choice(status: Status, background: bool) -> IconKind {
+fn icon_choice(
+    status: Status,
+    background: bool,
+    owner: Option<InteractorKind>,
+) -> IconKind {
     match status {
         Status::Idle if background => IconKind::Background,
         Status::Idle => IconKind::Idle,
+        Status::Recording if owner == Some(InteractorKind::Server) => IconKind::ApiRecording,
         Status::Recording => IconKind::Recording,
         Status::Transcribing => IconKind::Transcribing,
         Status::Recovering => IconKind::Recovering,
@@ -280,6 +294,10 @@ fn status_color(kind: IconKind) -> [u8; 3] {
         IconKind::Idle => [0xff, 0xff, 0xff],
         IconKind::Background => [0xb9, 0xa2, 0xf0],
         IconKind::Recording => [0xff, 0x5c, 0x5c],
+        // The same live red, shifted to raspberry: "something is recording, but
+        // it is not you". Near enough to read as the same alarm, far enough to
+        // be told apart at 16 px; amber and violet stay with their own states.
+        IconKind::ApiRecording => [0xff, 0x4d, 0x7a],
         IconKind::Transcribing => [0xff, 0x9f, 0x43],
         IconKind::Recovering => [0x6e, 0x9b, 0xff],
         IconKind::File => [0x5c, 0xe0, 0x7a],
@@ -297,8 +315,13 @@ fn icon_for(kind: IconKind, holiday: Option<&str>) -> tray_icon::Icon {
     icons::tray_icon(holiday, status_color(kind))
 }
 
-fn status_icon(status: Status, background: bool, holiday: Option<&str>) -> tray_icon::Icon {
-    icon_for(icon_choice(status, background), holiday)
+fn status_icon(
+    status: Status,
+    background: bool,
+    owner: Option<InteractorKind>,
+    holiday: Option<&str>,
+) -> tray_icon::Icon {
+    icon_for(icon_choice(status, background, owner), holiday)
 }
 
 fn tooltip(swap_mouse_buttons: bool) -> String {
@@ -335,6 +358,7 @@ fn run(
     // Blinking blue icon while a crash-interrupted recording is transcribed:
     // a static icon is easy to miss.
     let mut current_status = Status::Idle;
+    let mut current_owner: Option<InteractorKind> = None;
     let mut background = false;
     let mut holiday: Option<String> = None;
     let mut blink_at = std::time::Instant::now();
@@ -384,11 +408,12 @@ fn run(
         }
         while let Ok(command) = rx_cmd.try_recv() {
             match command {
-                TrayCommand::SetStatus(status) => {
+                TrayCommand::SetStatus { status, owner } => {
                     current_status = status;
+                    current_owner = owner;
                     blink_at = std::time::Instant::now();
                     blink_bright = true;
-                    let icon = status_icon(status, background, holiday.as_deref());
+                    let icon = status_icon(status, background, owner, holiday.as_deref());
                     let _ = tray.set_icon(Some(icon));
                     let hint = match status {
                         Status::Recovering => tr("Voice Button - recovering a recording"),
@@ -399,7 +424,12 @@ fn run(
                 }
                 TrayCommand::SetBackground(active) => {
                     background = active;
-                    let icon = status_icon(current_status, background, holiday.as_deref());
+                    let icon = status_icon(
+                        current_status,
+                        background,
+                        current_owner,
+                        holiday.as_deref(),
+                    );
                     let _ = tray.set_icon(Some(icon));
                 }
                 TrayCommand::Notify(text) => {
@@ -429,7 +459,12 @@ fn run(
                 }
                 TrayCommand::SetHoliday(next) => {
                     holiday = next;
-                    let icon = status_icon(current_status, background, holiday.as_deref());
+                    let icon = status_icon(
+                        current_status,
+                        background,
+                        current_owner,
+                        holiday.as_deref(),
+                    );
                     let _ = tray.set_icon(Some(icon));
                 }
                 TrayCommand::SetEntries { telegram, monologs } => {
@@ -582,8 +617,8 @@ mod tests {
 
     #[test]
     fn background_work_turns_the_icon_violet_only_when_nothing_else_happens() {
-        assert_eq!(icon_choice(Status::Idle, false), IconKind::Idle);
-        assert_eq!(icon_choice(Status::Idle, true), IconKind::Background);
+        assert_eq!(icon_choice(Status::Idle, false, None), IconKind::Idle);
+        assert_eq!(icon_choice(Status::Idle, true, None), IconKind::Background);
     }
 
     #[test]
@@ -596,11 +631,52 @@ mod tests {
             Status::NoModel,
         ] {
             assert_ne!(
-                icon_choice(status, true),
+                icon_choice(status, true, Some(InteractorKind::User)),
                 IconKind::Background,
                 "{status:?} must keep its own icon while the phone is transcribed"
             );
         }
+    }
+
+    #[test]
+    fn a_recording_started_by_the_api_client_has_its_own_red() {
+        // The live API session is the same alarm as the user's dictation, not a
+        // background task, and it must not look like the microphone is theirs.
+        assert_eq!(
+            icon_choice(Status::Recording, false, Some(InteractorKind::Server)),
+            IconKind::ApiRecording
+        );
+        assert_eq!(
+            icon_choice(Status::Recording, false, Some(InteractorKind::User)),
+            IconKind::Recording
+        );
+        // A status without a session (the tail of a recording) keeps the plain
+        // red, so the icon cannot claim an owner it no longer has.
+        assert_eq!(
+            icon_choice(Status::Recording, false, None),
+            IconKind::Recording
+        );
+        assert_eq!(status_color(IconKind::ApiRecording), [0xff, 0x4d, 0x7a]);
+        assert_ne!(
+            status_color(IconKind::ApiRecording),
+            status_color(IconKind::Recording),
+            "two live states must not share one colour"
+        );
+    }
+
+    #[test]
+    fn the_api_red_survives_background_work_and_other_statuses() {
+        // The phone being busy must not repaint the API session violet.
+        assert_eq!(
+            icon_choice(Status::Recording, true, Some(InteractorKind::Server)),
+            IconKind::ApiRecording
+        );
+        // And the API red is only for recording: the tail of the session is
+        // transcribed like everything else.
+        assert_eq!(
+            icon_choice(Status::Transcribing, false, Some(InteractorKind::Server)),
+            IconKind::Transcribing
+        );
     }
 }
 

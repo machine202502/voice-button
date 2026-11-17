@@ -10,9 +10,11 @@ use crate::ipc;
 use crate::log;
 use crate::model_manager;
 use crate::recorder::Recorder;
-use crate::session::{self, SessionHandle, SessionStart};
+use crate::session::{self, SessionHandle, SessionMode, SessionStart};
 use crate::sound;
-use crate::state::{Interactor, ModelChoice, Session, Shared, Status, StreamSession};
+use crate::state::{
+    Interactor, LazyTake, ModelChoice, Session, Shared, Status, StreamSession,
+};
 use crate::tray::TrayCommand;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
@@ -25,6 +27,9 @@ pub struct Runtime {
     pub asr: Arc<Engine>,
     /// The session that is currently open, if any.
     pub session: Mutex<Option<SessionHandle>>,
+    /// The lazy API take that is open, if any. It is not a `Session`: the
+    /// microphone and the phone never wait for it.
+    pub lazy: Mutex<Option<SessionHandle>>,
     /// The imported file that is being transcribed, for cancellation.
     pub file: Mutex<Option<crate::session::FileHandle>>,
 }
@@ -43,16 +48,21 @@ pub fn try_runtime() -> Option<&'static Runtime> {
     RUNTIME.get()
 }
 
-/// Publish the status to the UI (file) and to the tray (icon).
+/// Publish the status to the UI (file) and to the tray (icon). The owner travels
+/// with it: a live API session draws its own red, the user's dictation theirs.
 pub fn set_status(
     shared: &Shared,
     tray_cmds: &mpsc::Sender<TrayCommand>,
     dirs: &config::AppDirs,
     status: Status,
 ) {
-    shared.lock().status = status;
+    let owner = {
+        let mut data = shared.lock();
+        data.status = status;
+        data.session.as_ref().map(|session| session.owner.kind)
+    };
     ipc::write_status(&dirs.root, status);
-    let _ = tray_cmds.send(TrayCommand::SetStatus(status));
+    let _ = tray_cmds.send(TrayCommand::SetStatus { status, owner });
 }
 
 /// Monotonic id of a recording session, so stops and results can be attributed
@@ -60,6 +70,14 @@ pub fn set_status(
 pub fn next_session_id() -> u64 {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     COUNTER.fetch_add(1, Ordering::SeqCst) + 1
+}
+
+/// Real time the app may spend finishing an exclusive API tail once the stream
+/// stopped. `None` when the setting is zero: the whole tail is finished, however
+/// long that takes.
+pub fn api_tail_budget(shared: &Shared) -> Option<std::time::Duration> {
+    let seconds = shared.lock().config.api_tail_seconds;
+    (seconds > 0).then(|| std::time::Duration::from_secs(seconds as u64))
 }
 
 /// A model the API server may use is one this build offers and that is already
@@ -141,6 +159,10 @@ pub fn begin_stream_session(
         paste_target: None,
         clipboard: false,
         buffer,
+        mode: SessionMode::Live,
+        // The caller stopped, the microphone is still held by the tail: the
+        // person gets it back after the configured real time at the latest.
+        tail_budget: api_tail_budget(shared),
     };
     match session::start(
         shared.clone(),
@@ -169,6 +191,95 @@ pub fn begin_stream_session(
         sound::play_start(volume);
     }
     id
+}
+
+/// Start a lazy API take. Unlike a live session it claims nothing: no
+/// `Status::Recording`, no `Session`, no start sound. The audio still goes to
+/// the disk and to the segmenter, and each segment waits until the engine is
+/// free, so the microphone and the phone never stop for it.
+pub fn begin_lazy_session(
+    shared: &Arc<Shared>,
+    dirs: &config::AppDirs,
+    events_tx: mpsc::Sender<crate::state::AppEvent>,
+    model: Option<ModelChoice>,
+    sample_rate: u32,
+) -> Option<u64> {
+    let runtime = runtime();
+    let id = next_session_id();
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    {
+        let mut data = shared.lock();
+        data.lazy = Some(LazyTake {
+            id,
+            model: model.clone(),
+            sample_rate,
+            buffer: buffer.clone(),
+            received_samples: 0,
+            live_text: String::new(),
+            closed: false,
+            queued: 0,
+            waiting: false,
+        });
+    }
+    log::log(&format!("api lazy take {id} started ({sample_rate} Hz)"));
+    let start = SessionStart {
+        id,
+        interactor: Interactor::server(),
+        model,
+        rate: sample_rate,
+        append: false,
+        paste_target: None,
+        clipboard: false,
+        buffer,
+        mode: SessionMode::Lazy,
+        // Background work has no budget: it simply waits for the engine.
+        tail_budget: None,
+    };
+    match session::start(
+        shared.clone(),
+        dirs.clone(),
+        events_tx,
+        runtime.asr.clone(),
+        start,
+    ) {
+        Ok(handle) => {
+            *runtime.lazy.lock().unwrap() = Some(handle);
+            Some(id)
+        }
+        Err(e) => {
+            log::log(&format!("cannot start the lazy API take: {e:#}"));
+            shared.lock().lazy = None;
+            None
+        }
+    }
+}
+
+/// Close a lazy take: no more audio, and the tail is decoded as soon as the
+/// engine is free. `false` for an unknown or already closed take.
+pub fn stop_lazy_session(shared: &Arc<Shared>, session: u64) -> bool {
+    let closed = {
+        let mut data = shared.lock();
+        match data.lazy.as_mut() {
+            Some(take) if session == 0 || take.id == session => {
+                if take.closed {
+                    false
+                } else {
+                    take.closed = true;
+                    true
+                }
+            }
+            _ => false,
+        }
+    };
+    if closed {
+        if let Some(runtime) = try_runtime() {
+            if let Some(handle) = runtime.lazy.lock().unwrap().take() {
+                handle.stop();
+            }
+        }
+        log::log("api lazy take closed, the tail waits for the engine");
+    }
+    closed
 }
 
 /// Stop receiving audio and let the session decode the whole buffer. Kept in one
@@ -220,7 +331,43 @@ pub fn handle_api_request(
     use crate::api::{ApiAction, ApiResponse};
     let reply = request.reply;
     match request.action {
-        ApiAction::StreamStart { model, sample_rate } => {
+        ApiAction::StreamStart {
+            model,
+            sample_rate,
+            mode,
+        } => {
+            if mode == SessionMode::Lazy {
+                // A lazy take is background work: it never refuses the person,
+                // and it never blocks the mic. One such take at a time keeps
+                // "the caller's session" unambiguous for the status endpoint.
+                if shared.lock().lazy.is_some() {
+                    let _ = reply.send(ApiResponse::Rejected(
+                        "a lazy take is already open".to_string(),
+                    ));
+                    return;
+                }
+                let ready = match &model {
+                    Some(model) => model_choice_ready(dirs, model),
+                    None => model_manager::selection_ready(&dirs.models, &shared.lock().config),
+                };
+                if !ready {
+                    let _ = reply.send(ApiResponse::Rejected(
+                        "no downloaded model to transcribe with".to_string(),
+                    ));
+                    return;
+                }
+                match begin_lazy_session(shared, dirs, events_tx, model, sample_rate) {
+                    Some(session) => {
+                        let _ = reply.send(ApiResponse::StreamStarted { session });
+                    }
+                    None => {
+                        let _ = reply.send(ApiResponse::Rejected(
+                            "the lazy take could not be started".to_string(),
+                        ));
+                    }
+                }
+                return;
+            }
             let busy = {
                 let data = shared.lock();
                 data.session.is_some()
@@ -257,31 +404,58 @@ pub fn handle_api_request(
             let _ = reply.send(ApiResponse::StreamStarted { session });
         }
         ApiAction::StreamChunk { session, samples } => {
-            let buffer = {
+            let live = {
                 let data = shared.lock();
-                match data.stream.as_ref().filter(|s| s.id == session) {
-                    Some(stream) => Some(stream.buffer.clone()),
-                    None => None,
-                }
+                data.stream
+                    .as_ref()
+                    .filter(|s| s.id == session)
+                    .map(|s| s.buffer.clone())
             };
-            let Some(buffer) = buffer else {
+            if let Some(buffer) = live {
+                let count = samples.len() as u64;
+                buffer.lock().unwrap().extend(samples);
+                let (received_ms, live) = {
+                    let mut data = shared.lock();
+                    match data.stream.as_mut().filter(|s| s.id == session) {
+                        Some(stream) => {
+                            stream.received_samples += count;
+                            (stream.received_ms(), stream.live_text.clone())
+                        }
+                        None => (0, String::new()),
+                    }
+                };
+                let _ = reply.send(ApiResponse::ChunkAccepted { received_ms, live });
+                return;
+            }
+            // A lazy take: the audio is accepted whenever it arrives; only a
+            // closed take refuses more.
+            let lazy = {
+                let data = shared.lock();
+                data.lazy
+                    .as_ref()
+                    .filter(|take| take.id == session)
+                    .map(|take| (take.buffer.clone(), take.closed))
+            };
+            let Some((buffer, closed)) = lazy else {
                 let _ = reply.send(ApiResponse::Rejected(
                     "no active stream session with that id".to_string(),
                 ));
                 return;
             };
+            if closed {
+                let _ = reply.send(ApiResponse::Rejected(
+                    "the take is already closed".to_string(),
+                ));
+                return;
+            }
             let count = samples.len() as u64;
             buffer.lock().unwrap().extend(samples);
             let (received_ms, live) = {
                 let mut data = shared.lock();
-                match data.stream.as_mut().filter(|s| s.id == session) {
-                    Some(stream) => {
-                        stream.received_samples += count;
-                        let ms = stream
-                            .received_samples
-                            .saturating_mul(1000)
-                            .saturating_div(stream.sample_rate.max(1) as u64);
-                        (ms, stream.live_text.clone())
+                match data.lazy.as_mut().filter(|take| take.id == session) {
+                    Some(take) => {
+                        take.received_samples += count;
+                        (take.received_ms(), take.live_text.clone())
                     }
                     None => (0, String::new()),
                 }
@@ -301,7 +475,22 @@ pub fn handle_api_request(
                     ));
                 }
                 None => {
-                    let _ = reply.send(ApiResponse::StreamStopped);
+                    // No live session: the id may belong to a lazy take.
+                    let lazy = shared.lock().lazy.as_ref().map(|take| take.id);
+                    match lazy {
+                        Some(id) if session == 0 || session == id => {
+                            stop_lazy_session(shared, session);
+                            let _ = reply.send(ApiResponse::StreamStopped);
+                        }
+                        Some(_) => {
+                            let _ = reply.send(ApiResponse::Rejected(
+                                "that is not the active session".to_string(),
+                            ));
+                        }
+                        None => {
+                            let _ = reply.send(ApiResponse::StreamStopped);
+                        }
+                    }
                 }
             }
         }

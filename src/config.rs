@@ -124,6 +124,11 @@ pub struct Config {
     /// Port the local API server listens on.
     #[serde(default = "default_api_port")]
     pub api_port: u16,
+    /// Real-time seconds the app may spend finishing the tail of an exclusive
+    /// API session after the caller stopped, before the microphone is handed
+    /// back. Zero finishes the whole tail, however long it takes.
+    #[serde(default = "default_api_tail_seconds")]
+    pub api_tail_seconds: u32,
     /// Interface language: a locale code from `locales/`, empty = the Windows
     /// language (or English when there is no matching catalog).
     #[serde(default)]
@@ -311,6 +316,7 @@ impl Default for Config {
             api_enabled: false,
             api_host: default_api_host(),
             api_port: default_api_port(),
+            api_tail_seconds: default_api_tail_seconds(),
             ui_language: String::new(),
             site_enabled: false,
             site_port: default_site_port(),
@@ -388,6 +394,12 @@ fn default_api_host() -> String {
 
 fn default_api_port() -> u16 {
     8931
+}
+
+/// Ten seconds is enough for the tail of a normal API take and short enough
+/// that the person at the computer gets the microphone back quickly.
+fn default_api_tail_seconds() -> u32 {
+    10
 }
 
 #[derive(Debug, Clone)]
