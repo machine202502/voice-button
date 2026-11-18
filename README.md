@@ -233,6 +233,14 @@ Sound toggles, sound volume, language, and autostart apply immediately. A model
 selection applies only when its files are ready. Downloads run in the daemon,
 show progress, and can be cancelled; closing the UI does not cancel them.
 
+**Settings → Recordings** keeps a copy of every finished recording: microphone
+dictations, imported files, API takes, phone messages and Telegram media. The
+copy is Ogg/Opus (16 kHz mono, 24 kbit/s, about 11 MB an hour); the original is
+never moved or changed. The option is off by default. Copies go to
+`Music\VoiceButton`, or to the folder picked in Settings, under subfolders that
+say where the take came from: `user/`, `file/`, `api/`, `phone/`, and
+`telegram/<sender>/`; file names carry the date and the take's own details.
+
 Data lives in `%APPDATA%\voice-button`:
 
 - `config.json` — applied settings, the only user JSON the app keeps.

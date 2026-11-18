@@ -180,6 +180,42 @@ fn record_history(root: &Path, hub: &Hub, shared: &Arc<Shared>, id: u64) {
     }
 }
 
+/// Save the user's copy of a completed phone take.
+///
+/// The hub calls this the moment the take becomes final, while `site/audio`
+/// still holds the raw PCM; the hub deletes that file right after, so the copy
+/// has to be written here rather than when the text reaches the history.
+fn save_completed(root: &Path, db: &Mutex<Db>, shared: &Arc<Shared>, id: u64) {
+    let config = shared.lock().config.clone();
+    if !config.save_recordings {
+        return;
+    }
+    let (at, group) = {
+        let db = db.lock().unwrap();
+        let Some(message) = db.message(id) else {
+            return;
+        };
+        (
+            history_stamp(&message.recorded),
+            db.monolog(message.monolog)
+                .map(|monolog| monolog.name.clone()),
+        )
+    };
+    let recording = crate::audio_save::Recording {
+        origin: crate::audio_save::Origin::Phone,
+        account: "",
+        label: group.as_deref().unwrap_or(""),
+        at: &at,
+    };
+    if let Err(error) =
+        crate::audio_save::save_pcm16(&config, &recording, &Db::audio_path(root, id))
+    {
+        crate::log::log(&format!(
+            "site: cannot save a copy of message {id}: {error:#}"
+        ));
+    }
+}
+
 impl PhoneRuntime {
     /// Bring the layer up. Binding happens here, so a busy port is an error the
     /// caller sees, not a log line nobody reads.
@@ -200,6 +236,15 @@ impl PhoneRuntime {
             db.clone(),
             Box::new(move || cutter_for(&cutter_shared)),
         ));
+        // The copy is written while the take's PCM is still on disk: the hub
+        // deletes that file as soon as the take is final. Resumed takes go
+        // through the same hook, so a recording left by a crash is saved too.
+        let copy_db = db.clone();
+        let copy_shared = shared.clone();
+        let copy_root = root.to_path_buf();
+        hub.on_complete(Arc::new(move |id| {
+            save_completed(&copy_root, &copy_db, &copy_shared, id)
+        }));
         hub.resume(super::hub::now_ms());
 
         let static_dir = static_dir.unwrap_or_else(phone_static_dir);
@@ -553,6 +598,78 @@ mod tests {
         assert_eq!(entry.group.as_deref(), Some("Работа"));
         assert_eq!(entry.at, "2026-11-12 15:00:00", "the phone's own time");
         assert_eq!(shared.lock().history.len(), 1, "the window index has it at once");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The queue deletes a take's raw PCM as soon as the take is final. The
+    /// user's copy must be written before that, from that very file; writing it
+    /// later (when the text reaches the history) found the file already gone.
+    #[test]
+    fn a_completed_take_is_saved_before_its_audio_is_deleted() {
+        let root = temp_root("completed-copy");
+        let db = Arc::new(Mutex::new(Db::open(&root).unwrap()));
+        let id = {
+            let mut db = db.lock().unwrap();
+            let monolog = db.create_monolog("Работа", "2026-11-12T10:00:00+05:00");
+            let message = db.add_message(
+                monolog.id,
+                "2026-11-12T15:00:00+05:00",
+                "2026-11-12T15:00:01+05:00",
+            );
+            db.save().unwrap();
+            message.id
+        };
+        let shared = shared_with(Status::Idle);
+        {
+            let mut data = shared.lock();
+            data.config.save_recordings = true;
+            data.config.save_recordings_dir = root.join("saved").display().to_string();
+        }
+        let hub = Hub::new(db.clone());
+        {
+            let save_root = root.clone();
+            let save_db = db.clone();
+            let save_shared = shared.clone();
+            hub.on_complete(Arc::new(move |id| {
+                save_completed(&save_root, &save_db, &save_shared, id)
+            }));
+        }
+        hub.listen(
+            id,
+            Box::new(RealCutter::new(5.0, 10.0, 1.0)),
+            0,
+        );
+        // One second of a loud tone is enough for the cutter to hand over a
+        // segment, and for the queue to decode and finish the take.
+        let mut pcm = Vec::with_capacity(32_000);
+        for frame in 0..16_000 {
+            let t = frame as f32 / 16_000.0;
+            let sample =
+                (0.35 * (2.0 * std::f32::consts::PI * 220.0 * t).sin() * 32767.0) as i16;
+            pcm.extend_from_slice(&sample.to_le_bytes());
+        }
+        hub.audio(id, &pcm);
+        hub.finish(id);
+        let mut decoder = Says;
+        let did = hub.pump(0, true, false, &mut decoder);
+        assert!(
+            matches!(did, crate::site::queue::Did::Decoded { finished: true, .. }),
+            "the take must complete: {did:?}"
+        );
+        // The completion hook saved the copy and then the hub dropped the PCM.
+        let copies: Vec<_> = std::fs::read_dir(root.join("saved").join("phone"))
+            .expect("the phone folder")
+            .flatten()
+            .collect();
+        assert_eq!(copies.len(), 1, "one take, one saved copy");
+        assert_eq!(
+            copies[0].file_name().to_string_lossy(),
+            "2026-11-12_15-00-00_Работа.ogg"
+        );
+        assert!(
+            !Db::audio_path(&root, id).exists(),
+            "a finished take has no retry left"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 }

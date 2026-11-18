@@ -1557,6 +1557,26 @@ fn process_job(
 
     let samples = crate::telegram_media::decode_to_16k(&target)?;
     let seconds = samples.len() as f32 / crate::telegram_media::TARGET_RATE as f32;
+    // The downloaded file is temporary and goes away with the job; the user's
+    // copy is written now, so it exists even when the transcription fails.
+    let label = format!("{}_{}", job.kind, job.message_id);
+    let recording = crate::audio_save::Recording {
+        origin: crate::audio_save::Origin::Telegram,
+        account: &job.sender,
+        label: &label,
+        at: if job.original_at.trim().is_empty() {
+            &job.received_at
+        } else {
+            &job.original_at
+        },
+    };
+    let save_config = shared.lock().config.clone();
+    if let Err(e) = crate::audio_save::save_samples(&save_config, &recording, &samples) {
+        crate::log::log(&format!(
+            "telegram: cannot save a copy of update {}: {e:#}",
+            job.update_id
+        ));
+    }
     {
         let mut state = state.lock().unwrap();
         if let Some(current) = state.current.as_mut() {

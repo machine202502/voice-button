@@ -171,6 +171,13 @@ pub struct Config {
     /// Custom folder/file for Telegram when `telegram_model` is `custom`.
     #[serde(default)]
     pub telegram_model_folder: Option<String>,
+    /// Keep a compressed copy of every recording. Off until the user asks for
+    /// it, so the app does not write files nobody wants.
+    #[serde(default)]
+    pub save_recordings: bool,
+    /// Where the copies go; empty means `Music/VoiceButton`.
+    #[serde(default)]
+    pub save_recordings_dir: String,
 }
 
 /// Shortcuts start unbound: the user picks them in Settings.
@@ -330,6 +337,8 @@ impl Default for Config {
             phone_model_folder: None,
             telegram_model: String::new(),
             telegram_model_folder: None,
+            save_recordings: false,
+            save_recordings_dir: String::new(),
         }
     }
 }

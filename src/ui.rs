@@ -149,6 +149,10 @@ pub fn run_from_args() {
         // theme: the walk below forces dark and switches to light only for the
         // two review frames.
         cfg.theme = Theme::Dark;
+        // The save section is part of the Settings shot, and a committed image
+        // must not contain the developer's own Music path.
+        cfg.save_recordings = true;
+        cfg.save_recordings_dir = r"C:\Users\User\Music\VoiceButton".to_string();
         history = state::History::from_entries(vec![
             state::HistoryEntry {
                 at: "2026-11-05 09:14:32".to_string(),
@@ -1507,6 +1511,46 @@ fn settings_body(ui: &mut egui::Ui, data: &mut Data, dirs: &AppDirs) {
     ui.label(
         RichText::new(tr(
             "After this many minutes without dictation the model is unloaded and the memory is given back; the next dictation loads it again. Zero keeps it always.",
+        ))
+        .weak(),
+    );
+    ui.separator();
+    ui.heading(tr("Recordings"));
+    if ui
+        .checkbox(
+            &mut data.config.save_recordings,
+            tr("Save a copy of every recording"),
+        )
+        .changed()
+    {
+        apply_settings(data, dirs);
+    }
+    let saved_folder = crate::audio_save::folder(&data.config);
+    ui.label(
+        RichText::new(saved_folder.display().to_string())
+            .monospace()
+            .weak(),
+    );
+    ui.horizontal(|ui| {
+        if ui.button(tr("Choose folder...")).clicked() {
+            if let Some(path) = rfd::FileDialog::new()
+                .set_title(tr("Choose the folder for saved recordings"))
+                .pick_folder()
+            {
+                data.config.save_recordings_dir = path.display().to_string();
+                apply_settings(data, dirs);
+            }
+        }
+        if ui.button(tr("Open folder")).clicked() {
+            let _ = std::fs::create_dir_all(&saved_folder);
+            let _ = std::process::Command::new("explorer")
+                .arg(&saved_folder)
+                .spawn();
+        }
+    });
+    ui.label(
+        RichText::new(tr(
+            "Every recording - the microphone, an imported file, the API, the phone and Telegram - is copied here as a small Ogg/Opus file. The original stays where it is.",
         ))
         .weak(),
     );

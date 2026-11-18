@@ -846,7 +846,37 @@ fn start_recovery(
                             message: None,
                         };
                         match voice_button::history::append(&dirs.root, &entry) {
-                            Ok(row) => shared.lock().history.push_row(row),
+                            Ok(row) => {
+                                shared.lock().history.push_row(row);
+                                // The recovered words are in the history; the
+                                // user's copy of the audio is written too, if
+                                // the setting asks for it.
+                                let recording = voice_button::audio_save::Recording {
+                                    origin: match state.interactor {
+                                        InteractorKind::Server => {
+                                            voice_button::audio_save::Origin::Api
+                                        }
+                                        _ => voice_button::audio_save::Origin::User,
+                                    },
+                                    account: "",
+                                    label: "",
+                                    at: &state.started,
+                                };
+                                if cfg.save_recordings
+                                    && !voice_button::audio_save::already_saved(&cfg, &recording)
+                                {
+                                    if let Err(e) = voice_button::audio_save::save_wav(
+                                        &cfg,
+                                        &recording,
+                                        &session::audio_path(&dir),
+                                    ) {
+                                        log::log(&format!(
+                                            "recovery: cannot save a copy of {}: {e:#}",
+                                            dir.display()
+                                        ));
+                                    }
+                                }
+                            }
                             Err(e) => {
                                 log::log(&format!("recovery: cannot save the text: {e:#}"));
                                 continue;

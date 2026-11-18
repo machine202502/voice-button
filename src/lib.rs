@@ -3,6 +3,7 @@ pub mod asr;
 pub mod asr_worker;
 pub mod asr_engine;
 pub mod audio;
+pub mod audio_save;
 pub mod autostart;
 pub mod calendar;
 pub mod config;

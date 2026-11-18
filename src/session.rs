@@ -536,6 +536,26 @@ fn run(
     persisted.seconds = seconds;
     persisted.done = true;
     write_state(&dir, &persisted);
+    // A copy for the user, if they asked for one. The recording directory is
+    // the app's own working copy and is cleaned up below; the saved file is
+    // what stays.
+    let recording = crate::audio_save::Recording {
+        origin: match start.interactor.kind {
+            InteractorKind::Server => crate::audio_save::Origin::Api,
+            _ => crate::audio_save::Origin::User,
+        },
+        account: "",
+        label: "",
+        at: &persisted.started,
+    };
+    if let Err(e) =
+        crate::audio_save::save_wav(&shared.lock().config, &recording, &audio_path(&dir))
+    {
+        log::log(&format!(
+            "session {}: cannot save a copy of the recording: {e:#}",
+            start.id
+        ));
+    }
     let text = stitcher.text();
     log::log(&format!(
         "session {} finished: {:.2}s audio, {} chars, {} failed segments",
@@ -762,13 +782,40 @@ fn run_file(
         .and_then(|name| name.to_str())
         .unwrap_or("audio")
         .to_string();
-    let (limit, sensitivity, model_label) = {
+    // The copy is named after the moment the import started, like a dictation.
+    let started_at = chrono::Local::now()
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    let (limit, sensitivity, model_label, save_config) = {
         let data = shared.lock();
         (
             transcribe::limit_for_config(&data.config),
             data.config.vad_sensitivity,
             transcribe::selected_id(&data.config),
+            data.config.clone(),
         )
+    };
+    // The imported file stays where it is. When the user asks for saved copies,
+    // one is encoded while the file is decoded: a long recording never has to
+    // fit in memory twice.
+    let export_path = recordings_dir(&dirs.root).join(format!(
+        "export-{}-{}.wav",
+        std::process::id(),
+        chrono::Local::now().format("%Y%m%d-%H%M%S")
+    ));
+    let mut export = if save_config.save_recordings {
+        match WavWriter::create(&export_path, SAMPLE_RATE) {
+            Ok(writer) => Some(writer),
+            Err(e) => {
+                log::log(&format!(
+                    "file {}: cannot prepare the saved copy: {e:#}",
+                    path.display()
+                ));
+                None
+            }
+        }
+    } else {
+        None
     };
     let total = crate::decode::probe(&path)
         .ok()
@@ -807,6 +854,14 @@ fn run_file(
             return;
         }
         seconds += samples.len() as f64 / SAMPLE_RATE as f64;
+        if let Some(wav) = export.as_mut() {
+            if let Err(e) = wav.write(samples) {
+                log::log(&format!(
+                    "file {}: cannot write the saved copy: {e:#}",
+                    path.display()
+                ));
+            }
+        }
         for segment in segmenter.push(samples) {
             if degraded {
                 continue;
@@ -834,6 +889,10 @@ fn run_file(
     });
 
     if cancelled.load(Ordering::SeqCst) {
+        if let Some(wav) = export.take() {
+            drop(wav);
+            let _ = std::fs::remove_file(&export_path);
+        }
         snapshot.running = false;
         snapshot.cancelled = true;
         snapshot.text = stitcher.text();
@@ -843,6 +902,10 @@ fn run_file(
         return;
     }
     if let Err(e) = result {
+        if let Some(wav) = export.take() {
+            drop(wav);
+            let _ = std::fs::remove_file(&export_path);
+        }
         let message = crate::i18n::trf(
             "Could not read the file: {error}",
             &[("error", &format!("{e:#}"))],
@@ -860,6 +923,34 @@ fn run_file(
         if !degraded && !decode_file_segment(&asr, &tail, &mut stitcher) {
             failed += 1;
         }
+    }
+    // The file was fully read: the saved copy can be finished now. Its name
+    // keeps the original file's name, so the folder reads like the user's own.
+    if let Some(wav) = export.take() {
+        if let Err(e) = wav.finish() {
+            log::log(&format!(
+                "file {}: cannot close the saved copy: {e:#}",
+                path.display()
+            ));
+        }
+        let label = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("audio")
+            .to_string();
+        let recording = crate::audio_save::Recording {
+            origin: crate::audio_save::Origin::File,
+            account: "",
+            label: &label,
+            at: &started_at,
+        };
+        if let Err(e) = crate::audio_save::save_wav(&save_config, &recording, &export_path) {
+            log::log(&format!(
+                "file {}: cannot save a copy: {e:#}",
+                path.display()
+            ));
+        }
+        let _ = std::fs::remove_file(&export_path);
     }
     let text = stitcher.text();
     snapshot.running = false;
@@ -1537,6 +1628,52 @@ mod tests {
                 "every segment, including the flushed tail, reaches the engine"
             );
             let _ = std::fs::remove_dir_all(&dirs.root);
+        }
+
+        /// The take is over: the user asked for a copy, so one appears in the
+        /// folder that belongs to where the take came from.
+        #[test]
+        fn a_finished_take_leaves_a_saved_copy() {
+            let saved = std::env::temp_dir().join(format!(
+                "voice-button-saved-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&saved);
+            let shared = Arc::new(Shared::new(
+                Config::default(),
+                History::from_entries(Vec::new()),
+            ));
+            {
+                let mut data = shared.lock();
+                data.status = Status::Idle;
+                data.config.save_recordings = true;
+                data.config.save_recordings_dir = saved.display().to_string();
+            }
+            let dirs = temp_dirs("saved-copy");
+            let (events, events_rx) = mpsc::channel();
+            let handle = start(
+                shared.clone(),
+                dirs.clone(),
+                events,
+                Arc::new(Counting {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                }),
+                session_start(21, Arc::new(Mutex::new(loud(1.0))), SessionMode::Live),
+            )
+            .expect("start the live session");
+            handle.stop();
+            let event = events_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the session must finish");
+            assert!(matches!(event, AppEvent::Transcribed { .. }));
+            let copies: Vec<_> = std::fs::read_dir(saved.join("api"))
+                .expect("the api folder")
+                .flatten()
+                .collect();
+            assert_eq!(copies.len(), 1, "one take, one saved copy");
+            assert!(copies[0].file_name().to_string_lossy().ends_with(".ogg"));
+            let _ = std::fs::remove_dir_all(&dirs.root);
+            let _ = std::fs::remove_dir_all(&saved);
         }
 
         #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "voice-button"
-version = "0.7.3"
+version = "0.7.4"
 edition = "2021"
 description = "Offline voice-to-text in the Windows tray"
 license = "MIT"
@@ -46,6 +46,11 @@ winit = "0.29"
 image = { version = "0.25", default-features = false, features = ["png"] }
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging", "Win32_Media_Audio", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm", "Win32_Storage_Xps", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_Globalization"] }
 sherpa-onnx = { version = "2", default-features = false, features = ["shared"] }
+# A saved copy of a recording is Opus in an Ogg container: the smallest format
+# that keeps speech clean, and both halves are BSD/MIT. The decoder side is the
+# 0.6 Symphonia line the Telegram bot already uses.
+opus = "0.4"
+ogg = "0.9"
 # Telegram voice notes are Ogg/Opus. Symphonia 0.5 has neither, so the bot uses
 # the 0.6 line with the pure-Rust Opus decoder; the rest of the app keeps 0.5.
 symphonia06 = { package = "symphonia", version = "0.6.1", features = ["ogg", "mkv", "mp3", "aac", "isomp4", "alac"] }

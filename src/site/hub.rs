@@ -38,6 +38,8 @@ pub trait Cutter {
 /// from the app's settings, so the runtime passes this factory in.
 pub type CutterFactory = Box<dyn Fn() -> Box<dyn Cutter + Send> + Send + Sync>;
 
+pub type Completed = Arc<dyn Fn(u64) + Send + Sync>;
+
 pub struct Hub {
     pub db: Arc<Mutex<Db>>,
     pub queue: Mutex<Queue>,
@@ -46,6 +48,9 @@ pub struct Hub {
     /// `None` when the hub was built without the app's settings: a retry then
     /// falls back to the old empty-job behaviour instead of panicking.
     cutter_factory: Option<CutterFactory>,
+    /// Called with the message id when a take becomes final, just before its
+    /// raw audio is deleted. The phone layer uses it to save the user's copy.
+    completed: Mutex<Option<Completed>>,
 }
 
 impl Hub {
@@ -58,12 +63,19 @@ impl Hub {
         Self::build(db, Some(factory))
     }
 
+    /// Watch the moment a take becomes final. The callback runs while the raw
+    /// audio is still on disk, exactly once per take.
+    pub fn on_complete(&self, callback: Completed) {
+        *self.completed.lock().unwrap() = Some(callback);
+    }
+
     fn build(db: Arc<Mutex<Db>>, cutter_factory: Option<CutterFactory>) -> Self {
         Self {
             db,
             queue: Mutex::new(Queue::default()),
             cutters: Mutex::new(HashMap::new()),
             cutter_factory,
+            completed: Mutex::new(None),
         }
     }
 
@@ -97,7 +109,11 @@ impl Hub {
         decoder: &mut dyn super::queue::Decoder,
     ) -> Did {
         let mut queue = self.queue.lock().unwrap();
-        let mut sink = DbSink { db: &self.db };
+        let completed = self.completed.lock().unwrap().clone();
+        let mut sink = DbSink {
+            db: &self.db,
+            completed: completed.as_deref(),
+        };
         queue.tick(now, model_ready, engine_busy, decoder, &mut sink)
     }
 
@@ -198,7 +214,11 @@ impl Hub {
         }
         // The queue owns the stage: walk to `queued` through the sink instead
         // of writing it behind the queue's back.
-        DbSink { db: &self.db }.advance(id, Stage::Queued);
+        DbSink {
+            db: &self.db,
+            completed: None,
+        }
+        .advance(id, Stage::Queued);
         let mut queue = self.queue.lock().unwrap();
         queue.open(id, done, text, now);
         for segment in segments {
@@ -311,7 +331,10 @@ impl Engine for Hub {
 
     fn cancel(&self, id: u64) {
         self.cutters.lock().unwrap().remove(&id);
-        let mut sink = DbSink { db: &self.db };
+        let mut sink = DbSink {
+            db: &self.db,
+            completed: None,
+        };
         self.queue.lock().unwrap().cancel(id, &mut sink);
         // A cancelled message can never be retried, so its audio is dead
         // weight. Best effort: a leftover file is not a reason to fail.
@@ -345,6 +368,8 @@ fn discard_audio(db: &Mutex<Db>, id: u64) {
 /// The queue writes results here, and only here.
 struct DbSink<'a> {
     db: &'a Mutex<Db>,
+    /// Called when a take becomes final, before its raw audio is deleted.
+    completed: Option<&'a (dyn Fn(u64) + Send + Sync)>,
 }
 
 impl DbSink<'_> {
@@ -414,15 +439,25 @@ impl Sink for DbSink<'_> {
             let _ = db.save();
         }
         self.advance(id, Stage::Done);
-        // The text is final: nothing can be retried any more.
+        // The take is final. The app layer gets its chance to save a copy while
+        // the raw audio is still here; then the file goes, because a finished
+        // take has no retry left.
+        if let Some(completed) = self.completed {
+            completed(id);
+        }
         discard_audio(self.db, id);
     }
 
     fn settle(&mut self, id: u64, stage: Stage) {
         self.advance(id, stage);
         if stage == Stage::Silent {
-            // Silence is final too. `Failed` and `NoModel` keep the file: those
-            // are exactly the stages a retry may come from.
+            // Silence is final too, and the take is still the person's audio:
+            // the app layer gets its chance to save a copy before the file goes.
+            if let Some(completed) = self.completed {
+                completed(id);
+            }
+            // `Failed` and `NoModel` keep the file: those are exactly the
+            // stages a retry may come from.
             discard_audio(self.db, id);
         }
     }
@@ -628,7 +663,10 @@ mod tests {
         // The first chunk makes the message `uploading`; the silence timeout
         // then starts a decode before the page sends `finish`.
         hub.audio(id, &vec![0u8; 32_000]);
-        let mut sink = DbSink { db: &hub.db };
+        let mut sink = DbSink {
+            db: &hub.db,
+            completed: None,
+        };
         sink.progress(id, " текст", 1);
         assert_eq!(
             hub.db.lock().unwrap().message(id).unwrap().stage,
@@ -838,7 +876,10 @@ mod tests {
         assert!(db.set_stage(silent.id, Stage::Uploading));
         db.save().unwrap();
         let db = Mutex::new(Db::open(&root).unwrap());
-        let mut sink = DbSink { db: &db };
+        let mut sink = DbSink {
+            db: &db,
+            completed: None,
+        };
         sink.advance(done.id, Stage::Done);
         sink.settle(silent.id, Stage::Silent);
         let db = db.lock().unwrap();
