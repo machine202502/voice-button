@@ -321,24 +321,35 @@ Remove-Item Env:VB_SNAPSHOT
 
 ## Packages
 
-With Inno Setup 6 installed:
+Packaging needs the .NET 8 SDK and the `vpk` tool:
 
 ```powershell
+dotnet tool install --global vpk
 ./scripts/package.ps1
 ```
 
 This creates both release forms in `tmp/dist/`:
 
 - `voice-button-VERSION-windows-x64.zip` — portable, run `voice-button.exe`.
-- `voice-button-VERSION-windows-x64-setup.exe` — installer for all users.
+- `voice-button-VERSION-windows-x64-setup.msi` — installer for the current
+  user, with the standard Windows Installer wizard.
 
 Both packages contain the two executables, `LICENSE`, `NOTICE`, `AISOFTWARE`,
 and `THIRD-PARTY.txt`. The portable zip also carries the Visual C++ runtime
-DLLs and the Vulkan loader, so it runs on a clean machine. The installer runs
-`vc_redist.x64.exe` silently during setup and installs the same DLLs app-local.
-`scripts/publish.ps1` attaches them to a GitHub release using the authenticated
-GitHub CLI; it is the one caller that writes to `dist/` instead, so the release
-workflow keeps its own layout next to the checkout.
+DLLs and the Vulkan loader, so it runs on a clean machine. The installer ships
+the same DLLs app-local and installs the built-in updater; there is no
+administrator prompt.
+
+`scripts\package.ps1` also writes the Velopack feed to `site\updates\`.
+`scripts/publish.ps1` attaches the portable zip, MSI, feed, and `.nupkg` assets
+to a GitHub release using the authenticated GitHub CLI; it is the one caller
+that writes to `dist/` instead, so the release workflow keeps its own layout
+next to the checkout.
+
+The installed app checks `https://machine202502.github.io/voice-button/updates`
+when About opens. Uninstall an MSI through **Settings → Apps** or `msiexec /x`;
+deleting the folder and using `Update.exe --uninstall` leaves MSI registration
+behind. Existing Inno Setup installs must install 0.8.1 once manually.
 
 CI tests pushes and pull requests. A version change in `Cargo.toml` on `master`
 publishes a release. The static site in `site/` deploys to GitHub Pages and

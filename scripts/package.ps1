@@ -1,4 +1,4 @@
-# Build both executables and create portable ZIP + Inno Setup installer in dist/.
+# Build both executables and create portable ZIP + Velopack MSI installer.
 param([string]$Version)
 
 function Test-ShippedOnWindowsX64 {
@@ -232,16 +232,45 @@ if ($MyInvocation.InvocationName -ne '.') {
     Copy-Item (Join-Path $Root 'assets\CREDITS.md') (Join-Path $stage 'CREDITS.md')
     Copy-Item $thirdParty (Join-Path $stage 'THIRD-PARTY.txt')
     Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $portable
-    Remove-Item $stage -Recurse -Force
     Write-Host "Portable: $portable"
 
-    $iscc = @(
-        "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe",
-        "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
-        "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
-    ) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
-    if (-not $iscc) { throw 'Inno Setup 6 (ISCC.exe) was not found' }
-    & $iscc "/DAppVersion=$Version" "/DSourceDir=$TargetDir\release" "/DRedistDir=$redistDir" "/DThirdParty=$thirdParty" "/DOutDir=$dist" (Join-Path $Root 'installer\voice-button.iss')
-    if ($LASTEXITCODE -ne 0) { throw 'ISCC failed' }
-    Write-Host "Installer: $dist\voice-button-$Version-windows-x64-setup.exe"
+    $vpk = Get-Command vpk -ErrorAction SilentlyContinue
+    if (-not $vpk) { throw 'vpk was not found; install it with: dotnet tool install --global vpk' }
+    $velopack = Join-Path $dist 'velopack'
+    if (Test-Path $velopack) { Remove-Item $velopack -Recurse -Force }
+    New-Item -ItemType Directory -Force -Path $velopack | Out-Null
+
+    & $vpk.Source pack `
+        --packId VoiceButtonApp `
+        --packVersion $Version `
+        --packDir $stage `
+        --runtime win-x64 `
+        --mainExe voice-button.exe `
+        --packTitle "Voice Button" `
+        --packAuthors "machine202502" `
+        --icon (Join-Path $Root 'assets\icon.ico') `
+        --instLocation PerUser `
+        --msi `
+        --instWelcome (Join-Path $Root 'installer\welcome.txt') `
+        --outputDir $velopack
+    if ($LASTEXITCODE -ne 0) { throw 'vpk pack failed' }
+
+    $velopackMsi = Get-ChildItem -Path $velopack -Filter '*.msi' | Select-Object -First 1
+    if (-not $velopackMsi) { throw "Velopack MSI installer was not produced in $velopack" }
+    $setup = Join-Path $dist "voice-button-$Version-windows-x64-setup.msi"
+    Copy-Item $velopackMsi.FullName $setup -Force
+    $oldSetup = Join-Path $dist "voice-button-$Version-windows-x64-setup.exe"
+    if (Test-Path $oldSetup) { Remove-Item $oldSetup -Force }
+
+    $feed = Join-Path $velopack 'releases.win.json'
+    if (-not (Test-Path $feed)) { throw "Velopack feed was not produced: $feed" }
+    $siteUpdates = Join-Path $Root 'site\updates'
+    New-Item -ItemType Directory -Force -Path $siteUpdates | Out-Null
+    Get-ChildItem -Path $siteUpdates -Filter '*.nupkg' -ErrorAction SilentlyContinue | Remove-Item -Force
+    Copy-Item $feed (Join-Path $siteUpdates 'releases.win.json') -Force
+    Get-ChildItem -Path $velopack -Filter '*.nupkg' | Copy-Item -Destination $siteUpdates -Force
+
+    Remove-Item $stage -Recurse -Force
+    Write-Host "Installer: $setup"
+    Write-Host "Feed: $(Join-Path $siteUpdates 'releases.win.json')"
 }

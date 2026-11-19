@@ -38,7 +38,6 @@ jobs:
           fi
           tag=$(cat /tmp/tag.txt)
           version=${tag#v}
-          echo "version=$version" >> "$GITHUB_OUTPUT"
           mkdir -p /tmp/voice-button-release
           cd /tmp/voice-button-release
           asset() {
@@ -60,7 +59,21 @@ jobs:
             echo "${key}_size=$size" >> "$GITHUB_OUTPUT"
           }
           fill_asset 'windows-x64.zip' zip
-          fill_asset '-setup.exe' setup
+          if [ -z "$(asset '-setup.msi' name)" ]; then
+            echo "Release $tag has no MSI asset yet; deploying placeholders."
+            echo "version=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          fill_asset '-setup.msi' setup
+
+          mkdir -p "$GITHUB_WORKSPACE/site/updates"
+          gh release download "$tag" --repo "$GITHUB_REPOSITORY" \
+            --pattern 'releases.win.json' \
+            --dir "$GITHUB_WORKSPACE/site/updates" --clobber
+          gh release download "$tag" --repo "$GITHUB_REPOSITORY" \
+            --pattern '*.nupkg' \
+            --dir "$GITHUB_WORKSPACE/site/updates" --clobber
       - name: Fill release data into the site
         if: steps.release.outputs.version != ''
         run: |

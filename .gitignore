@@ -21,3 +21,5 @@ src/web.new/
 
 # The phone page is built from web/ into src/web, which the daemon serves.
 src/web/
+/site/updates/
+/.tools/

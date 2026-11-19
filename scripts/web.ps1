@@ -77,11 +77,20 @@ if (-not $pnpmMjs -and -not $pnpmExe) {
 
 function Invoke-Pnpm {
     param([string[]]$PnpmArgs)
-    if ($pnpmMjs) {
-        & $nodeExe $pnpmMjs @PnpmArgs
+    # pnpm writes its own banner to stderr even on success; with the script's
+    # Stop preference PowerShell would turn that into a terminating error.
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        if ($pnpmMjs) {
+            & $nodeExe $pnpmMjs @PnpmArgs
+        }
+        else {
+            & $pnpmExe @PnpmArgs
+        }
     }
-    else {
-        & $pnpmExe @PnpmArgs
+    finally {
+        $ErrorActionPreference = $previous
     }
 }
 

@@ -1,6 +1,6 @@
 [package]
 name = "voice-button"
-version = "0.7.4"
+version = "0.8.1"
 edition = "2021"
 description = "Offline voice-to-text in the Windows tray"
 license = "MIT"
@@ -66,6 +66,7 @@ if-addrs = "0.13"
 getrandom = "0.2"
 qrcode = { version = "0.14", default-features = false }
 resvg = { version = "0.50.0", default-features = false, features = ["text", "system-fonts"] }
+velopack = "1.2.161"
 
 [build-dependencies]
 winresource = "0.1"

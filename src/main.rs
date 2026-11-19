@@ -1998,6 +1998,7 @@ fn main() {
             .unwrap_or(1);
         std::process::exit(code);
     }
+    voice_button::update::init();
     run_daemon();
 }
 

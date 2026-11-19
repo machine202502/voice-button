@@ -68,8 +68,14 @@ jobs:
           cache: true
       - name: Test
         run: cargo test --release --lib --bins
-      - name: Install Inno Setup
-        run: choco install innosetup --yes --no-progress
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - name: Install Velopack
+        shell: pwsh
+        run: |
+          dotnet tool install --global vpk
+          "$env:USERPROFILE\.dotnet\tools" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
       # scripts/web.ps1 builds the phone page and needs pnpm; the Windows runner
       # ships Node and npm, not pnpm, and the release used to die there.
       - name: Install pnpm

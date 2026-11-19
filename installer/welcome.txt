@@ -1,0 +1,1 @@
+Voice Button installs for the current user and can update itself from the About window.

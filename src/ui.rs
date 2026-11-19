@@ -372,6 +372,7 @@ fn run_ui(config: config::Config, history: state::History, dirs: AppDirs, tab: S
             ExternalTab::LocalServer
         },
         show_about: false,
+        about_was_open: false,
         expanded_history: None,
         history_filter: saved_source_filter,
         history_range: saved_history_range,
@@ -611,6 +612,7 @@ pub struct MainWindow {
     tab: Tab,
     external_tab: ExternalTab,
     show_about: bool,
+    about_was_open: bool,
     expanded_history: Option<usize>,
     history_filter: HistoryFilter,
     /// The same date choices as the other lists. The history opens on everything,
@@ -665,6 +667,10 @@ impl eframe::App for MainWindow {
         // Keep the UI fresh (e.g. download progress) between events.
         ctx.request_repaint_after(Duration::from_millis(250));
         self.refresh_pages();
+        if self.show_about && !self.about_was_open {
+            crate::update::check();
+        }
+        self.about_was_open = self.show_about;
         if self.tab == Tab::External
             && self.external_tab == ExternalTab::Telegram
             && self
@@ -4287,11 +4293,45 @@ fn show_about_modal(
                     "https://github.com/machine202502/voice-button",
                 );
                 ui.separator();
-                if ui.button(tr("Open log folder")).clicked() {
-                    let _ = std::process::Command::new("explorer")
-                        .arg(&dirs.root)
-                        .spawn();
-                }
+                ui.horizontal(|ui| {
+                    if ui.button(tr("Open log folder")).clicked() {
+                        let _ = std::process::Command::new("explorer")
+                            .arg(&dirs.root)
+                            .spawn();
+                    }
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            let update = crate::update::state();
+                            let (label, enabled, success) = match update {
+                                crate::update::UpdateState::Available => {
+                                    (tr("Update"), true, true)
+                                }
+                                crate::update::UpdateState::Downloading(percent) => (
+                                    trf(
+                                        "Downloading {percent}%",
+                                        &[("percent", &percent.to_string())],
+                                    ),
+                                    false,
+                                    false,
+                                ),
+                                crate::update::UpdateState::Installing => {
+                                    (tr("Installing…"), false, false)
+                                }
+                                _ => (tr("Update"), false, false),
+                            };
+                            let text = egui::RichText::new(label)
+                                .color(if success { p.bg } else { p.ink });
+                            let mut button = egui::Button::new(text);
+                            if success {
+                                button = button.fill(p.success);
+                            }
+                            if ui.add_enabled(enabled, button).clicked() {
+                                crate::update::install();
+                            }
+                        },
+                    );
+                });
             });
         });
     if close || close_clicked {
