@@ -439,6 +439,80 @@ describe('archiving', () => {
     ).toBe('Новое');
     expect((await cache.overrides()).find((override) => override.kind === 'monolog')?.id).toBe(42);
   });
+
+  it('does not bring back a monolog made on the phone after it is archived', async () => {
+    const cache = cacheWith();
+    const local = await cache.allocate('Голосом');
+    await cache.mapLocal(local.id, 10);
+    // The computer has it and the phone has cached its row.
+    await cache.putServerMonologs([{ id: 10, name: 'Голосом' }], false);
+    await cache.applyArchive({ id: 10 }, true);
+    // The computer accepted the archive: the override is gone and the row says
+    // archived. The local copy that became this monolog must not draw it again.
+    await cache.commitArchive(10, true);
+    expect((await cache.monologPage(false, 0, 100)).monologs.some((m) => m.id === 10)).toBe(false);
+    expect((await cache.monologPage(true, 0, 100)).monologs.filter((m) => m.id === 10)).toHaveLength(
+      1,
+    );
+    // The negative id a take recorded before the mapping still resolves.
+    expect(await cache.serverId(local.id)).toBe(10);
+  });
+
+  it('does not bring back a monolog made on the phone after it is deleted', async () => {
+    const cache = cacheWith();
+    const local = await cache.allocate('Удалённое');
+    await cache.mapLocal(local.id, 13);
+    await cache.putServerMonologs([{ id: 13, name: 'Удалённое' }], false);
+    await cache.applyDeleteMonolog({ id: 13 });
+    await cache.deleteMonolog(13);
+    expect((await cache.monologPage(false, 0, 100)).monologs.some((m) => m.id === 13)).toBe(false);
+    expect(await cache.serverId(local.id)).toBe(13);
+  });
+
+  it('does not bring back a monolog the computer stopped listing', async () => {
+    const cache = cacheWith();
+    const local = await cache.allocate('Ушло');
+    await cache.mapLocal(local.id, 14);
+    await cache.putServerMonologs([{ id: 14, name: 'Ушло' }], false);
+    // A complete open page without it: the monolog was deleted elsewhere.
+    await cache.putServerMonologs([], false, { complete: true });
+    expect((await cache.monologPage(false, 0, 100)).monologs.some((m) => m.id === 14)).toBe(false);
+  });
+
+  it('hides a monolog archived before its server row was cached', async () => {
+    const cache = cacheWith();
+    const local = await cache.allocate('Архив раньше');
+    await cache.mapLocal(local.id, 15);
+    await cache.applyArchive({ id: 15 }, true);
+    await cache.commitArchive(15, true);
+    expect((await cache.monologPage(false, 0, 100)).monologs.some((m) => m.id === 15)).toBe(false);
+    expect(await cache.serverId(local.id)).toBe(15);
+  });
+
+  it('keeps a monolog made on the phone until the computer lists it, then one copy', async () => {
+    const cache = cacheWith();
+    const local = await cache.allocate('Черновик');
+    await cache.mapLocal(local.id, 11);
+    // No server row yet: the local copy is the only one there is.
+    expect(
+      (await cache.monologPage(false, 0, 100)).monologs.filter((m) => m.id === 11),
+    ).toHaveLength(1);
+    await cache.putServerMonologs([{ id: 11, name: 'Черновик' }], false);
+    expect(
+      (await cache.monologPage(false, 0, 100)).monologs.filter((m) => m.id === 11),
+    ).toHaveLength(1);
+  });
+
+  it('hides a local copy whose server row was cached before the rule existed', async () => {
+    const monologs = bag<Monolog>();
+    const cache = cacheWith(monologs);
+    const local = await cache.allocate('Старое');
+    await cache.mapLocal(local.id, 12);
+    // A row cached by an older build, with no `retired` flag on the local copy.
+    await monologs.put(12, { id: 12, name: 'Старое', archived: true });
+    expect((await cache.monologPage(false, 0, 100)).monologs.some((m) => m.id === 12)).toBe(false);
+    expect((await cache.monologPage(true, 0, 100)).monologs.some((m) => m.id === 12)).toBe(true);
+  });
 });
 
 describe('an edit', () => {

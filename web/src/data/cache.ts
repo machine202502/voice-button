@@ -261,6 +261,29 @@ export function createCache({
     return record;
   }
 
+  /**
+   * A server monolog is the truth now: the local record that became it must
+   * never be drawn as a monolog again.
+   *
+   * The record itself stays, because a take recorded before the mapping still
+   * carries the negative id and `serverId` is how the sync loop resolves it.
+   * Without this, an archived monolog made on the phone came back to the open
+   * list: the override that hid the local copy was dropped when the computer
+   * accepted the change, and the local record — still archived=false — was
+   * merged into the open view again.
+   */
+  async function retireLocalMonologs(serverIds: ReadonlySet<number>): Promise<void> {
+    if (serverIds.size === 0) return;
+    for (const key of await monologs.keys()) {
+      const id = Number(key);
+      if (!Number.isFinite(id) || id >= 0) continue;
+      const record = await monologs.get(key);
+      if (!record || record.retired === true || record.serverId == null) continue;
+      if (!serverIds.has(Number(record.serverId))) continue;
+      await monologs.put(key, { ...record, retired: true });
+    }
+  }
+
   /** The row with the phone's own changes laid over it, or null if deleted. */
   async function withMessageRow(message: Message): Promise<Message | null> {
     return withMessageOverride(message, await findOverride('message', message.id));
@@ -320,6 +343,13 @@ export function createCache({
         if (!record) continue;
         const server = record.serverId == null ? null : Number(record.serverId);
         const serverId = server !== null && Number.isFinite(server) ? server : null;
+        // The computer has this monolog: its own row is the truth, whichever
+        // list that row belongs to. A record retired here, or one cached
+        // before retirement existed, must not be drawn as a second monolog.
+        if (serverId !== null) {
+          if (record.retired === true) continue;
+          if ((await monologs.get(serverId)) !== undefined) continue;
+        }
         // A monolog that got a server id keeps its override under that id: the
         // sync loop moves it when the mapping is stored, and the mapped row is
         // still drawn here until the server list contains it.
@@ -458,6 +488,8 @@ export function createCache({
         if (!Number.isFinite(id) || id < 0) continue;
         incoming.set(id, monolog);
       }
+      /** Server rows this page proved are no longer in the view. */
+      const gone = new Set<number>();
       if (complete) {
         for (const key of await monologs.keys()) {
           const id = Number(key);
@@ -468,7 +500,12 @@ export function createCache({
           // The archive state is the phone's promise until the computer accepts
           // it: a complete page of the other view says nothing about this row.
           if (override && typeof override.archived === 'boolean') continue;
-          if (Boolean(record.archived) === Boolean(archived)) await monologs.remove(key);
+          if (Boolean(record.archived) === Boolean(archived)) {
+            await monologs.remove(key);
+            // A server row this view no longer lists is gone for good (deleted,
+            // or moved to the other view): its local record must not surface.
+            gone.add(id);
+          }
         }
       }
       for (const [id, monolog] of incoming) {
@@ -485,6 +522,9 @@ export function createCache({
             : {}),
         });
       }
+      // The rows just cached — and the ones this page proved gone — are the
+      // truth now; the local monologs that became them are only id mappings.
+      await retireLocalMonologs(new Set([...incoming.keys(), ...gone]));
     },
 
     /**
@@ -589,6 +629,9 @@ export function createCache({
     async deleteMonolog(monologId: number): Promise<void> {
       const monolog = Number(monologId);
       if (!Number.isFinite(monolog)) return;
+      // The computer has no such monolog any more: a local record that became
+      // it must not be drawn again as a monolog of its own.
+      await retireLocalMonologs(new Set([monolog]));
       const ids = await messages.ids(monolog);
       // The server can reuse an id after deleting the last monolog, so its
       // cached feed must not become the new monolog's feed.
@@ -634,6 +677,9 @@ export function createCache({
       if (found) {
         await monologs.put(found.key, { ...found.record, archived: Boolean(archived) });
       }
+      // An archived monolog must leave the open list even when its server row
+      // has not been cached yet: the local copy that became it must not linger.
+      if (archived) await retireLocalMonologs(new Set([Number(monologId)]));
       await this.clearOverride('monolog', monologId);
     },
 

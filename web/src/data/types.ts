@@ -79,6 +79,12 @@ export interface LocalMonolog extends Monolog {
   localId: number;
   local: true;
   serverId: number | null;
+  /**
+   * The computer has this monolog now, so its server row is the only copy the
+   * list may draw. The local record stays behind as the id a take recorded
+   * before the mapping still carries; it is never a row again.
+   */
+  retired?: boolean;
 }
 
 /** One recording in the outbox, before the computer has all of it. */
