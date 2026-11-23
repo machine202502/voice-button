@@ -196,7 +196,7 @@ fn a_live_session_writes_the_audio_and_reports_the_text() {
     use std::sync::{mpsc, Arc, Mutex};
     use voice_button::config::{AppDirs, Config};
     use voice_button::history::History;
-    use voice_button::session::{self, SessionStart};
+    use voice_button::session::{self, SessionMode, SessionStart};
     use voice_button::state::{AppEvent, Interactor, ModelChoice, Shared};
 
     let (samples, _) = load_audio();
@@ -221,6 +221,10 @@ fn a_live_session_writes_the_audio_and_reports_the_text() {
         paste_target: None,
         clipboard: true,
         buffer: buffer.clone(),
+        // The owner's own dictation: a live take, finished by `stop`, with no
+        // time budget for the tail.
+        mode: SessionMode::Live,
+        tail_budget: None,
     };
     let client = Arc::new(voice_button::asr_engine::Engine::new(exe));
     let handle = session::start(shared, dirs, events, client, start).expect("start the session");
@@ -288,11 +292,15 @@ fn the_api_server_transcribes_the_recording_over_http() {
     let mut cfg = Config::default();
     cfg.backend = Backend::Onnx;
     cfg.onnx_model = "gigaam-v3-rnnt-punct".to_string();
-    let shared = Arc::new(Shared::new(cfg, History::from_entries(Vec::new())));
+    // The finished session is appended to the same database this history reads,
+    // and `row()` only knows rows the store can see. An inline history would
+    // count the pushed row but return nothing for it.
+    let shared = Arc::new(Shared::new(cfg, History::load(&root)));
     voice_button::daemon::install(voice_button::daemon::Runtime {
         buffer: Arc::new(Mutex::new(Vec::new())),
         asr: Arc::new(voice_button::asr_engine::Engine::new(exe)),
         session: Mutex::new(None),
+        lazy: Mutex::new(None),
         file: Mutex::new(None),
     });
 
@@ -395,7 +403,9 @@ fn the_api_server_transcribes_the_recording_over_http() {
     }
 
     let help = json(&format!("{base}/api/help"));
-    assert_eq!(help["helpVersion"], 1, "the help document changed shape");
+    // Pinned on purpose: a change to the document's shape must be announced by
+    // bumping `HELP_VERSION` in `src/api/help.rs`, and this line follows it.
+    assert_eq!(help["helpVersion"], 2, "the help document changed shape");
     let models = json(&format!("{base}/api/models"));
     assert!(
         models.as_array().map(|list| !list.is_empty()).unwrap_or(false),

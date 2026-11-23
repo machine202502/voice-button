@@ -213,7 +213,8 @@ struct ServiceItems {
 fn build_menu(telegram: bool, monologs: bool) -> (Menu, MenuIds, ServiceItems) {
     let menu = Menu::new();
     // Everything that was there stays, in this order: the last transcription
-    // first, the everyday actions, then the two services, the folder, quit.
+    // first, the everyday actions, the two services, then settings, the models
+    // folder and quit.
     let copy_last = MenuItem::new(tr("Copy last transcription"), true, None);
     let capture = MenuItem::new(tr("Capture"), true, None);
     let history = MenuItem::new(tr("History"), true, None);
@@ -227,9 +228,9 @@ fn build_menu(telegram: bool, monologs: bool) -> (Menu, MenuIds, ServiceItems) {
         &copy_last,
         &capture,
         &history,
-        &settings,
         &telegram_item,
         &monologs_item,
+        &settings,
         &open_folder,
         &separator,
         &quit,

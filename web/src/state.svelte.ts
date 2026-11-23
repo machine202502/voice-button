@@ -41,6 +41,7 @@ import { applyTheme, readTheme } from './lib/theme';
 import type { ThemeMode } from './lib/theme';
 import { version as pageVersion } from './lib/version';
 import { NoiseCleaner } from './lib/noise';
+import { resampleBlock } from './lib/resample';
 import { createEventStream } from './lib/events';
 import type { EventStream } from './lib/events';
 import { readToken } from './lib/token';
@@ -1661,7 +1662,12 @@ class Page {
     }, METER_MS);
 
     const processor = context.createScriptProcessor(4096, 1, 1);
-    const ratio = context.sampleRate / RECORD_RATE;
+    // The device rate is not necessarily a multiple of 16 kHz (44.1 kHz is
+    // common), so the step is fractional and the position carries between
+    // blocks. A whole-number step indexed `input[fractional]`, which is
+    // `undefined`, and a take on such a device recorded near-silence.
+    const step = context.sampleRate / RECORD_RATE;
+    let position = 0;
     let carry: number[] = [];
 
     const enqueue = (samples: number[]): void => {
@@ -1681,16 +1687,9 @@ class Page {
     };
 
     processor.onaudioprocess = (event: AudioProcessingEvent) => {
-      const input = event.inputBuffer.getChannelData(0);
-      for (let index = 0; index < input.length; index += ratio) {
-        let sum = 0;
-        let count = 0;
-        for (let inner = 0; inner < ratio && index + inner < input.length; inner += 1) {
-          sum += input[index + inner] ?? 0;
-          count += 1;
-        }
-        carry.push(count ? sum / count : 0);
-      }
+      const resampled = resampleBlock(event.inputBuffer.getChannelData(0), step, position);
+      position = resampled.position;
+      carry.push(...resampled.samples);
       while (carry.length >= CHUNK_SAMPLES) {
         const slice = carry.slice(0, CHUNK_SAMPLES);
         carry = carry.slice(CHUNK_SAMPLES);
